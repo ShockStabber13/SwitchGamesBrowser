@@ -10,3 +10,4 @@ data/provider-releases.json
 .env
 
 switch/config.json
+.webui_secret_key

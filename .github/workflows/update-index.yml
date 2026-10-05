@@ -24,6 +24,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install scraper dependencies
+        run: python -m pip install --disable-pip-version-check beautifulsoup4
+
       - uses: actions/cache@v4
         with:
           path: data/provider-releases.json
