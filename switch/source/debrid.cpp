@@ -546,6 +546,68 @@ private:
 
 } // namespace
 
+
+AllDebridPinAuth beginAllDebridPinAuth() {
+    auto root = jsonResponse(
+        requestRetry(
+            "https://api.alldebrid.com/v4.1/pin/get",
+            false,
+            {}
+        ),
+        "AllDebrid PIN"
+    );
+
+    if (root.value("status", "") != "success")
+        throw std::runtime_error("AllDebrid PIN request failed");
+
+    auto data = root.find("data");
+    if (data == root.end() || !data->is_object())
+        throw std::runtime_error("AllDebrid PIN response missing data");
+
+    AllDebridPinAuth auth;
+    auth.pin = valueString(*data, "pin");
+    auth.check = valueString(*data, "check");
+    auth.userUrl = valueString(*data, "user_url");
+    auth.expiresIn = data->value("expires_in", 0);
+
+    if (auth.pin.empty() || auth.check.empty())
+        throw std::runtime_error("AllDebrid PIN response invalid");
+
+    return auth;
+}
+
+AllDebridPinCheck checkAllDebridPinAuth(
+    const AllDebridPinAuth& auth
+) {
+    std::string body =
+        "pin=" + encode(auth.pin) +
+        "&check=" + encode(auth.check);
+
+    auto root = jsonResponse(
+        requestRetry(
+            "https://api.alldebrid.com/v4/pin/check",
+            true,
+            {"Content-Type: application/x-www-form-urlencoded"},
+            body
+        ),
+        "AllDebrid PIN check"
+    );
+
+    if (root.value("status", "") != "success")
+        throw std::runtime_error("AllDebrid PIN expired or invalid");
+
+    auto data = root.find("data");
+    if (data == root.end() || !data->is_object())
+        throw std::runtime_error("AllDebrid PIN check missing data");
+
+    AllDebridPinCheck result;
+    result.activated = data->value("activated", false);
+    result.expiresIn = data->value("expires_in", 0);
+    result.apiKey = valueString(*data, "apikey");
+
+    return result;
+}
+
 std::unique_ptr<DebridBackend> createDebridBackend(const DebridConfig& config) {
     if (config.apiKey.empty()) return nullptr;
     if (config.service == DebridService::TorBox) return std::make_unique<TorBoxBackend>(config);

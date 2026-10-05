@@ -117,6 +117,23 @@ public:
     ) = 0;
 };
 
+
+struct AllDebridPinAuth {
+    std::string pin;
+    std::string check;
+    std::string userUrl;
+    int expiresIn = 0;
+};
+
+struct AllDebridPinCheck {
+    bool activated = false;
+    std::string apiKey;
+    int expiresIn = 0;
+};
+
+AllDebridPinAuth beginAllDebridPinAuth();
+AllDebridPinCheck checkAllDebridPinAuth(const AllDebridPinAuth& auth);
+
 std::unique_ptr<DebridBackend> createDebridBackend(const DebridConfig& config);
 
 } // namespace sgb

@@ -11,6 +11,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sys/stat.h>
 
 static const std::string root = "sdmc:/switch/SwitchGamesBrowser/";
@@ -237,6 +238,7 @@ int main(int, char**) {
     std::vector<size_t> rows = sgb::browse(games, filter, favourites);
     size_t cursor = 0, releaseIndex = 0, torrentCursor = 0, fileCursor = 0;
     size_t settingsCursor = 0;
+    std::optional<sgb::AllDebridPinAuth> allDebridPin;
     Page page = Page::Browse; bool dirty = false;
     std::set<size_t> selectedFiles;
     std::future<Refresh> pending; std::future<CoverResult> pendingCover;
@@ -358,7 +360,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 2)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 3)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -372,6 +374,7 @@ int main(int, char**) {
                             : sgb::DebridService::TorBox;
 
                     debridConfig.apiKey.clear();
+                    allDebridPin.reset();
                     debridStatuses.clear();
 
                     try {
@@ -379,7 +382,88 @@ int main(int, char**) {
                     } catch (...) {}
 
                     saveConfig();
-                } else if (settingsCursor == 1) {
+                }
+
+                else if (settingsCursor == 1) {
+                    if (debridConfig.service == sgb::DebridService::TorBox) {
+                        std::string token = keyboard(
+                            "Paste TorBox API token",
+                            ""
+                        );
+
+                        if (token.empty()) {
+                            status = "TorBox token unchanged";
+                        } else {
+                            debridConfig.apiKey = token;
+                            debridStatuses.clear();
+
+                            try {
+                                atomicWrite(
+                                    root + "debrid-status.json",
+                                    "{}"
+                                );
+                            } catch (...) {}
+
+                            saveConfig();
+                            status = "TorBox authorized";
+                        }
+                    }
+
+                    else if (
+                        debridConfig.service ==
+                        sgb::DebridService::AllDebrid
+                    ) {
+                        try {
+                            if (!allDebridPin.has_value()) {
+                                allDebridPin =
+                                    sgb::beginAllDebridPinAuth();
+
+                                status =
+                                    "Enter PIN " +
+                                    allDebridPin->pin +
+                                    " at alldebrid.com/pin";
+                            } else {
+                                auto result =
+                                    sgb::checkAllDebridPinAuth(
+                                        *allDebridPin
+                                    );
+
+                                if (result.activated &&
+                                    !result.apiKey.empty()) {
+
+                                    debridConfig.apiKey =
+                                        result.apiKey;
+
+                                    debridStatuses.clear();
+
+                                    try {
+                                        atomicWrite(
+                                            root +
+                                            "debrid-status.json",
+                                            "{}"
+                                        );
+                                    } catch (...) {}
+
+                                    saveConfig();
+                                    allDebridPin.reset();
+                                    status =
+                                        "AllDebrid authorized";
+                                } else {
+                                    allDebridPin->expiresIn =
+                                        result.expiresIn;
+
+                                    status =
+                                        "Waiting for PIN " +
+                                        allDebridPin->pin;
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            status = e.what();
+                        }
+                    }
+                }
+
+                else if (settingsCursor == 2) {
                     if (pending.valid()) {
                         status = "Refresh already running";
                     } else if (url.empty()) {
@@ -392,7 +476,9 @@ int main(int, char**) {
                             url
                         );
                     }
-                } else {
+                }
+
+                else {
                     page = Page::Browse;
                 }
             }
@@ -446,28 +532,91 @@ int main(int, char**) {
             label(renderer,big,"SETTINGS",32,85,1200,green);
             label(renderer,small,"A Select  |  B Back",32,130,1200,muted);
 
-            SDL_Rect serviceBox{32,180,1216,80};
+            SDL_Rect serviceBox{32,170,1216,75};
             rect(renderer,serviceBox,SDL_Color{18,18,18,255});
-            if (settingsCursor == 0) rect(renderer,serviceBox,green,true);
-            label(renderer,small,"Debrid Service",52,194,500);
-            label(renderer,big,sgb::debridServiceName(debridConfig.service),650,190,550,green);
+            if (settingsCursor == 0)
+                rect(renderer,serviceBox,green,true);
 
-            SDL_Rect refreshBox{32,280,1216,80};
-            rect(renderer,refreshBox,SDL_Color{18,18,18,255});
-            if (settingsCursor == 1) rect(renderer,refreshBox,green,true);
-            label(renderer,small,"Refresh Cached Index",52,305,1100);
+            label(renderer,small,"Debrid Service",52,192,500);
+            label(
+                renderer,
+                big,
+                sgb::debridServiceName(debridConfig.service),
+                650,185,550,green
+            );
 
-            SDL_Rect backBox{32,380,1216,80};
-            rect(renderer,backBox,SDL_Color{18,18,18,255});
-            if (settingsCursor == 2) rect(renderer,backBox,green,true);
-            label(renderer,small,"Back",52,405,1100);
+            SDL_Rect authBox{32,260,1216,75};
+            rect(renderer,authBox,SDL_Color{18,18,18,255});
+            if (settingsCursor == 1)
+                rect(renderer,authBox,green,true);
+
+            std::string authLabel = "Authorize";
+
+            if (debridConfig.service == sgb::DebridService::TorBox)
+                authLabel = "Authorize / Set TorBox API Token";
+
+            if (
+                debridConfig.service ==
+                sgb::DebridService::AllDebrid
+            ) {
+                authLabel = allDebridPin.has_value()
+                    ? "Check AllDebrid PIN"
+                    : "Authorize with AllDebrid PIN";
+            }
+
+            label(renderer,small,authLabel,52,283,800);
 
             label(
                 renderer,
                 small,
-                "Changing debrid service clears the old service credentials/status cache.",
-                32,500,1216,muted
+                debridConfig.apiKey.empty()
+                    ? "Not authorized"
+                    : "Authorized",
+                960,283,250,
+                debridConfig.apiKey.empty() ? muted : green
             );
+
+            SDL_Rect refreshBox{32,350,1216,75};
+            rect(renderer,refreshBox,SDL_Color{18,18,18,255});
+            if (settingsCursor == 2)
+                rect(renderer,refreshBox,green,true);
+
+            label(
+                renderer,
+                small,
+                "Refresh Cached Index",
+                52,373,1100
+            );
+
+            SDL_Rect backBox{32,440,1216,75};
+            rect(renderer,backBox,SDL_Color{18,18,18,255});
+            if (settingsCursor == 3)
+                rect(renderer,backBox,green,true);
+
+            label(renderer,small,"Back",52,463,1100);
+
+            if (allDebridPin.has_value()) {
+                label(
+                    renderer,
+                    big,
+                    "PIN: " + allDebridPin->pin,
+                    32,545,500,green
+                );
+
+                label(
+                    renderer,
+                    small,
+                    "Enter this at alldebrid.com/pin, then select Authorize again.",
+                    32,590,1216,white
+                );
+            } else {
+                label(
+                    renderer,
+                    small,
+                    "Credentials are stored locally in config.json on the SD card.",
+                    32,570,1216,muted
+                );
+            }
         } else if (page == Page::Detail && !rows.empty()) {
             const auto& g = games[rows[cursor]];
             label(renderer,big,g.title,32,85,1200);
