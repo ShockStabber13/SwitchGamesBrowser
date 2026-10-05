@@ -34,8 +34,8 @@ static std::string get(const std::string& url, size_t maxBytes) {
     curl_easy_setopt(curl.get(), CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "https");
-    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
+    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 3L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
