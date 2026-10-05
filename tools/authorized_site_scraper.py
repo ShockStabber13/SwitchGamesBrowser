@@ -268,6 +268,28 @@ def merge_releases(rows):
     return list(unique.values())
 
 
+
+def search_terms_for_game(game):
+    raw = game.get("torrentSearchTerms")
+    if not isinstance(raw, list):
+        raw = [game.get("name", "")]
+
+    terms = []
+    seen = set()
+
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        key = value.casefold()
+
+        if value and key not in seen:
+            seen.add(key)
+            terms.append(value)
+
+    return terms[:32]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--catalog", default="data/igdb-switch-games.json")
@@ -314,14 +336,14 @@ def main():
         for source in sources
     }
 
-    def search_one(game, source):
+    def search_one(game, source, query_name):
         gid = str(game.get("id", ""))
         name = str(game.get("name", "")).strip()
         source_name = str(source["name"])
         limiter.wait(source)
         source_stats[source_name]["searches"] += 1
         try:
-            payload = fetch_search(name, source)
+            payload = fetch_search(query_name, source)
             rows = convert_results(game, payload, source)
             if rows:
                 source_stats[source_name]["matchedGames"] += 1
@@ -344,7 +366,12 @@ def main():
             name = str(game.get("name", "")).strip()
             if not gid or not name:
                 continue
-            futures = [pool.submit(search_one, game, source) for source in sources]
+            terms = search_terms_for_game(game)
+            futures = [
+                pool.submit(search_one, game, source, term)
+                for source in sources
+                for term in terms
+            ]
             game_rows = []
             for future in futures:
                 rows, failure = future.result()

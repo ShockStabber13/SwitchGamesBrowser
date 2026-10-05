@@ -12,6 +12,15 @@ GAMES_URL = "https://api.igdb.com/v4/games"
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 SWITCH_PLATFORM_ID = 130
 
+# Visible standalone titles.
+# main_game, standalone_expansion, remake, remaster,
+# expanded_game, port, fork
+CATALOG_GAME_TYPES = {0, 4, 8, 9, 10, 11, 12}
+
+# Hidden child content attached to its parent for torrent searching.
+# dlc_addon, expansion, pack, update
+ATTACHED_CONTENT_TYPES = {1, 2, 13, 14}
+
 
 def _post(url, body=None, headers=None, content_type="text/plain; charset=utf-8"):
     data = body.encode() if isinstance(body, str) else None
@@ -87,10 +96,70 @@ def _cover_url(game):
     )
 
 
+
+def _game_type_id(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _visible_catalog(rows):
+    rows = [
+        dict(game)
+        for game in rows
+        if isinstance(game, dict) and game.get("name")
+    ]
+
+    visible = {}
+
+    for game in rows:
+        kind = _game_type_id(game.get("gameType"))
+        if kind not in CATALOG_GAME_TYPES:
+            continue
+
+        row = dict(game)
+        row["torrentSearchTerms"] = [row["name"]]
+        row["relatedContent"] = []
+        visible[str(row["id"])] = row
+
+    for child in rows:
+        kind = _game_type_id(child.get("gameType"))
+        if kind not in ATTACHED_CONTENT_TYPES:
+            continue
+
+        parent_id = str(child.get("parentGame") or "")
+        parent = visible.get(parent_id)
+        if not parent:
+            continue
+
+        child_name = str(child.get("name", "")).strip()
+        if not child_name:
+            continue
+
+        base_name = parent["name"]
+
+        if base_name.casefold() in child_name.casefold():
+            query = child_name
+        else:
+            query = f"{base_name} {child_name}"
+
+        if query not in parent["torrentSearchTerms"]:
+            parent["torrentSearchTerms"].append(query)
+
+        parent["relatedContent"].append({
+            "id": str(child.get("id", "")),
+            "name": child_name,
+            "gameType": kind,
+        })
+
+    return list(visible.values())
+
+
 def fetch_switch_games(client_id, client_secret):
     token = get_token(client_id, client_secret)
     headers = {"Client-ID": client_id, "Authorization": "Bearer " + token}
-    games = []
+    all_games = []
     last_id = 0
 
     while True:
@@ -118,7 +187,7 @@ def fetch_switch_games(client_id, client_secret):
             })
             rating_count = int(game.get("rating_count") or 0)
             rating = game.get("rating")
-            games.append({
+            all_games.append({
                 "id": str(gid),
                 "name": game.get("name", "").strip(),
                 "slug": game.get("slug", ""),
@@ -137,9 +206,9 @@ def fetch_switch_games(client_id, client_secret):
         if len(page) < 500:
             break
 
-    games = [game for game in games if game["name"]]
+    games = _visible_catalog(all_games)
     if not games:
-        raise ValueError("IGDB returned no Nintendo Switch games")
+        raise ValueError("IGDB returned no visible Nintendo Switch base games")
     return games
 
 
