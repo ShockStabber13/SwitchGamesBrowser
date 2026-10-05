@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "name": "Demo Quest",
+    "rating": 4.5,
+    "ratings_count": 10,
+    "genres": [
+      {
+        "name": "Adventure"
+      }
+    ],
+    "released": "2024-05-01"
+  },
+  {
+    "id": 2,
+    "name": "Puzzle Garden",
+    "rating": 3.5,
+    "ratings_count": 5,
+    "genres": [
+      {
+        "name": "Puzzle"
+      }
+    ],
+    "released": "2025-03-15"
+  }
+]

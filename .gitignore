@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+switch/build/
+*.elf
+*.nro
+*.nacp
+*.map
+data/metadata-cache.json
+data/provider-releases.json
+.env
+
+switch/config.json
