@@ -1,14 +1,15 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-10-05T16:15:54.663291+00:00",
-  "gameCount": 363,
-  "bytes": 295588,
-  "sha256": "6edcebd9e2b3eba10376a36755a8cdcf680a7a44066d82616010ec7dcb3d9013",
-  "matchReport": {
-    "matched": 0,
-    "unmatched": 484,
-    "ambiguous": 0,
-    "invalid": 0,
-    "duplicates": 0
+  "generatedAt": "2026-10-05T21:20:11.285964+00:00",
+  "gameCount": 6850,
+  "bytes": 4079984,
+  "sha256": "c4516986bccf312722bf66581788f121e93f61cf99d4fff8847296fb31662d47",
+  "source": "IGDB + authorized torrent sources",
+  "report": {
+    "igdbGames": 6850,
+    "gamesWithCandidates": 0,
+    "gamesWithoutCandidates": 6850,
+    "releaseCandidates": 0,
+    "duplicateReleases": 0
   }
 }
