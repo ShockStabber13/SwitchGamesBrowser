@@ -1,0 +1,52 @@
+name: Update Switch index
+on:
+  workflow_dispatch:
+    inputs:
+      refresh_ratings:
+        description: Refresh RAWG metadata (requires RAWG_API_KEY)
+        type: boolean
+        default: false
+  schedule:
+    - cron: '30 20 * * *' # 04:30 Singapore time
+permissions:
+  contents: write
+concurrency:
+  group: switch-index
+  cancel-in-progress: false
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: data/metadata-cache.json
+          key: rawg-metadata-${{ github.run_id }}
+          restore-keys: rawg-metadata-
+      - name: Test builder
+        run: python -m unittest discover -s tests -v
+      - name: Refresh catalog
+        env:
+          RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
+          REFRESH_RATINGS: ${{ inputs.refresh_ratings }}
+        shell: bash
+        run: |
+          args=()
+          if [ -n "$RAWG_API_KEY" ] && { [ "$REFRESH_RATINGS" = "true" ] || [ ! -f data/metadata-cache.json ] || [ "$(date -u +%u)" = "7" ]; }; then
+            args+=(--fetch-rawg)
+          fi
+          python tools/build_index.py "${args[@]}"
+      - name: Commit validated index
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/switch-index.json data/manifest.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Refresh Switch catalog and ratings'
+            git push
+          fi

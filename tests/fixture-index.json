@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "platform": "Nintendo Switch",
+  "generatedAt": "2026-10-05T14:43:29.602893+00:00",
+  "games": [
+    {
+      "id": "464079eb640da1fc19f60b5f",
+      "title": "Demo Quest",
+      "titleId": "",
+      "releaseDate": "2024-05-01",
+      "rating": 90.0,
+      "ratingCount": 10,
+      "ratingSource": "RAWG users",
+      "ratingUrl": "",
+      "criticRating": null,
+      "criticSource": "",
+      "coverUrl": "",
+      "genres": [
+        "Adventure"
+      ],
+      "summary": "",
+      "metadataMatched": true,
+      "releases": [
+        {
+          "title": "Demo Quest [NSZ]",
+          "infoHash": "1111111111111111111111111111111111111111",
+          "magnet": "magnet:?xt=urn:btih:1111111111111111111111111111111111111111",
+          "size": "",
+          "source": "Imported catalog",
+          "topicId": ""
+        }
+      ]
+    },
+    {
+      "id": "bdd4c6ff02db0dcf7c39f8cb",
+      "title": "Demo Quest 2",
+      "titleId": "",
+      "releaseDate": "",
+      "rating": null,
+      "ratingCount": 0,
+      "ratingSource": "",
+      "ratingUrl": "",
+      "criticRating": null,
+      "criticSource": "",
+      "coverUrl": "",
+      "genres": [],
+      "summary": "",
+      "metadataMatched": false,
+      "releases": [
+        {
+          "title": "Demo Quest 2 [NSP]",
+          "infoHash": "2222222222222222222222222222222222222222",
+          "magnet": "magnet:?xt=urn:btih:2222222222222222222222222222222222222222",
+          "size": "",
+          "source": "Imported catalog",
+          "topicId": ""
+        }
+      ]
+    },
+    {
+      "id": "0ceac1a71be12553be0f2a38",
+      "title": "Puzzle Garden",
+      "titleId": "",
+      "releaseDate": "2025-03-15",
+      "rating": 70.0,
+      "ratingCount": 5,
+      "ratingSource": "RAWG users",
+      "ratingUrl": "",
+      "criticRating": null,
+      "criticSource": "",
+      "coverUrl": "",
+      "genres": [
+        "Puzzle"
+      ],
+      "summary": "",
+      "metadataMatched": true,
+      "releases": [
+        {
+          "title": "Puzzle Garden [XCI]",
+          "infoHash": "3333333333333333333333333333333333333333",
+          "magnet": "magnet:?xt=urn:btih:3333333333333333333333333333333333333333",
+          "size": "",
+          "source": "Imported catalog",
+          "topicId": ""
+        }
+      ]
+    }
+  ]
+}
