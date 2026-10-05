@@ -10,7 +10,12 @@
       "files": "files"
     },
     "fileNameField": "name",
-    "allowedExtensions": [".nsp", ".nsz", ".xci", ".xcz"],
+    "allowedExtensions": [
+      ".nsp",
+      ".nsz",
+      ".xci",
+      ".xcz"
+    ],
     "requireFileList": false,
     "validateFileExtensionsWhenPresent": true,
     "authHeader": "Authorization",
@@ -22,7 +27,7 @@
   "sources": [
     {
       "name": "MyAuthorizedSite1",
-      "enabled": true,
+      "enabled": false,
       "searchUrl": "https://YOUR-SITE-1.example/api/search?q={query}",
       "tokenEnv": "TORRENT_SOURCE_1_TOKEN"
     },

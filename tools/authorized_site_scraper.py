@@ -174,8 +174,6 @@ def load_sources(config):
         source = dict(source)
         source.setdefault("name", f"AuthorizedSite{index}")
         enabled.append(source)
-    if not enabled:
-        raise ValueError("No authorized torrent sources are enabled")
     return enabled
 
 
@@ -281,6 +279,24 @@ def main():
     games = read_json(args.catalog)
     root_config = read_json(args.config)
     sources = load_sources(root_config)
+
+    if not sources:
+        write_atomic(args.output, [])
+        status = {
+            "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "providers": [],
+            "catalogGames": len(games),
+            "matchedGames": 0,
+            "uniqueReleases": 0,
+            "failedSearches": 0,
+            "sourceStats": {},
+            "failures": [],
+        }
+        write_atomic(Path(args.output).with_name("scraper-status.json"), status)
+        print("No torrent sources enabled; generated catalog-only provider list.", flush=True)
+        print(json.dumps(status, indent=2), flush=True)
+        return
+
     limiter = SourceRateLimiter(sources)
 
     previous = read_json(args.output) if Path(args.output).exists() else []
