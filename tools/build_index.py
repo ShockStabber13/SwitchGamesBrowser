@@ -79,7 +79,7 @@ def number(value, lo=0, hi=100):
         return None
 
 def text(value, limit=4096):
-    return value[:limit] if isinstance(value, str) else ''
+    return value.encode('utf-8')[:limit].decode('utf-8', errors='ignore') if isinstance(value, str) else ''
 
 def rawg_catalog(key):
     def api(route, params):
