@@ -1,0 +1,42 @@
+{
+  "defaults": {
+    "method": "GET",
+    "resultsPath": "results",
+    "fields": {
+      "title": "name",
+      "magnet": "magnet",
+      "infoHash": "info_hash",
+      "size": "size",
+      "files": "files"
+    },
+    "fileNameField": "name",
+    "allowedExtensions": [".nsp", ".nsz", ".xci", ".xcz"],
+    "requireFileList": false,
+    "validateFileExtensionsWhenPresent": true,
+    "authHeader": "Authorization",
+    "authPrefix": "Bearer ",
+    "requestDelaySeconds": 0.25,
+    "timeoutSeconds": 45,
+    "maxResultsPerGame": 100
+  },
+  "sources": [
+    {
+      "name": "MyAuthorizedSite1",
+      "enabled": true,
+      "searchUrl": "https://YOUR-SITE-1.example/api/search?q={query}",
+      "tokenEnv": "TORRENT_SOURCE_1_TOKEN"
+    },
+    {
+      "name": "MyAuthorizedSite2",
+      "enabled": false,
+      "searchUrl": "https://YOUR-SITE-2.example/api/search?q={query}",
+      "tokenEnv": "TORRENT_SOURCE_2_TOKEN"
+    },
+    {
+      "name": "MyAuthorizedSite3",
+      "enabled": false,
+      "searchUrl": "https://YOUR-SITE-3.example/api/search?q={query}",
+      "tokenEnv": "TORRENT_SOURCE_3_TOKEN"
+    }
+  ]
+}

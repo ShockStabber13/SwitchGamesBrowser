@@ -1,3 +1,5 @@
-﻿{
-    "indexUrl":  "https://raw.githubusercontent.com/ShockStabber13/SwitchGamesBrowser/main/data/switch-index.json"
+{
+  "indexUrl": "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPOSITORY/main/data/switch-index.json",
+  "debridService": "torbox",
+  "debridApiKey": "PASTE_YOUR_API_KEY_HERE"
 }

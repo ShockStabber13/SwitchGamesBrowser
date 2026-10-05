@@ -8,3 +8,5 @@ switch/build/
 data/metadata-cache.json
 data/provider-releases.json
 .env
+
+switch/config.json

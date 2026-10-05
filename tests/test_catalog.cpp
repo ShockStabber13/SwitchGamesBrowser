@@ -14,9 +14,13 @@ int main(int argc, char** argv) {
     f = {}; f.search = "QUEST"; assert(sgb::browse(games, f, {}).size() == 2);
     f = {}; f.favouritesOnly = true;
     assert(sgb::browse(games, f, {games[0].id}).size() == 1);
+    auto noReleases = sgb::Json::parse(sgb::read(argv[1]));
+    noReleases["games"][2]["releases"] = sgb::Json::array();
+    auto withEmpty = sgb::parse(noReleases.dump());
+    assert(withEmpty[2].releases.empty());
     auto invalid = sgb::Json::parse(sgb::read(argv[1]));
     invalid["games"][1]["id"] = invalid["games"][0]["id"];
     bool rejected = false; try { sgb::parse(invalid.dump()); } catch (...) { rejected = true; }
     assert(rejected);
-    std::cout << "Catalog parsing, sorting, filtering and duplicate validation passed\n";
+    std::cout << "Catalog parsing, empty-release support, sorting, filtering and duplicate validation passed\n";
 }

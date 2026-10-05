@@ -10,7 +10,7 @@
 
 namespace sgb {
 using Json = nlohmann::json;
-struct Release { std::string title, magnet, size; };
+struct Release { std::string title, magnet, size, infoHash, source; std::vector<std::string> files; };
 struct Game {
     std::string id, title, titleId, date, cover, summary, ratingSource, ratingUrl;
     std::vector<std::string> genres;
@@ -56,10 +56,15 @@ inline std::vector<Game> parse(const std::string& bytes) {
             for (auto& genre : row["genres"]) if (genre.is_string()) g.genres.push_back(genre.get<std::string>().substr(0, 256));
         }
         auto& releases = row.at("releases");
-        if (!releases.is_array() || releases.empty() || (totalReleases += releases.size()) > 20000) throw std::runtime_error("Invalid release count");
+        if (!releases.is_array() || (totalReleases += releases.size()) > 20000) throw std::runtime_error("Invalid release count");
         for (const auto& r : releases) {
-            Release release{field(r, "title", 1024), field(r, "magnet", 4096), field(r, "size", 100)};
+            Release release{field(r, "title", 1024), field(r, "magnet", 4096), field(r, "size", 100), field(r, "infoHash", 64), field(r, "source", 128), {}};
+            if (r.contains("files") && r["files"].is_array()) {
+                if (r["files"].size() > 512) throw std::runtime_error("Too many release files");
+                for (const auto& f : r["files"]) if (f.is_string()) release.files.push_back(f.get<std::string>().substr(0, 1024));
+            }
             if (release.magnet.rfind("magnet:?", 0) != 0) throw std::runtime_error("Invalid release magnet");
+            if (release.infoHash.size() != 40) throw std::runtime_error("Invalid release info hash");
             g.releases.push_back(std::move(release));
         }
         result.push_back(std::move(g));

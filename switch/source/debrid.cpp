@@ -1,0 +1,556 @@
+#include "debrid.hpp"
+#include <curl/curl.h>
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <set>
+#include <stdexcept>
+#include <thread>
+
+namespace sgb {
+namespace {
+
+using Json = nlohmann::json;
+
+struct Buffer {
+    std::string bytes;
+    size_t limit = 0;
+    long retryAfter = 0;
+};
+
+struct Response {
+    long status = 0;
+    std::string body;
+    long retryAfter = 0;
+};
+
+size_t writeBody(char* data, size_t size, size_t count, void* opaque) {
+    auto* b = static_cast<Buffer*>(opaque);
+    if (size && count > SIZE_MAX / size) return 0;
+    const size_t n = size * count;
+    if (n > b->limit - b->bytes.size()) return 0;
+    b->bytes.append(data, n);
+    return n;
+}
+
+size_t readHeader(char* data, size_t size, size_t count, void* opaque) {
+    auto* b = static_cast<Buffer*>(opaque);
+    const size_t n = size * count;
+    std::string line(data, n), lower = line;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (lower.rfind("retry-after:", 0) == 0) {
+        try { b->retryAfter = std::stol(line.substr(12)); } catch (...) {}
+    }
+    return n;
+}
+
+std::string lowerHash(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string valueString(const Json& object, const char* key) {
+    auto it = object.find(key);
+    if (it == object.end() || it->is_null()) return "";
+    if (it->is_string()) return it->get<std::string>();
+    if (it->is_number_integer()) return std::to_string(it->get<long long>());
+    return "";
+}
+
+std::string encode(const std::string& value) {
+    CURL* curl = curl_easy_init();
+    if (!curl) throw std::runtime_error("URL encoding failed");
+    char* escaped = curl_easy_escape(curl, value.c_str(), static_cast<int>(value.size()));
+    if (!escaped) {
+        curl_easy_cleanup(curl);
+        throw std::runtime_error("URL encoding failed");
+    }
+    std::string out(escaped);
+    curl_free(escaped);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
+Response request(
+    const std::string& url,
+    bool post,
+    const std::vector<std::string>& headers,
+    const std::string& body = ""
+) {
+    if (url.rfind("https://", 0) != 0) throw std::runtime_error("Debrid endpoint must use HTTPS");
+    CURL* curl = curl_easy_init();
+    if (!curl) throw std::runtime_error("Debrid network initialization failed");
+
+    Buffer buffer{{}, 16 * 1024 * 1024, 0};
+    curl_slist* headerList = nullptr;
+    for (const auto& h : headers) headerList = curl_slist_append(headerList, h.c_str());
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "SwitchGamesBrowser/0.4");
+    #if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+#endif
+#ifdef __SWITCH__
+    curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
+#endif
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 12L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, readHeader);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &buffer);
+    if (headerList) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+    if (post) {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    }
+
+    const auto rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    if (headerList) curl_slist_free_all(headerList);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK) throw std::runtime_error("Debrid network request failed");
+    return {status, std::move(buffer.bytes), buffer.retryAfter};
+}
+
+Response requestRetry(
+    const std::string& url,
+    bool post,
+    const std::vector<std::string>& headers,
+    const std::string& body = ""
+) {
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        auto response = request(url, post, headers, body);
+        if (response.status != 429 && response.status != 503) return response;
+        const long waitSeconds = response.retryAfter > 0 ? response.retryAfter : std::min<long>(8, 1L << attempt);
+        std::this_thread::sleep_for(std::chrono::seconds(waitSeconds));
+    }
+    throw std::runtime_error("Debrid service rate limit");
+}
+
+Json jsonResponse(const Response& response, const char* label) {
+    if (response.status < 200 || response.status >= 300)
+        throw std::runtime_error(std::string(label) + " HTTP " + std::to_string(response.status));
+    try { return Json::parse(response.body); }
+    catch (...) { throw std::runtime_error(std::string(label) + " returned invalid JSON"); }
+}
+
+void appendTorBoxFiles(const Json& files, std::vector<DebridFile>& out) {
+    if (!files.is_array()) return;
+    for (const auto& f : files) {
+        if (f.is_string()) {
+            out.push_back({f.get<std::string>(), "", false});
+            continue;
+        }
+        if (!f.is_object()) continue;
+        std::string name = valueString(f, "name");
+        if (name.empty()) name = valueString(f, "path");
+        std::string id = valueString(f, "file_id");
+        if (id.empty()) id = valueString(f, "id");
+        if (!name.empty()) out.push_back({name, id, false});
+    }
+}
+
+void appendAllDebridFiles(const Json& files, std::vector<DebridFile>& out, const std::string& prefix = "") {
+    if (!files.is_array()) return;
+    for (const auto& node : files) {
+        if (!node.is_object()) continue;
+        std::string name = valueString(node, "n");
+        auto children = node.find("e");
+        if (children != node.end() && children->is_array()) {
+            appendAllDebridFiles(*children, out, prefix + (name.empty() ? "" : name + "/"));
+            continue;
+        }
+        if (!name.empty()) out.push_back({prefix + name, "", false});
+    }
+}
+
+class TorBoxBackend final : public DebridBackend {
+public:
+    explicit TorBoxBackend(DebridConfig config) : config_(std::move(config)) {}
+
+    std::map<std::string, DebridTorrentStatus> check(const std::vector<DebridCandidate>& candidates) override {
+        std::map<std::string, DebridTorrentStatus> out;
+        auto account = accountTorrents();
+
+        std::vector<std::string> hashes;
+        std::set<std::string> seen;
+        for (const auto& candidate : candidates) {
+            const std::string hash = lowerHash(candidate.infoHash);
+            if (hash.size() == 40 && seen.insert(hash).second) hashes.push_back(hash);
+        }
+
+        for (size_t offset = 0; offset < hashes.size(); offset += 50) {
+            const size_t end = std::min(offset + 50, hashes.size());
+            std::string joined;
+            for (size_t i = offset; i < end; ++i) {
+                if (!joined.empty()) joined += ",";
+                joined += hashes[i];
+            }
+
+            auto root = jsonResponse(requestRetry(
+                "https://api.torbox.app/v1/api/torrents/checkcached?hash=" + encode(joined) + "&format=list&list_files=true",
+                false,
+                authHeaders()
+            ), "TorBox checkcached");
+
+            auto data = root.find("data");
+            if (data == root.end()) continue;
+            if (data->is_array()) {
+                for (const auto& item : *data) parseCachedItem(item, "", account, out);
+            } else if (data->is_object()) {
+                for (auto it = data->begin(); it != data->end(); ++it) parseCachedItem(it.value(), it.key(), account, out);
+            }
+        }
+
+        for (const auto& hash : hashes) {
+            auto accountIt = account.find(hash);
+            if (accountIt != account.end() && out.find(hash) == out.end()) {
+                DebridTorrentStatus state = accountIt->second;
+                state.downloaded = true;
+                out[hash] = std::move(state);
+            }
+        }
+        return out;
+    }
+
+    DebridTorrentStatus add(const std::string& infoHash, const std::string& magnet) override {
+        const std::string hash = lowerHash(infoHash);
+        auto account = accountTorrents();
+        auto existing = account.find(hash);
+        if (existing != account.end()) {
+            auto state = existing->second;
+            state.downloaded = true;
+            if (state.files.empty() && !state.remoteId.empty()) state.files = files(state);
+            return state;
+        }
+
+        CURL* curl = curl_easy_init();
+        if (!curl) throw std::runtime_error("TorBox network initialization failed");
+        Buffer buffer{{}, 8 * 1024 * 1024, 0};
+        curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, ("Authorization: Bearer " + config_.apiKey).c_str());
+        curl_mime* mime = curl_mime_init(curl);
+        curl_mimepart* part = curl_mime_addpart(mime);
+        curl_mime_name(part, "magnet");
+        curl_mime_data(part, magnet.c_str(), CURL_ZERO_TERMINATED);
+
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.torbox.app/v1/api/torrents/createtorrent");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "SwitchGamesBrowser/0.4");
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+#ifdef __SWITCH__
+        curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
+#endif
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeBody);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L);
+        auto rc = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        curl_mime_free(mime);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        if (rc != CURLE_OK || status < 200 || status >= 300)
+            throw std::runtime_error("TorBox create torrent failed");
+
+        Json root = Json::parse(buffer.bytes);
+        auto data = root.find("data");
+        std::string id;
+        if (data != root.end() && data->is_object()) {
+            id = valueString(*data, "torrent_id");
+            if (id.empty()) id = valueString(*data, "id");
+        } else if (data != root.end() && data->is_array() && !data->empty() && (*data)[0].is_object()) {
+            id = valueString((*data)[0], "torrent_id");
+            if (id.empty()) id = valueString((*data)[0], "id");
+        }
+        if (id.empty()) throw std::runtime_error("TorBox create torrent returned no ID");
+
+        DebridTorrentStatus state;
+        state.downloaded = true;
+        state.remoteId = id;
+        for (int i = 0; i < 5 && state.files.empty(); ++i) {
+            try { state.files = files(state); } catch (...) {}
+            if (state.files.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        state.cached = !state.files.empty();
+        return state;
+    }
+
+    std::vector<DebridFile> files(const DebridTorrentStatus& torrent) override {
+        if (torrent.remoteId.empty()) return {};
+        auto root = jsonResponse(requestRetry(
+            "https://api.torbox.app/v1/api/torrents/mylist?id=" + encode(torrent.remoteId) + "&bypass_cache=true",
+            false,
+            authHeaders()
+        ), "TorBox torrent details");
+
+        auto data = root.find("data");
+        if (data == root.end()) return {};
+        Json item;
+        if (data->is_object()) item = *data;
+        else if (data->is_array() && !data->empty() && (*data)[0].is_object()) item = (*data)[0];
+        else return {};
+
+        std::vector<DebridFile> out;
+        auto f = item.find("files");
+        if (f != item.end()) appendTorBoxFiles(*f, out);
+        return out;
+    }
+
+private:
+    DebridConfig config_;
+
+    std::vector<std::string> authHeaders() const {
+        return {"Authorization: Bearer " + config_.apiKey};
+    }
+
+    std::map<std::string, DebridTorrentStatus> accountTorrents() const {
+        std::map<std::string, DebridTorrentStatus> out;
+        auto root = jsonResponse(requestRetry(
+            "https://api.torbox.app/v1/api/torrents/mylist?bypass_cache=true&limit=1000",
+            false,
+            authHeaders()
+        ), "TorBox mylist");
+        auto data = root.find("data");
+        if (data == root.end()) return out;
+
+        Json rows = Json::array();
+        if (data->is_array()) rows = *data;
+        else if (data->is_object()) {
+            auto torrents = data->find("torrents");
+            if (torrents != data->end() && torrents->is_array()) rows = *torrents;
+            else rows.push_back(*data);
+        }
+
+        for (const auto& item : rows) {
+            if (!item.is_object()) continue;
+            std::string hash = lowerHash(valueString(item, "hash"));
+            if (hash.empty()) hash = lowerHash(valueString(item, "info_hash"));
+            if (hash.empty()) continue;
+            DebridTorrentStatus state;
+            state.downloaded = true;
+            state.remoteId = valueString(item, "id");
+            if (state.remoteId.empty()) state.remoteId = valueString(item, "torrent_id");
+            std::string downloadState = valueString(item, "download_state");
+            if (downloadState.empty()) downloadState = valueString(item, "state");
+            state.cached = lowerHash(downloadState) == "cached";
+            auto filesIt = item.find("files");
+            if (filesIt != item.end()) appendTorBoxFiles(*filesIt, state.files);
+            if (!state.files.empty()) state.cached = true;
+            out[hash] = std::move(state);
+        }
+        return out;
+    }
+
+    static void parseCachedItem(
+        const Json& item,
+        const std::string& fallbackHash,
+        const std::map<std::string, DebridTorrentStatus>& account,
+        std::map<std::string, DebridTorrentStatus>& out
+    ) {
+        if (!item.is_object()) return;
+        std::string hash = lowerHash(valueString(item, "hash"));
+        if (hash.empty()) hash = lowerHash(valueString(item, "info_hash"));
+        if (hash.empty()) hash = lowerHash(fallbackHash);
+        if (hash.empty()) return;
+
+        DebridTorrentStatus state;
+        state.cached = true;
+        auto accountIt = account.find(hash);
+        if (accountIt != account.end()) {
+            state.downloaded = true;
+            state.remoteId = accountIt->second.remoteId;
+            state.files = accountIt->second.files;
+        }
+        auto filesIt = item.find("files");
+        if (state.files.empty() && filesIt != item.end()) appendTorBoxFiles(*filesIt, state.files);
+        out[hash] = std::move(state);
+    }
+};
+
+class AllDebridBackend final : public DebridBackend {
+public:
+    explicit AllDebridBackend(DebridConfig config) : config_(std::move(config)) {}
+
+    std::map<std::string, DebridTorrentStatus> check(const std::vector<DebridCandidate>& candidates) override {
+        std::map<std::string, DebridTorrentStatus> out;
+        const auto existingIds = existingMagnetIds();
+
+        for (size_t offset = 0; offset < candidates.size(); offset += 10) {
+            const size_t end = std::min(offset + 10, candidates.size());
+            std::string body;
+            for (size_t i = offset; i < end; ++i) {
+                if (!body.empty()) body += "&";
+                body += "magnets%5B%5D=" + encode(candidates[i].magnet);
+            }
+
+            auto root = apiPost("https://api.alldebrid.com/v4/magnet/upload", body, "AllDebrid upload");
+            auto data = root.find("data");
+            if (data == root.end() || !data->is_object()) continue;
+            auto magnets = data->find("magnets");
+            if (magnets == data->end() || !magnets->is_array()) continue;
+
+            std::vector<std::string> readyIds;
+            std::map<std::string, std::string> idToHash;
+            std::vector<std::string> temporaryIds;
+
+            for (const auto& item : *magnets) {
+                if (!item.is_object()) continue;
+                if (item.contains("error") && !item["error"].is_null()) continue;
+                const std::string hash = lowerHash(valueString(item, "hash"));
+                const std::string id = valueString(item, "id");
+                if (hash.empty() || id.empty()) continue;
+
+                DebridTorrentStatus state;
+                state.cached = item.value("ready", false);
+                state.downloaded = existingIds.count(id) != 0;
+                state.remoteId = state.downloaded ? id : "";
+                out[hash] = state;
+                idToHash[id] = hash;
+                if (state.cached) readyIds.push_back(id);
+                if (!state.downloaded) temporaryIds.push_back(id);
+            }
+
+            if (!readyIds.empty()) {
+                auto trees = filesByIds(readyIds);
+                for (const auto& pair : trees) {
+                    auto h = idToHash.find(pair.first);
+                    if (h != idToHash.end()) out[h->second].files = pair.second;
+                }
+            }
+
+            for (const auto& id : temporaryIds) deleteMagnet(id);
+        }
+        return out;
+    }
+
+    DebridTorrentStatus add(const std::string& infoHash, const std::string& magnet) override {
+        (void)infoHash;
+        auto root = apiPost(
+            "https://api.alldebrid.com/v4/magnet/upload",
+            "magnets%5B%5D=" + encode(magnet),
+            "AllDebrid upload"
+        );
+        auto data = root.find("data");
+        if (data == root.end() || !data->is_object()) throw std::runtime_error("AllDebrid upload missing data");
+        auto magnets = data->find("magnets");
+        if (magnets == data->end() || !magnets->is_array() || magnets->empty() || !(*magnets)[0].is_object())
+            throw std::runtime_error("AllDebrid upload missing magnet result");
+        const auto& item = (*magnets)[0];
+        if (item.contains("error") && !item["error"].is_null()) throw std::runtime_error("AllDebrid rejected magnet");
+
+        DebridTorrentStatus state;
+        state.remoteId = valueString(item, "id");
+        state.cached = item.value("ready", false);
+        state.downloaded = !state.remoteId.empty();
+        if (state.remoteId.empty()) throw std::runtime_error("AllDebrid upload returned no ID");
+        if (state.cached) state.files = files(state);
+        return state;
+    }
+
+    std::vector<DebridFile> files(const DebridTorrentStatus& torrent) override {
+        if (torrent.remoteId.empty()) return {};
+        auto rows = filesByIds({torrent.remoteId});
+        auto it = rows.find(torrent.remoteId);
+        return it == rows.end() ? std::vector<DebridFile>{} : it->second;
+    }
+
+private:
+    DebridConfig config_;
+
+    std::vector<std::string> authHeaders() const {
+        return {
+            "Authorization: Bearer " + config_.apiKey,
+            "Content-Type: application/x-www-form-urlencoded"
+        };
+    }
+
+    Json apiPost(const std::string& url, const std::string& body, const char* label) const {
+        auto root = jsonResponse(requestRetry(url, true, authHeaders(), body), label);
+        if (root.value("status", "") != "success") throw std::runtime_error(std::string(label) + " failed");
+        return root;
+    }
+
+    std::set<std::string> existingMagnetIds() const {
+        std::set<std::string> ids;
+        auto root = apiPost("https://api.alldebrid.com/v4.1/magnet/status", "", "AllDebrid status");
+        auto data = root.find("data");
+        if (data == root.end() || !data->is_object()) return ids;
+        auto magnets = data->find("magnets");
+        if (magnets == data->end() || !magnets->is_array()) return ids;
+        for (const auto& item : *magnets) {
+            if (!item.is_object()) continue;
+            const std::string id = valueString(item, "id");
+            if (!id.empty()) ids.insert(id);
+        }
+        return ids;
+    }
+
+    std::map<std::string, std::vector<DebridFile>> filesByIds(const std::vector<std::string>& ids) const {
+        std::map<std::string, std::vector<DebridFile>> out;
+        if (ids.empty()) return out;
+        std::string body;
+        for (const auto& id : ids) {
+            if (!body.empty()) body += "&";
+            body += "id%5B%5D=" + encode(id);
+        }
+        auto root = apiPost("https://api.alldebrid.com/v4/magnet/files", body, "AllDebrid files");
+        auto data = root.find("data");
+        if (data == root.end() || !data->is_object()) return out;
+        auto magnets = data->find("magnets");
+        if (magnets == data->end() || !magnets->is_array()) return out;
+        for (const auto& item : *magnets) {
+            if (!item.is_object() || item.contains("error")) continue;
+            const std::string id = valueString(item, "id");
+            if (id.empty()) continue;
+            auto filesIt = item.find("files");
+            if (filesIt != item.end()) appendAllDebridFiles(*filesIt, out[id]);
+        }
+        return out;
+    }
+
+    void deleteMagnet(const std::string& id) const {
+        if (id.empty()) return;
+        try {
+            (void)apiPost(
+                "https://api.alldebrid.com/v4/magnet/delete",
+                "id=" + encode(id),
+                "AllDebrid delete"
+            );
+        } catch (...) {
+            // A failed cleanup must not discard otherwise useful cache results.
+        }
+    }
+};
+
+} // namespace
+
+std::unique_ptr<DebridBackend> createDebridBackend(const DebridConfig& config) {
+    if (config.apiKey.empty()) return nullptr;
+    if (config.service == DebridService::TorBox) return std::make_unique<TorBoxBackend>(config);
+    if (config.service == DebridService::AllDebrid) return std::make_unique<AllDebridBackend>(config);
+    return nullptr;
+}
+
+} // namespace sgb

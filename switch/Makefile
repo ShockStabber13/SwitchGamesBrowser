@@ -40,7 +40,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	SwitchGamesBrowser
 APP_TITLE := Switch Games Browser
 APP_AUTHOR := Nicholas Kwek
-APP_VERSION := 0.1.0
+APP_VERSION := 0.4.0
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
@@ -226,4 +226,4 @@ endif
 
 APP_TITLE := Switch Games Browser
 APP_AUTHOR := Nicholas Kwek
-APP_VERSION := 0.1.0
+APP_VERSION := 0.4.0

@@ -4,6 +4,7 @@
 #include <SDL2/SDL_image.h>
 #include <curl/curl.h>
 #include "catalog.hpp"
+#include "debrid.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -30,12 +31,17 @@ static std::string get(const std::string& url, size_t maxBytes) {
     if (!curl) throw std::runtime_error("Network initialization failed");
     Download d{{}, maxBytes};
     curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "SwitchGamesBrowser/0.1");
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "SwitchGamesBrowser/0.4");
     curl_easy_setopt(curl.get(), CURLOPT_CAINFO, "romfs:/cacert.pem");
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
-    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
+    #if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 3L);
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
@@ -113,6 +119,45 @@ static std::string score(const sgb::Game& g) {
     return std::to_string(static_cast<int>(g.rating + .5)) + "/100  (" + std::to_string(g.ratingCount) + " votes)";
 }
 struct CoverResult { std::string id, path; };
+struct DebridCheckResult { std::map<std::string, sgb::DebridTorrentStatus> rows; std::string message; };
+struct DebridAddResult { std::string hash; sgb::DebridTorrentStatus state; std::string message; };
+enum class Page { Browse, Detail, Torrents, Files };
+
+static DebridCheckResult liveDebridCheck(
+    const sgb::DebridConfig& config,
+    const std::vector<sgb::DebridCandidate>& candidates
+) {
+    DebridCheckResult result;
+    for (const auto& c : candidates) result.rows[c.infoHash] = {};
+    try {
+        auto backend = sgb::createDebridBackend(config);
+        if (!backend) throw std::runtime_error("Configure debridService and debridApiKey in config.json");
+        auto checked = backend->check(candidates);
+        for (auto& pair : checked) result.rows[pair.first] = std::move(pair.second);
+        result.message = sgb::debridServiceName(config.service) + " status refreshed";
+    } catch (const std::exception& e) {
+        result.message = e.what();
+    }
+    return result;
+}
+
+static DebridAddResult liveDebridAdd(
+    const sgb::DebridConfig& config,
+    const std::string& hash,
+    const std::string& magnet
+) {
+    DebridAddResult result; result.hash = hash;
+    try {
+        auto backend = sgb::createDebridBackend(config);
+        if (!backend) throw std::runtime_error("Configure debridService and debridApiKey in config.json");
+        result.state = backend->add(hash, magnet);
+        result.message = "Added to " + sgb::debridServiceName(config.service);
+    } catch (const std::exception& e) {
+        result.message = e.what();
+        result.hash.clear();
+    }
+    return result;
+}
 int main(int, char**) {
     if (appletGetAppletType() != AppletType_Application) {
         consoleInit(nullptr); printf("Launch in application mode: hold R while opening a game.\nPress + to exit.\n");
@@ -135,10 +180,28 @@ int main(int, char**) {
     SDL_RenderSetLogicalSize(renderer, 1280, 720);
     PadState pad; padConfigureInput(1, HidNpadStyleSet_NpadStandard); padInitializeDefault(&pad);
     std::vector<sgb::Game> games; std::set<std::string> favourites;
-    sgb::Filter filter; std::string url, status = "Set indexUrl in config.json, then press Y";
+    sgb::Filter filter;
+    std::string url, status = "Set indexUrl in config.json, then press Y";
+    sgb::DebridConfig debridConfig;
+    std::map<std::string, sgb::DebridTorrentStatus> debridStatuses;
     try { games = sgb::parse(sgb::read(root + "switch-index.json")); status = "Loaded cached index"; }
     catch (...) { try { games = sgb::parse(sgb::read(root + "switch-index.json.bak")); status = "Recovered previous cache"; } catch (...) {} }
-    try { url = sgb::field(sgb::Json::parse(sgb::read(root + "config.json", 65536)), "indexUrl", 2048); } catch (...) {}
+    try {
+        auto config = sgb::Json::parse(
+            sgb::read(root + "config.json", 65536)
+        );
+
+        url = sgb::field(config, "indexUrl", 2048);
+
+        debridConfig.service = sgb::parseDebridService(
+            config.value("debridService", "")
+        );
+
+        debridConfig.apiKey =
+            config.value("debridApiKey", "");
+
+    } catch (...) {}
+    try { debridStatuses = sgb::parseDebridStatusJson(sgb::read(root + "debrid-status.json", 8 * 1024 * 1024)); } catch (...) {}
     try {
         auto state = sgb::Json::parse(sgb::read(root + "state.json", 1024 * 1024));
         filter.search = state.value("search", ""); filter.genre = state.value("genre", "");
@@ -152,17 +215,75 @@ int main(int, char**) {
         catch (const std::exception& e) { status = e.what(); }
     };
     std::vector<size_t> rows = sgb::browse(games, filter, favourites);
-    size_t cursor = 0, releaseIndex = 0; bool detail = false, dirty = false;
+    size_t cursor = 0, releaseIndex = 0, torrentCursor = 0, fileCursor = 0;
+    Page page = Page::Browse; bool dirty = false;
+    std::set<size_t> selectedFiles;
     std::future<Refresh> pending; std::future<CoverResult> pendingCover;
+    std::future<DebridCheckResult> pendingDebridCheck;
+    std::future<DebridAddResult> pendingDebridAdd;
     std::map<std::string, SDL_Texture*> covers; std::set<std::string> attempted;
     auto rebuild = [&]() { rows = sgb::browse(games, filter, favourites); cursor = std::min(cursor, rows.empty() ? size_t(0) : rows.size()-1); dirty = true; };
+    auto filesFor = [&](const sgb::Release& release) {
+        std::vector<std::string> files;
+        auto found = debridStatuses.find(release.infoHash);
+        if (found != debridStatuses.end() && !found->second.files.empty()) {
+            for (const auto& file : found->second.files) if (!file.name.empty()) files.push_back(file.name);
+        }
+        if (files.empty()) files = release.files;
+        return files;
+    };
+    auto queueSelectedFiles = [&](const sgb::Game& g, const sgb::Release& release, const std::vector<std::string>& files) {
+        if (selectedFiles.empty()) { status = "Select at least one file"; return; }
+        auto queue = sgb::Json::array();
+        try { queue = sgb::Json::parse(sgb::read(root + "install-queue.json", 4 * 1024 * 1024)); } catch (...) {}
+        if (!queue.is_array()) throw std::runtime_error("Install queue format invalid");
+        sgb::Json chosen = sgb::Json::array();
+        for (size_t i : selectedFiles) if (i < files.size()) chosen.push_back(files[i]);
+        queue.push_back({{"gameId",g.id},{"gameTitle",g.title},{"releaseTitle",release.title},{"magnet",release.magnet},{"infoHash",release.infoHash},{"source",release.source},{"files",chosen}});
+        atomicWrite(root + "install-queue.json", queue.dump(2));
+        status = "Queued " + std::to_string(chosen.size()) + " selected file(s)";
+    };
+    auto saveDebridStatuses = [&]() {
+        try { atomicWrite(root + "debrid-status.json", sgb::serializeDebridStatusJson(debridStatuses)); }
+        catch (const std::exception& e) { status = e.what(); }
+    };
+    auto startDebridCheck = [&](const sgb::Game& g) {
+        if (debridConfig.service == sgb::DebridService::None || debridConfig.apiKey.empty()) {
+            status = "Configure debridService and debridApiKey in config.json";
+            return;
+        }
+        if (pendingDebridCheck.valid() || pendingDebridAdd.valid()) { status = "Debrid request already running"; return; }
+        std::vector<sgb::DebridCandidate> candidates;
+        candidates.reserve(g.releases.size());
+        for (const auto& rel : g.releases) candidates.push_back({rel.infoHash, rel.magnet});
+        status = "Checking " + sgb::debridServiceName(debridConfig.service) + "...";
+        auto configCopy = debridConfig;
+        pendingDebridCheck = std::async(std::launch::async, [configCopy, candidates]() {
+            return liveDebridCheck(configCopy, candidates);
+        });
+    };
+    auto startDebridAdd = [&](const sgb::Release& release) {
+        if (debridConfig.service == sgb::DebridService::None || debridConfig.apiKey.empty()) {
+            status = "Configure debridService and debridApiKey in config.json";
+            return;
+        }
+        if (pendingDebridCheck.valid() || pendingDebridAdd.valid()) { status = "Debrid request already running"; return; }
+        auto known = debridStatuses.find(release.infoHash);
+        if (known != debridStatuses.end() && known->second.downloaded) { status = "Already in debrid account"; return; }
+        status = "Adding to " + sgb::debridServiceName(debridConfig.service) + "...";
+        auto configCopy = debridConfig;
+        auto hash = release.infoHash, magnet = release.magnet;
+        pendingDebridAdd = std::async(std::launch::async, [configCopy, hash, magnet]() {
+            return liveDebridAdd(configCopy, hash, magnet);
+        });
+    };
     while (appletMainLoop()) {
         SDL_Event event; while (SDL_PollEvent(&event)) {} // libnx handles controller input below.
         padUpdate(&pad); u64 keys = padGetButtonsDown(&pad);
         if (keys & HidNpadButton_Plus) break;
         if (pending.valid() && pending.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto result = pending.get(); status = result.message;
-            if (!result.games.empty()) { games = std::move(result.games); detail = false; releaseIndex = 0; rebuild(); }
+            if (!result.games.empty()) { games = std::move(result.games); page = Page::Browse; releaseIndex = torrentCursor = fileCursor = 0; selectedFiles.clear(); rebuild(); }
         }
         if (pendingCover.valid() && pendingCover.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto c = pendingCover.get();
@@ -174,14 +295,25 @@ int main(int, char**) {
             // Bound decoded textures; disk cache remains reusable.
             if (covers.size() > 24) { auto i = covers.begin(); SDL_DestroyTexture(i->second); attempted.erase(i->first); covers.erase(i); }
         }
-        if (!detail) {
+        if (pendingDebridCheck.valid() && pendingDebridCheck.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            auto result = pendingDebridCheck.get();
+            for (auto& pair : result.rows) debridStatuses[pair.first] = std::move(pair.second);
+            saveDebridStatuses();
+            status = result.message;
+        }
+        if (pendingDebridAdd.valid() && pendingDebridAdd.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            auto result = pendingDebridAdd.get();
+            if (!result.hash.empty()) { debridStatuses[result.hash] = std::move(result.state); saveDebridStatuses(); }
+            status = result.message;
+        }
+        if (page == Page::Browse) {
             if ((keys & HidNpadButton_Left) && cursor) --cursor;
             if ((keys & HidNpadButton_Right) && cursor+1 < rows.size()) ++cursor;
             if ((keys & HidNpadButton_Up) && cursor >= 4) cursor -= 4;
             if ((keys & HidNpadButton_Down) && cursor+4 < rows.size()) cursor += 4;
             if (keys & HidNpadButton_L) cursor = cursor >= 8 ? cursor-8 : 0;
             if (keys & HidNpadButton_R) cursor = rows.empty() ? 0 : std::min(cursor+8, rows.size()-1);
-            if ((keys & HidNpadButton_A) && !rows.empty()) { detail = true; releaseIndex = 0; }
+            if ((keys & HidNpadButton_A) && !rows.empty()) { page = Page::Detail; releaseIndex = torrentCursor = fileCursor = 0; selectedFiles.clear(); }
             if (keys & HidNpadButton_X) { filter.search = keyboard("Search Switch games", filter.search); cursor = 0; rebuild(); }
             if (keys & HidNpadButton_B) { filter = {}; cursor = 0; rebuild(); }
             if (keys & HidNpadButton_ZL) { filter.sort = static_cast<sgb::Sort>((static_cast<int>(filter.sort)+1)%3); cursor = 0; rebuild(); }
@@ -199,24 +331,47 @@ int main(int, char**) {
             if (keys & HidNpadButton_StickR) { filter.minReviews = filter.minReviews == 0 ? 10 : filter.minReviews == 10 ? 50 : filter.minReviews == 50 ? 100 : 0; cursor = 0; rebuild(); }
         } else if (!rows.empty()) {
             const auto& g = games[rows[cursor]];
-            if (keys & HidNpadButton_B) detail = false;
-            if (keys & HidNpadButton_X) { if (favourites.count(g.id)) favourites.erase(g.id); else favourites.insert(g.id); dirty = true; }
-            if ((keys & HidNpadButton_Left) && releaseIndex) --releaseIndex;
-            if ((keys & HidNpadButton_Right) && releaseIndex+1 < g.releases.size()) ++releaseIndex;
-            if (keys & HidNpadButton_A) {
-                try {
-                    auto queue = sgb::Json::array();
-                    try { queue = sgb::Json::parse(sgb::read(root + "magnet-queue.json", 4 * 1024 * 1024)); } catch (...) {}
-                    if (!queue.is_array()) throw std::runtime_error("Queue format invalid");
-                    bool exists = false; const auto& release = g.releases[releaseIndex];
-                    for (const auto& entry : queue) if (entry.value("magnet", "") == release.magnet) exists = true;
-                    if (!exists) queue.push_back({{"gameId",g.id},{"title",release.title},{"magnet",release.magnet}});
-                    atomicWrite(root + "magnet-queue.json", queue.dump(2)); status = "Magnet saved to SD (downloader integration pending)";
-                } catch (const std::exception& e) { status = e.what(); }
+            if (page == Page::Detail) {
+                if (keys & HidNpadButton_B) page = Page::Browse;
+                if (keys & HidNpadButton_X) { if (favourites.count(g.id)) favourites.erase(g.id); else favourites.insert(g.id); dirty = true; }
+                if (keys & HidNpadButton_A) {
+                    if (g.releases.empty()) status = "No torrents available for this game";
+                    else { page = Page::Torrents; torrentCursor = 0; selectedFiles.clear(); startDebridCheck(g); }
+                }
+            } else if (page == Page::Torrents) {
+                if (keys & HidNpadButton_B) page = Page::Detail;
+                if ((keys & HidNpadButton_Up) && torrentCursor) --torrentCursor;
+                if ((keys & HidNpadButton_Down) && torrentCursor+1 < g.releases.size()) ++torrentCursor;
+                if (keys & HidNpadButton_L) torrentCursor = torrentCursor >= 8 ? torrentCursor-8 : 0;
+                if (keys & HidNpadButton_R) torrentCursor = g.releases.empty() ? 0 : std::min(torrentCursor+8, g.releases.size()-1);
+                if ((keys & HidNpadButton_A) && !g.releases.empty()) startDebridAdd(g.releases[torrentCursor]);
+                if (keys & HidNpadButton_Y) startDebridCheck(g);
+                if ((keys & HidNpadButton_X) && !g.releases.empty()) {
+                    releaseIndex = torrentCursor; fileCursor = 0; selectedFiles.clear(); page = Page::Files;
+                }
+            } else if (page == Page::Files && releaseIndex < g.releases.size()) {
+                const auto& release = g.releases[releaseIndex];
+                auto files = filesFor(release);
+                if (keys & HidNpadButton_B) { page = Page::Torrents; selectedFiles.clear(); }
+                if ((keys & HidNpadButton_Up) && fileCursor) --fileCursor;
+                if ((keys & HidNpadButton_Down) && fileCursor+1 < files.size()) ++fileCursor;
+                if (keys & HidNpadButton_L) fileCursor = fileCursor >= 10 ? fileCursor-10 : 0;
+                if (keys & HidNpadButton_R) fileCursor = files.empty() ? 0 : std::min(fileCursor+10, files.size()-1);
+                if ((keys & HidNpadButton_A) && !files.empty()) {
+                    if (selectedFiles.count(fileCursor)) selectedFiles.erase(fileCursor); else selectedFiles.insert(fileCursor);
+                }
+                if ((keys & HidNpadButton_X) && !files.empty()) {
+                    if (selectedFiles.size() == files.size()) selectedFiles.clear();
+                    else { selectedFiles.clear(); for (size_t i = 0; i < files.size(); ++i) selectedFiles.insert(i); }
+                }
+                if (keys & HidNpadButton_Y) {
+                    try { queueSelectedFiles(g, release, files); }
+                    catch (const std::exception& e) { status = e.what(); }
+                }
             }
         }
-        if ((keys & HidNpadButton_B) && !detail) rebuild();
-        if ((keys & HidNpadButton_Y) && !pending.valid()) {
+        if ((keys & HidNpadButton_B) && page == Page::Browse) rebuild();
+        if (page == Page::Browse && (keys & HidNpadButton_Y) && !pending.valid()) {
             if (url.empty()) status = "Configure indexUrl on SD first";
             else { status = "Refreshing index..."; pending = std::async(std::launch::async, refresh, url); }
         }
@@ -224,21 +379,61 @@ int main(int, char**) {
         SDL_SetRenderDrawColor(renderer, 0,0,0,255); SDL_RenderClear(renderer);
         label(renderer, big, "SWITCH GAMES", 32,22,850,green);
         label(renderer, small, std::to_string(rows.size()) + " games", 1050,32,200,muted);
-        if (detail && !rows.empty()) {
+        if (page == Page::Detail && !rows.empty()) {
             const auto& g = games[rows[cursor]];
             label(renderer,big,g.title,32,85,1200);
             label(renderer,small,score(g) + "  " + g.ratingSource,32,140,1200,green);
-            label(renderer,small,"Released: " + (g.date.empty() ? "Unknown" : g.date) + "  Title ID: " + g.titleId,32,178,1200,muted);
+            label(renderer,small,"Released: " + (g.date.empty() ? "Unknown" : g.date) + "  Torrents: " + std::to_string(g.releases.size()),32,178,1200,muted);
             label(renderer,small,g.ratingUrl,32,215,1200,muted);
             SDL_RenderSetClipRect(renderer,nullptr);
-            SDL_Rect summaryBox{32,260,1200,180}; SDL_RenderSetClipRect(renderer,&summaryBox);
+            SDL_Rect summaryBox{32,260,1200,250}; SDL_RenderSetClipRect(renderer,&summaryBox);
             label(renderer,small,g.summary.empty() ? "No description available" : g.summary,32,260,1200,white,true);
             SDL_RenderSetClipRect(renderer,nullptr);
+            label(renderer,small,"Debrid: " + sgb::debridServiceName(debridConfig.service),32,535,1200,muted);
+            label(renderer,small,favourites.count(g.id) ? "Saved to favourites" : "X: Add to favourites",32,575,1200,green);
+            label(renderer,small,"A Torrents | X Favourite | B Back",32,620,1200);
+        } else if (page == Page::Torrents && !rows.empty()) {
+            const auto& g = games[rows[cursor]];
+            label(renderer,big,g.title,32,78,1200);
+            label(renderer,small,"TORRENTS  |  A Add to Debrid  |  X View Files  |  Y Refresh Status  |  B Back",32,122,1200,muted);
+            size_t startRow = (torrentCursor / 7) * 7;
+            for (size_t slot = 0; slot < 7 && startRow + slot < g.releases.size(); ++slot) {
+                size_t index = startRow + slot;
+                const auto& rel = g.releases[index];
+                int y = 158 + static_cast<int>(slot) * 70;
+                SDL_Rect box{32,y,1216,62};
+                rect(renderer,box,SDL_Color{18,18,18,255});
+                if (index == torrentCursor) { rect(renderer,box,green,true); rect(renderer,{33,y+1,1214,60},green,true); }
+                label(renderer,small,rel.title,48,y+7,1150);
+                auto st = debridStatuses.find(rel.infoHash);
+                std::string state = "Cached: Unknown  Downloaded: Unknown";
+                SDL_Color stateColour = muted;
+                if (st != debridStatuses.end()) {
+                    state = std::string("Cached: ") + (st->second.cached ? "True" : "False") +
+                        "  Downloaded: " + (st->second.downloaded ? "True" : "False");
+                    if (st->second.cached) stateColour = green;
+                }
+                label(renderer,small,rel.source + "  " + rel.size + "  " + state,48,y+34,1150,stateColour);
+            }
+            if (g.releases.empty()) label(renderer,big,"No torrents available",32,300,1200,muted);
+        } else if (page == Page::Files && !rows.empty()) {
+            const auto& g = games[rows[cursor]];
             const auto& rel = g.releases[releaseIndex];
-            label(renderer,small,"Release " + std::to_string(releaseIndex+1) + "/" + std::to_string(g.releases.size()) + ": " + rel.title,32,470,1200);
-            label(renderer,small,"Size: " + rel.size,32,510,1200,muted);
-            label(renderer,small,favourites.count(g.id) ? "Saved to favourites" : "X: Add to favourites",32,550,1200,green);
-            label(renderer,small,"A Save magnet | Left/Right Release | X Favourite | B Back",32,610,1200);
+            auto files = filesFor(rel);
+            label(renderer,big,"FILES",32,75,300,green);
+            label(renderer,small,rel.title,190,82,1030);
+            label(renderer,small,std::to_string(selectedFiles.size()) + " selected  |  A Toggle  |  X Select All  |  Y Queue Selected  |  B Back",32,120,1216,muted);
+            size_t startRow = (fileCursor / 9) * 9;
+            for (size_t slot = 0; slot < 9 && startRow + slot < files.size(); ++slot) {
+                size_t index = startRow + slot;
+                int y = 158 + static_cast<int>(slot) * 53;
+                SDL_Rect box{32,y,1216,46};
+                rect(renderer,box,SDL_Color{18,18,18,255});
+                if (index == fileCursor) { rect(renderer,box,green,true); rect(renderer,{33,y+1,1214,44},green,true); }
+                std::string mark = selectedFiles.count(index) ? "[x] " : "[ ] ";
+                label(renderer,small,mark + files[index],48,y+11,1150,selectedFiles.count(index) ? green : white);
+            }
+            if (files.empty()) label(renderer,big,"No file list available for this torrent",32,300,1200,muted);
         } else {
             static const char* sortLabels[] = {"Title A-Z","Highest rated","Newest"};
             label(renderer,small,std::string(sortLabels[static_cast<int>(filter.sort)]) + " | " + (filter.genre.empty() ? "All genres" : filter.genre) + " | Min " + std::to_string(static_cast<int>(filter.minRating)) + " | Votes " + std::to_string(filter.minReviews) + (filter.favouritesOnly ? " | Favourites" : "") + (filter.search.empty() ? "" : " | " + filter.search),32,68,1216,muted);
@@ -269,6 +464,8 @@ int main(int, char**) {
         SDL_RenderPresent(renderer);
     }
     stopping = true; if (pending.valid()) pending.wait(); if (pendingCover.valid()) pendingCover.wait();
+    if (pendingDebridCheck.valid()) pendingDebridCheck.wait();
+    if (pendingDebridAdd.valid()) pendingDebridAdd.wait();
     saveState(); for (auto& p : covers) SDL_DestroyTexture(p.second);
     TTF_CloseFont(small); TTF_CloseFont(big); SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window);
     IMG_Quit(); TTF_Quit(); SDL_Quit(); plExit(); curl_global_cleanup(); romfsExit(); socketExit();
