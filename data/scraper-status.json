@@ -1,0 +1,26 @@
+{
+  "generatedAt": "2026-10-05T16:15:54.544742+00:00",
+  "providers": {
+    "ThePirateBay": {
+      "status": "ok",
+      "rows": 214,
+      "usedPrevious": false
+    },
+    "Bitsearch": {
+      "status": "failed",
+      "rows": 0,
+      "usedPrevious": false
+    },
+    "LimeTorrents": {
+      "status": "failed",
+      "rows": 0,
+      "usedPrevious": false
+    },
+    "Knaben": {
+      "status": "ok",
+      "rows": 451,
+      "usedPrevious": false
+    }
+  },
+  "uniqueReleases": 484
+}
