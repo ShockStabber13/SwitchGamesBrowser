@@ -308,34 +308,28 @@ def main():
 
         rows = []
         local_failures = []
+        searches = 0
+        provider_failures = 0
 
         for term in search_terms_for_game(game):
-            source_stats[source]["searches"] += 1
+            searches += 1
 
             try:
-                raw = provider.search(term)
-
-                if raw is None:
-                    raw = []
+                raw = provider.search(term) or []
 
                 for item in raw:
                     normalized = normalize_provider_result(
-                        game,
-                        provider,
-                        item,
+                        game, provider, item
                     )
-
                     if normalized:
                         rows.append(normalized)
 
             except Exception as error:
-                source_stats[source]["failures"] += 1
+                provider_failures += 1
 
-                fallback = old_by_game_source.get(
-                    (gid, source),
-                    [],
+                rows.extend(
+                    old_by_game_source.get((gid, source), [])
                 )
-                rows.extend(fallback)
 
                 local_failures.append({
                     "gameId": gid,
@@ -345,52 +339,59 @@ def main():
                     "error": str(error)[:300],
                 })
 
-        if rows:
-            source_stats[source]["matchedGames"] += 1
-            source_stats[source]["releases"] += len(rows)
+        return {
+            "gameId": gid,
+            "source": source,
+            "rows": rows,
+            "failures": local_failures,
+            "searches": searches,
+            "providerFailures": provider_failures,
+        }
 
-        return rows, local_failures
+    workers = max(1, min(args.workers, 32))
 
-    workers = max(
-        1,
-        min(args.workers, len(providers), 16),
-    )
+    jobs = []
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=workers
     ) as pool:
 
-        for index, game in enumerate(games, 1):
+        for game in games:
             gid = str(game.get("id", ""))
             name = str(game.get("name", "")).strip()
 
             if not gid or not name:
                 continue
 
-            futures = [
-                pool.submit(
-                    search_provider,
-                    game,
-                    provider,
+            for provider in providers:
+                jobs.append(
+                    pool.submit(search_provider, game, provider)
                 )
-                for provider in providers
-            ]
 
-            game_rows = []
+        total = len(jobs)
 
-            for future in futures:
-                rows, errors = future.result()
-                game_rows.extend(rows)
-                failures.extend(errors)
+        for completed, future in enumerate(
+            concurrent.futures.as_completed(jobs), 1
+        ):
+            result = future.result()
 
-            if game_rows:
-                matched_games.add(gid)
-                collected.extend(game_rows)
+            source = result["source"]
+            rows = result["rows"]
 
-            if index % 100 == 0:
+            source_stats[source]["searches"] += result["searches"]
+            source_stats[source]["failures"] += result["providerFailures"]
+
+            if rows:
+                source_stats[source]["matchedGames"] += 1
+                source_stats[source]["releases"] += len(rows)
+                matched_games.add(result["gameId"])
+                collected.extend(rows)
+
+            failures.extend(result["failures"])
+
+            if completed % 100 == 0:
                 print(
-                    f"Searched {index}/{len(games)} games "
-                    f"across {len(providers)} providers; "
+                    f"Completed {completed}/{total} searches; "
                     f"{len(collected)} raw releases",
                     flush=True,
                 )
