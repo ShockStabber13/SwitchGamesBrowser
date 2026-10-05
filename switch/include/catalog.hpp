@@ -38,7 +38,6 @@ inline std::vector<Game> parse(const std::string& bytes) {
     if (!rows.is_array() || rows.empty() || rows.size() > 20000) throw std::runtime_error("Invalid game count");
     std::vector<Game> result;
     std::set<std::string> ids;
-    size_t totalReleases = 0;
     for (const auto& row : rows) {
         Game g;
         g.id = field(row, "id", 64); g.title = field(row, "title", 1024);
@@ -56,7 +55,7 @@ inline std::vector<Game> parse(const std::string& bytes) {
             for (auto& genre : row["genres"]) if (genre.is_string()) g.genres.push_back(genre.get<std::string>().substr(0, 256));
         }
         auto& releases = row.at("releases");
-        if (!releases.is_array() || (totalReleases += releases.size()) > 20000) throw std::runtime_error("Invalid release count");
+        if (!releases.is_array()) throw std::runtime_error("Invalid release list");
         for (const auto& r : releases) {
             Release release{field(r, "title", 1024), field(r, "magnet", 4096), field(r, "size", 100), field(r, "infoHash", 64), field(r, "source", 128), {}};
             if (r.contains("files") && r["files"].is_array()) {
