@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-05T15:34:13.558101+00:00",
+  "gameCount": 7099,
+  "bytes": 19070890,
+  "sha256": "e32864f1d64ba5c67a134ccf17aad010aded62510b6d9f3af3e509fa87624801",
+  "matchReport": {
+    "matched": 0,
+    "unmatched": 7187,
+    "ambiguous": 0,
+    "invalid": 0,
+    "duplicates": 0
+  }
+}
