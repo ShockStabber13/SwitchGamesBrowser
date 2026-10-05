@@ -24,11 +24,15 @@ jobs:
           python-version: '3.12'
       - uses: actions/cache@v4
         with:
-          path: data/metadata-cache.json
+          path: |
+            data/metadata-cache.json
+            data/provider-releases.json
           key: rawg-metadata-${{ github.run_id }}
           restore-keys: rawg-metadata-
       - name: Test builder
         run: python -m unittest discover -s tests -v
+      - name: Scrape MoviesAndSeries sources
+        run: python tools/scrape_torrents.py
       - name: Refresh catalog
         env:
           RAWG_API_KEY: ${{ secrets.RAWG_API_KEY }}
@@ -39,13 +43,13 @@ jobs:
           if [ -n "$RAWG_API_KEY" ] && { [ "$REFRESH_RATINGS" = "true" ] || [ ! -f data/metadata-cache.json ] || [ "$(date -u +%u)" = "7" ]; }; then
             args+=(--fetch-rawg)
           fi
-          python tools/build_index.py "${args[@]}"
+          python tools/build_index.py --source data/provider-releases.json --allow-shrink "${args[@]}"
       - name: Commit validated index
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add data/switch-index.json data/manifest.json
+          git add data/switch-index.json data/manifest.json data/scraper-status.json
           if ! git diff --cached --quiet; then
             git commit -m 'Refresh Switch catalog and ratings'
             git push

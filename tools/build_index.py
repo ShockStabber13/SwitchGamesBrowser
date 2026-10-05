@@ -177,7 +177,7 @@ def compile_index(releases, metadata, overrides=None):
                 row['coverUrl'] = ''
             groups[group] = row
             rows.append(row)
-        groups[group]['releases'].append({'title': title, 'infoHash': digest, 'magnet': magnet, 'size': text(str(release.get('size', '')), 100), 'source': 'Imported catalog', 'topicId': text(str(release.get('topic_id', '')), 32)})
+        groups[group]['releases'].append({'title': title, 'infoHash': digest, 'magnet': magnet, 'size': text(str(release.get('size', '')), 100), 'source': text(release.get('source') or 'Imported catalog', 128), 'sources': release.get('sources', []), 'topicId': text(str(release.get('topic_id', '')), 32)})
     rows.sort(key=lambda row: (normalise(row['title']), row['id']))
     if not rows:
         raise ValueError('No valid games; refusing to replace the previous index')
@@ -198,6 +198,7 @@ def main():
     parser.add_argument('--fetch-rawg', action='store_true')
     parser.add_argument('--overrides', default='data/match-overrides.json')
     parser.add_argument('--output', default='data')
+    parser.add_argument('--allow-shrink', action='store_true', help='Accept a smaller catalog when intentionally switching sources')
     args = parser.parse_args()
     root = Path(args.output)
     releases = read_json(args.source) if args.source else fetch_json(args.source_url)
@@ -216,7 +217,7 @@ def main():
     index, report = compile_index(releases, metadata, overrides)
     if (root / 'switch-index.json').exists():
         old = read_json(root / 'switch-index.json')
-        if len(index['games']) < len(old.get('games', [])) * 0.7:
+        if not args.allow_shrink and len(index['games']) < len(old.get('games', [])) * 0.7:
             raise ValueError('Catalog shrank over 30%; previous index was preserved')
     payload = json.dumps(index, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()
     if len(payload) > MAX_BYTES:

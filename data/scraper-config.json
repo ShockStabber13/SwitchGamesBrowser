@@ -1,0 +1,5 @@
+{
+  "sources": ["ThePirateBay", "Bitsearch", "LimeTorrents", "Knaben"],
+  "queries": ["Nintendo Switch", "NSP", "NSZ", "XCI"],
+  "maxPagesPerQuery": 3
+}
