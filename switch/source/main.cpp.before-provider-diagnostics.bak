@@ -7,7 +7,6 @@
 #include "debrid.hpp"
 #include "provider.hpp"
 #include "live_search.hpp"
-#include "provider_diagnostics.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -959,7 +958,7 @@ static std::vector<std::string> coverCandidates(
 
 struct DebridCheckResult { std::map<std::string, sgb::DebridTorrentStatus> rows; std::string message; };
 struct DebridAddResult { std::string hash; sgb::DebridTorrentStatus state; std::string message; };
-enum class Page { Browse, Detail, Torrents, Files, Settings, Providers, SearchProgress, Options };
+enum class Page { Browse, Detail, Torrents, Files, Settings, Providers, SearchProgress };
 
 static DebridCheckResult liveDebridCheck(
     const sgb::DebridConfig& config,
@@ -1019,7 +1018,7 @@ int main(int, char**) {
     PadState pad; padConfigureInput(1, HidNpadStyleSet_NpadStandard); padInitializeDefault(&pad);
     std::vector<sgb::Game> games; std::set<std::string> favourites;
     sgb::Filter filter;
-    std::string url, status = "Press - for Options";
+    std::string url, status = "Press Y for Settings";
     sgb::DebridConfig debridConfig;
     std::map<std::string, sgb::DebridTorrentStatus> debridStatuses;
 
@@ -1128,7 +1127,6 @@ int main(int, char**) {
     std::vector<size_t> rows = sgb::browse(games, filter, favourites);
     size_t cursor = 0, releaseIndex = 0, torrentCursor = 0, fileCursor = 0;
     size_t settingsCursor = 0, providerCursor = 0;
-    size_t optionsCursor = 0;
     std::optional<sgb::AllDebridPinAuth> allDebridPin;
     loadCoverPackManifest();
 
@@ -1292,18 +1290,7 @@ int main(int, char**) {
                 torrentCursor = 0;
                 selectedFiles.clear();
                 status = result.message;
-
-                if (
-                    games[liveSearchGameIndex]
-                        .releases.empty()
-                ) {
-                    page =
-                        Page::SearchProgress;
-                }
-                else {
-                    page =
-                        Page::Torrents;
-                }
+                page = Page::Torrents;
             }
         }
         if (page == Page::Browse) {
@@ -1314,98 +1301,26 @@ int main(int, char**) {
             if (keys & HidNpadButton_L) cursor = cursor >= 10 ? cursor-10 : 0;
             if (keys & HidNpadButton_R) cursor = rows.empty() ? 0 : std::min(cursor+10, rows.size()-1);
             if ((keys & HidNpadButton_A) && !rows.empty()) { page = Page::Detail; releaseIndex = torrentCursor = fileCursor = 0; selectedFiles.clear(); }
+            if (keys & HidNpadButton_X) { filter.search = keyboard("Search Switch games", filter.search); cursor = 0; rebuild(); }
+            if (keys & HidNpadButton_B) { filter = {}; cursor = 0; rebuild(); }
+            if (keys & HidNpadButton_ZL) { filter.sort = static_cast<sgb::Sort>((static_cast<int>(filter.sort)+1)%3); cursor = 0; rebuild(); }
+            if (keys & HidNpadButton_ZR) { filter.favouritesOnly = !filter.favouritesOnly; cursor = 0; rebuild(); }
             if (keys & HidNpadButton_Minus) {
-                optionsCursor = 0;
-                page = Page::Options;
+                filter.minRating = filter.minRating == 0 ? 70 : filter.minRating == 70 ? 80 : filter.minRating == 80 ? 90 : 0;
+                cursor = 0; rebuild();
             }
+            if (keys & HidNpadButton_StickL) {
+                std::set<std::string> genres; for (const auto& g : games) for (const auto& genre : g.genres) genres.insert(genre);
+                if (filter.genre.empty()) { if (!genres.empty()) filter.genre = *genres.begin(); }
+                else { auto next = genres.upper_bound(filter.genre); filter.genre = next == genres.end() ? "" : *next; }
+                cursor = 0; rebuild();
+            }
+            if (keys & HidNpadButton_StickR) { filter.minReviews = filter.minReviews == 0 ? 10 : filter.minReviews == 10 ? 50 : filter.minReviews == 50 ? 100 : 0; cursor = 0; rebuild(); }
             if (keys & HidNpadButton_Y) {
                 settingsCursor = 0;
                 page = Page::Settings;
             }
-        } else if (page == Page::Options) {
-            if ((keys & HidNpadButton_Up) && optionsCursor > 0)
-                --optionsCursor;
-
-            if ((keys & HidNpadButton_Down) && optionsCursor < 7)
-                ++optionsCursor;
-
-            if (keys & HidNpadButton_B) {
-                page = Page::Browse;
-            }
-
-            if (keys & HidNpadButton_A) {
-                if (optionsCursor == 0) {
-                    filter.search = keyboard(
-                        "Search Switch games",
-                        filter.search
-                    );
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 1) {
-                    filter.sort = static_cast<sgb::Sort>(
-                        (static_cast<int>(filter.sort) + 1) % 3
-                    );
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 2) {
-                    std::set<std::string> genres;
-                    for (const auto& game : games) {
-                        for (const auto& genre : game.genres)
-                            genres.insert(genre);
-                    }
-
-                    if (filter.genre.empty()) {
-                        if (!genres.empty())
-                            filter.genre = *genres.begin();
-                    }
-                    else {
-                        auto next = genres.upper_bound(filter.genre);
-                        filter.genre =
-                            next == genres.end()
-                                ? ""
-                                : *next;
-                    }
-
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 3) {
-                    filter.minRating =
-                        filter.minRating == 0 ? 70 :
-                        filter.minRating == 70 ? 80 :
-                        filter.minRating == 80 ? 90 : 0;
-
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 4) {
-                    filter.minReviews =
-                        filter.minReviews == 0 ? 10 :
-                        filter.minReviews == 10 ? 50 :
-                        filter.minReviews == 50 ? 100 : 0;
-
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 5) {
-                    filter.favouritesOnly =
-                        !filter.favouritesOnly;
-
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 6) {
-                    filter = {};
-                    cursor = 0;
-                    rebuild();
-                    status = "Filters reset";
-                }
-                else {
-                    page = Page::Browse;
-                }
-            }        } else if (page == Page::Settings) {
+        } else if (page == Page::Settings) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
@@ -1642,80 +1557,7 @@ int main(int, char**) {
         SDL_SetRenderDrawColor(renderer, 0,0,0,255); SDL_RenderClear(renderer);
         label(renderer, big, "SWITCH GAMES", 32,22,850,green);
         label(renderer, small, std::to_string(rows.size()) + " games", 1050,32,200,muted);
-        if (page == Page::Options) {
-            static const char* optionSortLabels[] = {
-                "Title A-Z",
-                "Highest rated",
-                "Newest"
-            };
-
-            label(
-                renderer,big,
-                "FILTER / SORT OPTIONS",
-                32,70,1200,green
-            );
-
-            label(
-                renderer,small,
-                "A Change / Select  |  B Back",
-                32,112,1200,muted
-            );
-
-            std::vector<std::string> optionRows{
-                "Search: " +
-                    (filter.search.empty() ? std::string("Any") : filter.search),
-
-                "Sort: " +
-                    std::string(optionSortLabels[static_cast<int>(filter.sort)]),
-
-                "Genre: " +
-                    (filter.genre.empty() ? std::string("All genres") : filter.genre),
-
-                "Minimum rating: " +
-                    (filter.minRating == 0
-                        ? std::string("Any")
-                        : std::to_string(static_cast<int>(filter.minRating)) + "+"),
-
-                "Minimum votes: " +
-                    (filter.minReviews == 0
-                        ? std::string("Any")
-                        : std::to_string(filter.minReviews) + "+"),
-
-                "Favourites only: " +
-                    std::string(filter.favouritesOnly ? "On" : "Off"),
-
-                "Reset filters",
-                "Back"
-            };
-
-            for (size_t i = 0; i < optionRows.size(); ++i) {
-                int y = 150 + static_cast<int>(i) * 61;
-                SDL_Rect box{32,y,1216,53};
-
-                rect(
-                    renderer,
-                    box,
-                    SDL_Color{18,18,18,255}
-                );
-
-                if (i == optionsCursor) {
-                    rect(renderer,box,green,true);
-                    rect(
-                        renderer,
-                        {33,y+1,1214,51},
-                        green,
-                        true
-                    );
-                }
-
-                label(
-                    renderer,small,
-                    optionRows[i],
-                    52,y+14,1160,
-                    i == optionsCursor ? green : white
-                );
-            }
-        } else if (page == Page::SearchProgress) {
+        if (page == Page::SearchProgress) {
             const std::string gameTitle =
                 liveSearchGameIndex < games.size()
                     ? games[liveSearchGameIndex].title
@@ -1775,95 +1617,6 @@ int main(int, char**) {
                     "Latest provider: " + provider,
                     32,405,1200,muted
                 );
-            }
-
-            const auto providerDiagnostics =
-                sgb::providerDiagnosticsSnapshot();
-
-            const sgb::ProviderDiagnostic*
-                currentDiagnostic = nullptr;
-
-            if (!provider.empty()) {
-                for (const auto& diagnostic :
-                     providerDiagnostics) {
-                    if (diagnostic.id == provider) {
-                        currentDiagnostic =
-                            &diagnostic;
-                        break;
-                    }
-                }
-            }
-
-            if (
-                !currentDiagnostic &&
-                !providerDiagnostics.empty()
-            ) {
-                currentDiagnostic =
-                    &providerDiagnostics.back();
-            }
-
-            if (currentDiagnostic) {
-                const std::string httpText =
-                    currentDiagnostic->httpStatus
-                        ? std::to_string(
-                            currentDiagnostic->httpStatus
-                        )
-                        : "-";
-
-                label(
-                    renderer,
-                    small,
-                    "HTTP: " + httpText +
-                    " | Requests: " +
-                    std::to_string(
-                        currentDiagnostic->requests
-                    ) +
-                    " | Bytes: " +
-                    std::to_string(
-                        currentDiagnostic->responseBytes
-                    ) +
-                    " | Candidates: " +
-                    std::to_string(
-                        currentDiagnostic->candidates
-                    ),
-                    32,610,1200,white
-                );
-
-                std::string finalUrl =
-                    currentDiagnostic->finalUrl;
-
-                if (finalUrl.size() > 110) {
-                    finalUrl =
-                        finalUrl.substr(0,107) +
-                        "...";
-                }
-
-                if (!finalUrl.empty()) {
-                    label(
-                        renderer,
-                        small,
-                        "Final URL: " + finalUrl,
-                        32,640,1200,muted
-                    );
-                }
-
-                if (!currentDiagnostic->error.empty()) {
-                    std::string errorText =
-                        currentDiagnostic->error;
-
-                    if (errorText.size() > 110) {
-                        errorText =
-                            errorText.substr(0,107) +
-                            "...";
-                    }
-
-                    label(
-                        renderer,
-                        small,
-                        "Error: " + errorText,
-                        32,670,1200,white
-                    );
-                }
             }
 
             size_t percent = 0;
@@ -2432,8 +2185,8 @@ int main(int, char**) {
                 }
             }
             if (rows.empty()) label(renderer,big,games.empty() ? "Press Y to load your GitHub index" : "No games match these filters",32,260,1200,muted);
-            label(renderer,small,"- Options  |  A Details  |  Y Settings  |  + Exit",32,648,1216,muted);
-
+            label(renderer,small,"A Details | X Search | Y Settings | ZL Sort | ZR Favourites | - Rating",32,580,1216);
+            label(renderer,small,"L/R Page | Left stick Genre | Right stick Votes | B Reset | + Exit",32,614,1216,muted);
         }
         label(renderer,small,status,32,675,1216,green);
         SDL_RenderPresent(renderer);

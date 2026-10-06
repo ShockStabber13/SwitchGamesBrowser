@@ -1,0 +1,24 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+namespace sgb {
+
+struct ProviderResult {
+    std::string title;
+    std::string magnet;
+    std::string infoHash;
+};
+
+class Provider {
+public:
+    virtual ~Provider() = default;
+
+    virtual std::string id() const = 0;
+
+    virtual std::vector<ProviderResult>
+    search(const std::string& query) = 0;
+};
+
+} // namespace sgb

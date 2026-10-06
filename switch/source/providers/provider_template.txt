@@ -1,0 +1,95 @@
+#include "provider.hpp"
+
+#include <curl/curl.h>
+
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+    auto* output = static_cast<std::string*>(userdata);
+    const size_t bytes = size * nmemb;
+    output->append(ptr, bytes);
+    return bytes;
+}
+
+std::string httpGet(const std::string& url)
+{
+    CURL* curl = curl_easy_init();
+    if (!curl)
+        throw std::runtime_error("curl_easy_init failed");
+
+    std::string response;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "SwitchGamesBrowser/1.0");
+
+    const CURLcode code = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (code != CURLE_OK)
+        throw std::runtime_error(curl_easy_strerror(code));
+
+    return response;
+}
+
+std::string urlEncode(const std::string& value)
+{
+    CURL* curl = curl_easy_init();
+    if (!curl)
+        return value;
+
+    char* encoded = curl_easy_escape(
+        curl, value.c_str(), static_cast<int>(value.size()));
+    std::string result = encoded ? encoded : value;
+
+    if (encoded)
+        curl_free(encoded);
+    curl_easy_cleanup(curl);
+    return result;
+}
+
+} // namespace
+
+class MyProvider final : public sgb::Provider {
+public:
+    std::string id() const override { return "my_provider"; }
+
+    std::vector<sgb::ProviderResult> search(const std::string& query) override
+    {
+        std::vector<sgb::ProviderResult> results;
+
+        const std::string url =
+            "https://YOUR-SOURCE.example/search?q=" + urlEncode(query);
+        const std::string body = httpGet(url);
+
+        // Adapt your provider parsing here.
+        //
+        // For each result:
+        //
+        // sgb::ProviderResult result;
+        // result.title = "...";
+        // result.magnet = "...";
+        // result.infoHash = "...";
+        //
+        // if (!result.title.empty() &&
+        //     (!result.magnet.empty() || !result.infoHash.empty())) {
+        //     results.push_back(std::move(result));
+        // }
+        //
+        // Do not filter NSP/NSZ/XCI/XCZ here; later stages can decide
+        // which files from an otherwise valid provider result are usable.
+
+        (void)body;
+        return results;
+    }
+};
+
