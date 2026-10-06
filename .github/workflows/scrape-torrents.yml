@@ -53,8 +53,8 @@ jobs:
           compression-level: 9
           retention-days: 14
 
-      - name: Build Switch index
-        run: python tools/build_igdb_index.py --allow-shrink
+      - name: Build torrent shards
+        run: python tools/build_torrent_shards.py
 
       - name: Commit torrent index
         run: |
@@ -70,6 +70,9 @@ jobs:
           if git diff --cached --quiet; then
             echo "No torrent/index changes."
           else
-            git commit -m "Refresh torrent index"
+            git add data/torrent-manifest.json
+git add data/torrent-index-*.json
+git add data/scraper-status.json
+git commit -m "Refresh torrent index"
             git push
           fi
