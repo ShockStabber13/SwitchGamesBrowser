@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -70,6 +71,105 @@ inline std::vector<Game> parse(const std::string& bytes) {
     }
     return result;
 }
+
+inline std::vector<Game> parseIgdbCatalog(const std::string& bytes) {
+    if (bytes.size() > 48 * 1024 * 1024)
+        throw std::runtime_error("Catalog exceeds 48 MB");
+
+    auto rows = Json::parse(bytes);
+
+    if (!rows.is_array() || rows.empty() || rows.size() > 20000)
+        throw std::runtime_error("Invalid IGDB catalog");
+
+    std::vector<Game> result;
+    std::set<std::string> ids;
+
+    for (const auto& row : rows) {
+        std::string igdbId = field(row, "id", 64);
+        std::string name = field(row, "name", 1024);
+
+        if (igdbId.empty() || name.empty())
+            continue;
+
+        Game g;
+        g.id = "igdb-" + igdbId;
+        g.title = name;
+
+        if (!ids.insert(g.id).second)
+            continue;
+
+        g.date = field(row, "releaseDate", 10);
+        g.cover = field(row, "cover", 2048);
+        g.summary = field(row, "summary", 4096);
+        g.ratingSource = "IGDB";
+
+        std::string slug = field(row, "slug", 512);
+        if (!slug.empty())
+            g.ratingUrl = "https://www.igdb.com/games/" + slug;
+
+        if (
+            row.contains("ratingCount") &&
+            row["ratingCount"].is_number_integer()
+        ) {
+            g.ratingCount = row["ratingCount"].get<int>();
+        }
+
+        if (
+            row.contains("rating") &&
+            row["rating"].is_number() &&
+            g.ratingCount > 0
+        ) {
+            double rating = row["rating"].get<double>();
+
+            if (
+                std::isfinite(rating) &&
+                rating >= 0 &&
+                rating <= 100
+            ) {
+                g.rating = rating;
+            }
+        }
+
+        if (
+            row.contains("genres") &&
+            row["genres"].is_array()
+        ) {
+            for (const auto& genre : row["genres"]) {
+                if (genre.is_string())
+                    g.genres.push_back(
+                        genre.get<std::string>().substr(0, 256)
+                    );
+            }
+        }
+
+        result.push_back(std::move(g));
+    }
+
+    if (result.empty())
+        throw std::runtime_error("IGDB catalog is empty");
+
+    return result;
+}
+
+inline void mergeReleases(
+    std::vector<Game>& catalog,
+    const std::vector<Game>& torrentIndex
+) {
+    std::map<std::string, const Game*> torrents;
+
+    for (const auto& game : torrentIndex)
+        torrents[game.id] = &game;
+
+    for (auto& game : catalog) {
+        auto found = torrents.find(game.id);
+
+        if (found != torrents.end())
+            game.releases = found->second->releases;
+        else
+            game.releases.clear();
+    }
+}
+
 inline std::string read(const std::string& path, size_t limit = 48 * 1024 * 1024) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error("File unavailable");

@@ -72,21 +72,143 @@ static void atomicWrite(const std::string& path, const std::string& bytes) {
     if (std::rename(temp.c_str(), path.c_str())) { if (exists) std::rename(backup.c_str(), path.c_str()); throw std::runtime_error("Cache replacement failed"); }
     std::remove(backup.c_str());
 }
-struct Refresh { std::vector<sgb::Game> games; std::string message; };
-static Refresh refresh(const std::string& url) {
-    try {
-        if (url.rfind("https://raw.githubusercontent.com/", 0) != 0 || url.find('?') != std::string::npos || url.substr(url.find_last_of('/') + 1) != "switch-index.json")
-            throw std::runtime_error("Set a raw GitHub switch-index.json URL in config.json");
-        auto manifest = sgb::Json::parse(get(url.substr(0, url.find_last_of('/') + 1) + "manifest.json", 64 * 1024));
-        if (manifest.at("schemaVersion") != 1) throw std::runtime_error("Unsupported manifest");
-        auto bytes = get(url, 48 * 1024 * 1024);
-        if (manifest.at("bytes") != bytes.size() || manifest.at("sha256") != digest(bytes)) throw std::runtime_error("Index changed during refresh; try again");
-        auto games = sgb::parse(bytes);
-        if (manifest.at("gameCount") != games.size()) throw std::runtime_error("Manifest game count mismatch");
-        atomicWrite(root + "switch-index.json", bytes);
-        return {std::move(games), "Index refreshed"};
-    } catch (const std::exception& e) { return {{}, e.what()}; }
+struct Refresh {
+    std::vector<sgb::Game> games;
+    std::string message;
+};
+
+static std::string siblingUrl(
+    const std::string& indexUrl,
+    const std::string& filename
+) {
+    if (
+        indexUrl.rfind(
+            "https://raw.githubusercontent.com/",
+            0
+        ) != 0 ||
+        indexUrl.find('?') != std::string::npos
+    ) {
+        throw std::runtime_error(
+            "Configure a raw GitHub indexUrl first"
+        );
+    }
+
+    auto slash = indexUrl.find_last_of('/');
+
+    if (slash == std::string::npos)
+        throw std::runtime_error("Invalid indexUrl");
+
+    return indexUrl.substr(0, slash + 1) + filename;
 }
+
+static Refresh refreshCatalog(
+    const std::string& indexUrl,
+    const std::vector<sgb::Game>& current
+) {
+    try {
+        auto url = siblingUrl(
+            indexUrl,
+            "igdb-switch-games.json"
+        );
+
+        auto bytes = get(
+            url,
+            48 * 1024 * 1024
+        );
+
+        auto catalog =
+            sgb::parseIgdbCatalog(bytes);
+
+        sgb::mergeReleases(
+            catalog,
+            current
+        );
+
+        atomicWrite(
+            root + "igdb-switch-games.json",
+            bytes
+        );
+
+        return {
+            std::move(catalog),
+            "Catalog index refreshed"
+        };
+    }
+    catch (const std::exception& e) {
+        return {{}, e.what()};
+    }
+}
+
+static Refresh refreshTorrents(
+    const std::string& indexUrl,
+    const std::vector<sgb::Game>& current
+) {
+    try {
+        auto url = siblingUrl(
+            indexUrl,
+            "switch-index.json"
+        );
+
+        auto manifestUrl = siblingUrl(
+            indexUrl,
+            "manifest.json"
+        );
+
+        auto manifest = sgb::Json::parse(
+            get(
+                manifestUrl,
+                64 * 1024
+            )
+        );
+
+        if (manifest.at("schemaVersion") != 1)
+            throw std::runtime_error(
+                "Unsupported manifest"
+            );
+
+        auto bytes = get(
+            url,
+            48 * 1024 * 1024
+        );
+
+        if (
+            manifest.at("bytes") != bytes.size() ||
+            manifest.at("sha256") != digest(bytes)
+        ) {
+            throw std::runtime_error(
+                "Torrent index changed during refresh"
+            );
+        }
+
+        auto torrents = sgb::parse(bytes);
+
+        std::vector<sgb::Game> merged = current;
+
+        if (merged.empty()) {
+            merged = torrents;
+        }
+        else {
+            sgb::mergeReleases(
+                merged,
+                torrents
+            );
+        }
+
+        atomicWrite(
+            root + "switch-index.json",
+            bytes
+        );
+
+        return {
+            std::move(merged),
+            "Torrent index refreshed"
+        };
+    }
+    catch (const std::exception& e) {
+        return {{}, e.what()};
+    }
+}
+
 static std::string keyboard(const char* label, const std::string& initial) {
     SwkbdConfig config; char out[256]{};
     if (R_FAILED(swkbdCreate(&config, 0))) return initial;
@@ -185,8 +307,37 @@ int main(int, char**) {
     std::string url, status = "Press Y for Settings";
     sgb::DebridConfig debridConfig;
     std::map<std::string, sgb::DebridTorrentStatus> debridStatuses;
-    try { games = sgb::parse(sgb::read(root + "switch-index.json")); status = "Loaded cached index"; }
-    catch (...) { try { games = sgb::parse(sgb::read(root + "switch-index.json.bak")); status = "Recovered previous cache"; } catch (...) {} }
+    try {
+        games = sgb::parseIgdbCatalog(
+            sgb::read(root + "igdb-switch-games.json")
+        );
+
+        try {
+            auto torrents = sgb::parse(
+                sgb::read(root + "switch-index.json")
+            );
+
+            sgb::mergeReleases(
+                games,
+                torrents
+            );
+
+            status = "Loaded cached catalog + torrents";
+        }
+        catch (...) {
+            status = "Loaded cached catalog";
+        }
+    }
+    catch (...) {
+        try {
+            games = sgb::parse(
+                sgb::read(root + "switch-index.json")
+            );
+
+            status = "Loaded cached torrent index";
+        }
+        catch (...) {}
+    }
     try {
         auto config = sgb::Json::parse(
             sgb::read(root + "config.json", 65536)
@@ -311,7 +462,7 @@ int main(int, char**) {
         if (pendingCover.valid() && pendingCover.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto c = pendingCover.get();
             if (!c.path.empty()) { SDL_Surface* s = IMG_Load(c.path.c_str()); if (s) {
-                    SDL_Surface* thumb = SDL_CreateRGBSurfaceWithFormat(0, 288, 120, 32, SDL_PIXELFORMAT_RGBA32);
+                    SDL_Surface* thumb = SDL_CreateRGBSurfaceWithFormat(0, 150, 212, 32, SDL_PIXELFORMAT_RGBA32);
                     if (thumb) { SDL_BlitScaled(s, nullptr, thumb, nullptr); covers[c.id] = SDL_CreateTextureFromSurface(renderer, thumb); SDL_FreeSurface(thumb); }
                     SDL_FreeSurface(s);
                 } }
@@ -332,10 +483,10 @@ int main(int, char**) {
         if (page == Page::Browse) {
             if ((keys & HidNpadButton_Left) && cursor) --cursor;
             if ((keys & HidNpadButton_Right) && cursor+1 < rows.size()) ++cursor;
-            if ((keys & HidNpadButton_Up) && cursor >= 4) cursor -= 4;
-            if ((keys & HidNpadButton_Down) && cursor+4 < rows.size()) cursor += 4;
-            if (keys & HidNpadButton_L) cursor = cursor >= 8 ? cursor-8 : 0;
-            if (keys & HidNpadButton_R) cursor = rows.empty() ? 0 : std::min(cursor+8, rows.size()-1);
+            if ((keys & HidNpadButton_Up) && cursor >= 5) cursor -= 5;
+            if ((keys & HidNpadButton_Down) && cursor+5 < rows.size()) cursor += 5;
+            if (keys & HidNpadButton_L) cursor = cursor >= 10 ? cursor-10 : 0;
+            if (keys & HidNpadButton_R) cursor = rows.empty() ? 0 : std::min(cursor+10, rows.size()-1);
             if ((keys & HidNpadButton_A) && !rows.empty()) { page = Page::Detail; releaseIndex = torrentCursor = fileCursor = 0; selectedFiles.clear(); }
             if (keys & HidNpadButton_X) { filter.search = keyboard("Search Switch games", filter.search); cursor = 0; rebuild(); }
             if (keys & HidNpadButton_B) { filter = {}; cursor = 0; rebuild(); }
@@ -360,7 +511,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 3)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 4)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -466,14 +617,47 @@ int main(int, char**) {
                 else if (settingsCursor == 2) {
                     if (pending.valid()) {
                         status = "Refresh already running";
-                    } else if (url.empty()) {
+                    }
+                    else if (url.empty()) {
                         status = "Configure indexUrl first";
-                    } else {
-                        status = "Refreshing index...";
+                    }
+                    else {
+                        status = "Refreshing catalog index...";
+
+                        auto current = games;
+
                         pending = std::async(
                             std::launch::async,
-                            refresh,
-                            url
+                            [url, current]() {
+                                return refreshCatalog(
+                                    url,
+                                    current
+                                );
+                            }
+                        );
+                    }
+                }
+
+                else if (settingsCursor == 3) {
+                    if (pending.valid()) {
+                        status = "Refresh already running";
+                    }
+                    else if (url.empty()) {
+                        status = "Configure indexUrl first";
+                    }
+                    else {
+                        status = "Refreshing torrent index...";
+
+                        auto current = games;
+
+                        pending = std::async(
+                            std::launch::async,
+                            [url, current]() {
+                                return refreshTorrents(
+                                    url,
+                                    current
+                                );
+                            }
                         );
                     }
                 }
@@ -529,92 +713,201 @@ int main(int, char**) {
         label(renderer, big, "SWITCH GAMES", 32,22,850,green);
         label(renderer, small, std::to_string(rows.size()) + " games", 1050,32,200,muted);
         if (page == Page::Settings) {
-            label(renderer,big,"SETTINGS",32,85,1200,green);
-            label(renderer,small,"A Select  |  B Back",32,130,1200,muted);
-
-            SDL_Rect serviceBox{32,170,1216,75};
-            rect(renderer,serviceBox,SDL_Color{18,18,18,255});
-            if (settingsCursor == 0)
-                rect(renderer,serviceBox,green,true);
-
-            label(renderer,small,"Debrid Service",52,192,500);
             label(
-                renderer,
-                big,
-                sgb::debridServiceName(debridConfig.service),
-                650,185,550,green
+                renderer,big,
+                "SETTINGS",
+                32,70,1200,green
             );
 
-            SDL_Rect authBox{32,260,1216,75};
-            rect(renderer,authBox,SDL_Color{18,18,18,255});
+            label(
+                renderer,small,
+                "A Select  |  B Back",
+                32,112,1200,muted
+            );
+
+            SDL_Rect serviceBox{
+                32,150,1216,65
+            };
+
+            rect(
+                renderer,
+                serviceBox,
+                SDL_Color{18,18,18,255}
+            );
+
+            if (settingsCursor == 0)
+                rect(
+                    renderer,
+                    serviceBox,
+                    green,
+                    true
+                );
+
+            label(
+                renderer,small,
+                "Debrid Service",
+                52,170,500
+            );
+
+            label(
+                renderer,big,
+                sgb::debridServiceName(
+                    debridConfig.service
+                ),
+                650,163,550,green
+            );
+
+
+            SDL_Rect authBox{
+                32,225,1216,65
+            };
+
+            rect(
+                renderer,
+                authBox,
+                SDL_Color{18,18,18,255}
+            );
+
             if (settingsCursor == 1)
-                rect(renderer,authBox,green,true);
+                rect(
+                    renderer,
+                    authBox,
+                    green,
+                    true
+                );
 
-            std::string authLabel = "Authorize";
+            std::string authLabel =
+                "Authorize";
 
-            if (debridConfig.service == sgb::DebridService::TorBox)
-                authLabel = "Authorize / Set TorBox API Token";
+            if (
+                debridConfig.service ==
+                sgb::DebridService::TorBox
+            ) {
+                authLabel =
+                    "Authorize / Set TorBox API Token";
+            }
 
             if (
                 debridConfig.service ==
                 sgb::DebridService::AllDebrid
             ) {
-                authLabel = allDebridPin.has_value()
+                authLabel =
+                    allDebridPin.has_value()
                     ? "Check AllDebrid PIN"
                     : "Authorize with AllDebrid PIN";
             }
 
-            label(renderer,small,authLabel,52,283,800);
+            label(
+                renderer,small,
+                authLabel,
+                52,246,780
+            );
 
             label(
-                renderer,
-                small,
+                renderer,small,
                 debridConfig.apiKey.empty()
                     ? "Not authorized"
                     : "Authorized",
-                960,283,250,
-                debridConfig.apiKey.empty() ? muted : green
+                970,246,230,
+                debridConfig.apiKey.empty()
+                    ? muted
+                    : green
             );
 
-            SDL_Rect refreshBox{32,350,1216,75};
-            rect(renderer,refreshBox,SDL_Color{18,18,18,255});
+
+            SDL_Rect catalogBox{
+                32,300,1216,65
+            };
+
+            rect(
+                renderer,
+                catalogBox,
+                SDL_Color{18,18,18,255}
+            );
+
             if (settingsCursor == 2)
-                rect(renderer,refreshBox,green,true);
+                rect(
+                    renderer,
+                    catalogBox,
+                    green,
+                    true
+                );
 
             label(
-                renderer,
-                small,
-                "Refresh Cached Index",
-                52,373,1100
+                renderer,small,
+                "Refresh Catalog Index",
+                52,321,1100
             );
 
-            SDL_Rect backBox{32,440,1216,75};
-            rect(renderer,backBox,SDL_Color{18,18,18,255});
-            if (settingsCursor == 3)
-                rect(renderer,backBox,green,true);
 
-            label(renderer,small,"Back",52,463,1100);
+            SDL_Rect torrentBox{
+                32,375,1216,65
+            };
+
+            rect(
+                renderer,
+                torrentBox,
+                SDL_Color{18,18,18,255}
+            );
+
+            if (settingsCursor == 3)
+                rect(
+                    renderer,
+                    torrentBox,
+                    green,
+                    true
+                );
+
+            label(
+                renderer,small,
+                "Refresh Torrent Index",
+                52,396,1100
+            );
+
+
+            SDL_Rect backBox{
+                32,450,1216,65
+            };
+
+            rect(
+                renderer,
+                backBox,
+                SDL_Color{18,18,18,255}
+            );
+
+            if (settingsCursor == 4)
+                rect(
+                    renderer,
+                    backBox,
+                    green,
+                    true
+                );
+
+            label(
+                renderer,small,
+                "Back",
+                52,471,1100
+            );
+
 
             if (allDebridPin.has_value()) {
                 label(
-                    renderer,
-                    big,
+                    renderer,big,
                     "PIN: " + allDebridPin->pin,
                     32,545,500,green
                 );
 
                 label(
-                    renderer,
-                    small,
-                    "Enter this at alldebrid.com/pin, then select Authorize again.",
+                    renderer,small,
+                    "Enter PIN at alldebrid.com/pin, then select Authorize again.",
                     32,590,1216,white
                 );
-            } else {
+            }
+            else {
                 label(
-                    renderer,
-                    small,
-                    "Credentials are stored locally in config.json on the SD card.",
-                    32,570,1216,muted
+                    renderer,small,
+                    "Catalog and torrent indexes are cached separately on the SD card.",
+                    32,560,1216,muted
                 );
             }
         } else if (page == Page::Detail && !rows.empty()) {
@@ -675,24 +968,182 @@ int main(int, char**) {
         } else {
             static const char* sortLabels[] = {"Title A-Z","Highest rated","Newest"};
             label(renderer,small,std::string(sortLabels[static_cast<int>(filter.sort)]) + " | " + (filter.genre.empty() ? "All genres" : filter.genre) + " | Min " + std::to_string(static_cast<int>(filter.minRating)) + " | Votes " + std::to_string(filter.minReviews) + (filter.favouritesOnly ? " | Favourites" : "") + (filter.search.empty() ? "" : " | " + filter.search),32,68,1216,muted);
-            size_t start = (cursor / 8) * 8;
-            for (size_t slot = 0; slot < 8 && start+slot < rows.size(); ++slot) {
-                const auto& g = games[rows[start+slot]];
-                int x = 32 + (slot%4)*308, y = 112 + (slot/4)*228;
-                SDL_Rect box{x,y,292,210}; rect(renderer,box,SDL_Color{18,18,18,255});
-                auto found = covers.find(g.id);
-                if (found != covers.end() && found->second) { SDL_Rect pic{x+2,y+2,288,120}; SDL_RenderCopy(renderer,found->second,nullptr,&pic); }
-                else { rect(renderer,{x+2,y+2,288,120},SDL_Color{9,40,12,255}); label(renderer,big,"SWITCH",x+18,y+43,250,green); }
-                if (!pendingCover.valid() && !attempted.count(g.id) && !g.cover.empty()) {
-                    attempted.insert(g.id); std::string path = root + "covers/" + digest(g.cover) + ".img";
-                    std::string coverUrl = g.cover, id = g.id;
-                    pendingCover = std::async(std::launch::async,[path,coverUrl,id]() -> CoverResult {
-                        try { std::ifstream cached(path); bool exists = cached.good(); cached.close(); if (!exists) atomicWrite(path,get(coverUrl,4*1024*1024)); return {id,path}; } catch (...) { return {id,""}; }
-                    });
+            size_t start =
+                (cursor / 10) * 10;
+
+            for (
+                size_t slot = 0;
+                slot < 10 &&
+                start + slot < rows.size();
+                ++slot
+            ) {
+                const auto& g =
+                    games[rows[start + slot]];
+
+                int x =
+                    32 +
+                    (slot % 5) * 244;
+
+                int y =
+                    102 +
+                    (slot / 5) * 272;
+
+                SDL_Rect box{
+                    x,y,232,262
+                };
+
+                rect(
+                    renderer,
+                    box,
+                    SDL_Color{18,18,18,255}
+                );
+
+                auto found =
+                    covers.find(g.id);
+
+                if (
+                    found != covers.end() &&
+                    found->second
+                ) {
+                    SDL_Rect pic{
+                        x + 41,
+                        y + 6,
+                        150,
+                        212
+                    };
+
+                    SDL_RenderCopy(
+                        renderer,
+                        found->second,
+                        nullptr,
+                        &pic
+                    );
                 }
-                label(renderer,small,g.title,x+12,y+133,268);
-                label(renderer,small,score(g),x+12,y+166,268,green);
-                if (start+slot == cursor) { rect(renderer,box,green,true); rect(renderer,{x+1,y+1,290,208},green,true); }
+                else {
+                    rect(
+                        renderer,
+                        {
+                            x + 41,
+                            y + 6,
+                            150,
+                            212
+                        },
+                        SDL_Color{
+                            9,40,12,255
+                        }
+                    );
+
+                    label(
+                        renderer,big,
+                        "SWITCH",
+                        x + 55,
+                        y + 92,
+                        125,
+                        green
+                    );
+                }
+
+                if (
+                    !pendingCover.valid() &&
+                    !attempted.count(g.id) &&
+                    !g.cover.empty()
+                ) {
+                    attempted.insert(g.id);
+
+                    std::string path =
+                        root +
+                        "covers/" +
+                        digest(g.cover) +
+                        ".img";
+
+                    std::string coverUrl =
+                        g.cover;
+
+                    std::string id =
+                        g.id;
+
+                    pendingCover =
+                        std::async(
+                            std::launch::async,
+                            [
+                                path,
+                                coverUrl,
+                                id
+                            ]() -> CoverResult {
+                                try {
+                                    std::ifstream cached(
+                                        path
+                                    );
+
+                                    bool exists =
+                                        cached.good();
+
+                                    cached.close();
+
+                                    if (!exists)
+                                        atomicWrite(
+                                            path,
+                                            get(
+                                                coverUrl,
+                                                4 * 1024 * 1024
+                                            )
+                                        );
+
+                                    return {
+                                        id,
+                                        path
+                                    };
+                                }
+                                catch (...) {
+                                    return {
+                                        id,
+                                        ""
+                                    };
+                                }
+                            }
+                        );
+                }
+
+                label(
+                    renderer,small,
+                    g.title,
+                    x + 10,
+                    y + 220,
+                    212
+                );
+
+                label(
+                    renderer,small,
+                    score(g),
+                    x + 10,
+                    y + 240,
+                    212,
+                    green
+                );
+
+                if (
+                    start + slot ==
+                    cursor
+                ) {
+                    rect(
+                        renderer,
+                        box,
+                        green,
+                        true
+                    );
+
+                    rect(
+                        renderer,
+                        {
+                            x + 1,
+                            y + 1,
+                            230,
+                            260
+                        },
+                        green,
+                        true
+                    );
+                }
             }
             if (rows.empty()) label(renderer,big,games.empty() ? "Press Y to load your GitHub index" : "No games match these filters",32,260,1200,muted);
             label(renderer,small,"A Details | X Search | Y Settings | ZL Sort | ZR Favourites | - Rating",32,580,1216);
