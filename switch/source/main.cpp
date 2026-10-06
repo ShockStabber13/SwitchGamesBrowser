@@ -302,6 +302,10 @@ static CoverCacheStats cacheCatalogCovers(
     };
 }
 
+static size_t downloadCoverPacks(
+    const std::string& indexUrl
+);
+
 static Refresh refreshCatalog(
     const std::string& indexUrl,
     const std::vector<sgb::Game>& current
@@ -337,16 +341,14 @@ static Refresh refreshCatalog(
 
         catalogRefreshPhase.store(2);
 
-        auto covers =
-            cacheCatalogCovers(catalog);
+        auto packCount =
+            downloadCoverPacks(indexUrl);
 
         return {
             std::move(catalog),
             "Catalog refreshed; " +
-            std::to_string(covers.cached) +
-            "/" +
-            std::to_string(covers.total) +
-            " covers cached"
+            std::to_string(packCount) +
+            " cover packs ready"
         };
     }
     catch (const std::exception& e) {
@@ -457,7 +459,277 @@ static std::string score(const sgb::Game& g) {
     return std::to_string(static_cast<int>(g.rating + .5)) + "/100  (" + std::to_string(g.ratingCount) + " votes)";
 }
 
+
 struct CoverResult { std::string id, path; };
+
+struct PackedCoverEntry {
+    int pack = 0;
+    size_t offset = 0;
+    size_t size = 0;
+};
+
+static std::map<std::string, PackedCoverEntry> packedCovers;
+
+static bool loadCoverPackManifest() {
+    try {
+        auto manifest = sgb::Json::parse(
+            sgb::read(root + "covers-manifest.json")
+        );
+
+        if (
+            manifest.value("schemaVersion", 0) != 1 ||
+            !manifest.contains("entries") ||
+            !manifest["entries"].is_object()
+        ) {
+            return false;
+        }
+
+        std::map<std::string, PackedCoverEntry> next;
+
+        for (
+            auto it = manifest["entries"].begin();
+            it != manifest["entries"].end();
+            ++it
+        ) {
+            const auto& value = it.value();
+
+            if (!value.is_object())
+                continue;
+
+            PackedCoverEntry entry;
+            entry.pack = value.value("pack", -1);
+            entry.offset = value.value("offset", 0u);
+            entry.size = value.value("size", 0u);
+
+            if (
+                entry.pack < 0 ||
+                entry.pack > 15 ||
+                entry.size == 0
+            ) {
+                continue;
+            }
+
+            next[it.key()] = entry;
+        }
+
+        packedCovers = std::move(next);
+        return !packedCovers.empty();
+    }
+    catch (...) {
+        packedCovers.clear();
+        return false;
+    }
+}
+
+static SDL_Texture* loadPackedCoverTexture(
+    SDL_Renderer* renderer,
+    const std::string& gameId
+) {
+    auto found = packedCovers.find(gameId);
+
+    if (found == packedCovers.end())
+        return nullptr;
+
+    const auto& entry = found->second;
+
+    static const char hex[] = "0123456789abcdef";
+
+    std::string path =
+        root +
+        "covers-0" +
+        std::string(1, hex[entry.pack]) +
+        ".pack";
+
+    std::ifstream file(
+        path,
+        std::ios::binary
+    );
+
+    if (!file)
+        return nullptr;
+
+    file.seekg(
+        static_cast<std::streamoff>(entry.offset)
+    );
+
+    if (!file)
+        return nullptr;
+
+    std::vector<unsigned char> bytes(
+        entry.size
+    );
+
+    file.read(
+        reinterpret_cast<char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size())
+    );
+
+    if (!file)
+        return nullptr;
+
+    SDL_RWops* rw = SDL_RWFromConstMem(
+        bytes.data(),
+        static_cast<int>(bytes.size())
+    );
+
+    if (!rw)
+        return nullptr;
+
+    SDL_Surface* source =
+        IMG_Load_RW(rw, 1);
+
+    if (!source)
+        return nullptr;
+
+    SDL_Surface* portrait =
+        SDL_CreateRGBSurfaceWithFormat(
+            0,
+            150,
+            212,
+            32,
+            SDL_PIXELFORMAT_RGBA32
+        );
+
+    if (!portrait) {
+        SDL_FreeSurface(source);
+        return nullptr;
+    }
+
+    SDL_BlitScaled(
+        source,
+        nullptr,
+        portrait,
+        nullptr
+    );
+
+    SDL_Texture* texture =
+        SDL_CreateTextureFromSurface(
+            renderer,
+            portrait
+        );
+
+    SDL_FreeSurface(portrait);
+    SDL_FreeSurface(source);
+
+    return texture;
+}
+
+static size_t downloadCoverPacks(
+    const std::string& indexUrl
+) {
+    auto manifestUrl = siblingUrl(
+        indexUrl,
+        "covers-manifest.json"
+    );
+
+    auto manifestBytes = get(
+        manifestUrl,
+        8 * 1024 * 1024
+    );
+
+    auto manifest =
+        sgb::Json::parse(manifestBytes);
+
+    if (
+        manifest.value("schemaVersion", 0) != 1 ||
+        !manifest.contains("packs") ||
+        !manifest["packs"].is_object()
+    ) {
+        throw std::runtime_error(
+            "Invalid cover manifest"
+        );
+    }
+
+    const auto& packs = manifest["packs"];
+
+    catalogCoverTotal.store(packs.size());
+    catalogCoverDone.store(0);
+    catalogCoverCached.store(0);
+
+    size_t ready = 0;
+
+    for (
+        auto it = packs.begin();
+        it != packs.end();
+        ++it
+    ) {
+        const auto& info = it.value();
+
+        std::string filename =
+            info.value("file", "");
+
+        size_t expectedBytes =
+            info.value("bytes", 0u);
+
+        std::string expectedHash =
+            info.value("sha256", "");
+
+        if (
+            filename.empty() ||
+            expectedBytes == 0 ||
+            expectedHash.empty()
+        ) {
+            throw std::runtime_error(
+                "Invalid cover pack metadata"
+            );
+        }
+
+        std::string localPath =
+            root + filename;
+
+        bool alreadyGood = false;
+
+        try {
+            auto local =
+                sgb::read(localPath);
+
+            alreadyGood =
+                local.size() == expectedBytes &&
+                digest(local) == expectedHash;
+        }
+        catch (...) {}
+
+        if (alreadyGood) {
+            ++ready;
+            catalogCoverCached.fetch_add(1);
+            catalogCoverDone.fetch_add(1);
+            continue;
+        }
+
+        auto packBytes = get(
+            siblingUrl(indexUrl, filename),
+            SIZE_MAX
+        );
+
+        if (
+            packBytes.size() != expectedBytes ||
+            digest(packBytes) != expectedHash
+        ) {
+            throw std::runtime_error(
+                "Cover pack verification failed: " +
+                filename
+            );
+        }
+
+        atomicWrite(
+            localPath,
+            packBytes
+        );
+
+        ++ready;
+        catalogCoverDone.fetch_add(1);
+    }
+
+    // Manifest is written last so it never points to
+    // partially-downloaded packs.
+    atomicWrite(
+        root + "covers-manifest.json",
+        manifestBytes
+    );
+
+    return ready;
+}
+
 
 static std::vector<std::string> coverCandidates(
     const std::string& url
@@ -658,9 +930,11 @@ int main(int, char**) {
     size_t cursor = 0, releaseIndex = 0, torrentCursor = 0, fileCursor = 0;
     size_t settingsCursor = 0;
     std::optional<sgb::AllDebridPinAuth> allDebridPin;
+    loadCoverPackManifest();
+
     Page page = Page::Browse; bool dirty = false;
     std::set<size_t> selectedFiles;
-    std::future<Refresh> pending; std::vector<std::future<CoverResult>> coverJobs;
+    std::future<Refresh> pending; 
     std::future<DebridCheckResult> pendingDebridCheck;
     std::future<DebridAddResult> pendingDebridAdd;
     std::map<std::string, SDL_Texture*> covers; std::set<std::string> attempted;
@@ -733,6 +1007,8 @@ int main(int, char**) {
                 covers.clear();
                 attempted.clear();
 
+                loadCoverPackManifest();
+
                 games = std::move(result.games);
                 page = Page::Browse;
                 releaseIndex = torrentCursor = fileCursor = 0;
@@ -740,82 +1016,7 @@ int main(int, char**) {
                 rebuild();
             }
         }
-        for (auto it = coverJobs.begin(); it != coverJobs.end();) {
-            if (
-                it->wait_for(std::chrono::milliseconds(0)) !=
-                std::future_status::ready
-            ) {
-                ++it;
-                continue;
-            }
 
-            auto c = it->get();
-            it = coverJobs.erase(it);
-
-            bool loaded = false;
-
-            if (!c.path.empty()) {
-                SDL_Surface* surface =
-                    IMG_Load(c.path.c_str());
-
-                if (surface) {
-                    SDL_Surface* thumb =
-                        SDL_CreateRGBSurfaceWithFormat(
-                            0,
-                            150,
-                            212,
-                            32,
-                            SDL_PIXELFORMAT_RGBA32
-                        );
-
-                    if (thumb) {
-                        SDL_BlitScaled(
-                            surface,
-                            nullptr,
-                            thumb,
-                            nullptr
-                        );
-
-                        SDL_Texture* texture =
-                            SDL_CreateTextureFromSurface(
-                                renderer,
-                                thumb
-                            );
-
-                        if (texture) {
-                            covers[c.id] = texture;
-                            loaded = true;
-                        }
-
-                        SDL_FreeSurface(thumb);
-                    }
-
-                    SDL_FreeSurface(surface);
-                }
-                else {
-                    // Bad/incomplete cached image: remove and retry.
-                    std::remove(c.path.c_str());
-                }
-            }
-
-            if (!loaded) {
-                // Stay on the offline placeholder until Catalog Refresh.
-            }
-
-            while (covers.size() > 24) {
-                auto oldCover = covers.begin();
-
-                SDL_DestroyTexture(
-                    oldCover->second
-                );
-
-                attempted.erase(
-                    oldCover->first
-                );
-
-                covers.erase(oldCover);
-            }
-        }
 
         if (pendingDebridCheck.valid() && pendingDebridCheck.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto result = pendingDebridCheck.get();
@@ -1283,7 +1484,7 @@ int main(int, char**) {
                     total ? (done * 100 / total) : 0;
 
                 std::string progress =
-                    "Catalog covers: " +
+                    "Cover packs: " +
                     std::to_string(done) +
                     "/" +
                     std::to_string(total) +
@@ -1388,6 +1589,23 @@ int main(int, char**) {
                     SDL_Color{18,18,18,255}
                 );
 
+                if (
+                    !covers.count(g.id) &&
+                    !attempted.count(g.id)
+                ) {
+                    attempted.insert(g.id);
+
+                    if (
+                        SDL_Texture* texture =
+                            loadPackedCoverTexture(
+                                renderer,
+                                g.id
+                            )
+                    ) {
+                        covers[g.id] = texture;
+                    }
+                }
+
                 auto found =
                     covers.find(g.id);
 
@@ -1433,50 +1651,6 @@ int main(int, char**) {
                     );
                 }
 
-                if (
-                    coverJobs.size() < 4 &&
-                    !attempted.count(g.id) &&
-                    !g.cover.empty()
-                ) {
-                    attempted.insert(g.id);
-
-                    std::string coverUrl = g.cover;
-                    std::string id = g.id;
-
-                    coverJobs.emplace_back(
-                        std::async(
-                            std::launch::async,
-                            [coverUrl, id]() -> CoverResult {
-                                for (
-                                    const auto& candidate :
-                                    coverCandidates(coverUrl)
-                                ) {
-                                    try {
-                                        std::string path =
-                                            root +
-                                            "covers/" +
-                                            digest(candidate) +
-                                            ".img";
-
-                                        std::ifstream cached(path);
-                                        bool exists = cached.good();
-                                        cached.close();
-
-                                        if (!exists)
-                                            continue;
-
-                                        return {id, path};
-                                    }
-                                    catch (...) {
-                                        // Try the next IGDB size.
-                                    }
-                                }
-
-                                return {id, ""};
-                            }
-                        )
-                    );
-                }
 
                 label(
                     renderer,small,
@@ -1526,7 +1700,7 @@ int main(int, char**) {
         label(renderer,small,status,32,675,1216,green);
         SDL_RenderPresent(renderer);
     }
-    stopping = true; if (pending.valid()) pending.wait(); for (auto& job : coverJobs) if (job.valid()) job.wait();
+    stopping = true; if (pending.valid()) pending.wait(); 
     if (pendingDebridCheck.valid()) pendingDebridCheck.wait();
     if (pendingDebridAdd.valid()) pendingDebridAdd.wait();
     saveState(); for (auto& p : covers) SDL_DestroyTexture(p.second);
