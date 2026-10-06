@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <sys/stat.h>
+#include <vector>
 
 static const std::string root = "sdmc:/switch/SwitchGamesBrowser/";
 static std::atomic<bool> stopping{false};
@@ -241,7 +242,60 @@ static std::string score(const sgb::Game& g) {
     if (g.rating < 0) return "Unrated";
     return std::to_string(static_cast<int>(g.rating + .5)) + "/100  (" + std::to_string(g.ratingCount) + " votes)";
 }
+
 struct CoverResult { std::string id, path; };
+
+static std::vector<std::string> coverCandidates(
+    const std::string& url
+) {
+    std::vector<std::string> result;
+
+    auto add = [&](const std::string& value) {
+        if (
+            !value.empty() &&
+            std::find(result.begin(), result.end(), value) ==
+                result.end()
+        ) {
+            result.push_back(value);
+        }
+    };
+
+    const std::string big =
+        "/t_cover_big/";
+
+    const std::string big2x =
+        "/t_cover_big_2x/";
+
+    if (url.find(big2x) != std::string::npos) {
+        add(url);
+
+        std::string fallback = url;
+        fallback.replace(
+            fallback.find(big2x),
+            big2x.size(),
+            big
+        );
+
+        add(fallback);
+    }
+    else if (url.find(big) != std::string::npos) {
+        std::string better = url;
+        better.replace(
+            better.find(big),
+            big.size(),
+            big2x
+        );
+
+        add(better);
+        add(url);
+    }
+    else {
+        add(url);
+    }
+
+    return result;
+}
+
 struct DebridCheckResult { std::map<std::string, sgb::DebridTorrentStatus> rows; std::string message; };
 struct DebridAddResult { std::string hash; sgb::DebridTorrentStatus state; std::string message; };
 enum class Page { Browse, Detail, Torrents, Files, Settings };
@@ -392,7 +446,7 @@ int main(int, char**) {
     std::optional<sgb::AllDebridPinAuth> allDebridPin;
     Page page = Page::Browse; bool dirty = false;
     std::set<size_t> selectedFiles;
-    std::future<Refresh> pending; std::future<CoverResult> pendingCover;
+    std::future<Refresh> pending; std::vector<std::future<CoverResult>> coverJobs;
     std::future<DebridCheckResult> pendingDebridCheck;
     std::future<DebridAddResult> pendingDebridAdd;
     std::map<std::string, SDL_Texture*> covers; std::set<std::string> attempted;
@@ -459,16 +513,84 @@ int main(int, char**) {
             auto result = pending.get(); status = result.message;
             if (!result.games.empty()) { games = std::move(result.games); page = Page::Browse; releaseIndex = torrentCursor = fileCursor = 0; selectedFiles.clear(); rebuild(); }
         }
-        if (pendingCover.valid() && pendingCover.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-            auto c = pendingCover.get();
-            if (!c.path.empty()) { SDL_Surface* s = IMG_Load(c.path.c_str()); if (s) {
-                    SDL_Surface* thumb = SDL_CreateRGBSurfaceWithFormat(0, 150, 212, 32, SDL_PIXELFORMAT_RGBA32);
-                    if (thumb) { SDL_BlitScaled(s, nullptr, thumb, nullptr); covers[c.id] = SDL_CreateTextureFromSurface(renderer, thumb); SDL_FreeSurface(thumb); }
-                    SDL_FreeSurface(s);
-                } }
-            // Bound decoded textures; disk cache remains reusable.
-            if (covers.size() > 24) { auto i = covers.begin(); SDL_DestroyTexture(i->second); attempted.erase(i->first); covers.erase(i); }
+        for (auto it = coverJobs.begin(); it != coverJobs.end();) {
+            if (
+                it->wait_for(std::chrono::milliseconds(0)) !=
+                std::future_status::ready
+            ) {
+                ++it;
+                continue;
+            }
+
+            auto c = it->get();
+            it = coverJobs.erase(it);
+
+            bool loaded = false;
+
+            if (!c.path.empty()) {
+                SDL_Surface* surface =
+                    IMG_Load(c.path.c_str());
+
+                if (surface) {
+                    SDL_Surface* thumb =
+                        SDL_CreateRGBSurfaceWithFormat(
+                            0,
+                            150,
+                            212,
+                            32,
+                            SDL_PIXELFORMAT_RGBA32
+                        );
+
+                    if (thumb) {
+                        SDL_BlitScaled(
+                            surface,
+                            nullptr,
+                            thumb,
+                            nullptr
+                        );
+
+                        SDL_Texture* texture =
+                            SDL_CreateTextureFromSurface(
+                                renderer,
+                                thumb
+                            );
+
+                        if (texture) {
+                            covers[c.id] = texture;
+                            loaded = true;
+                        }
+
+                        SDL_FreeSurface(thumb);
+                    }
+
+                    SDL_FreeSurface(surface);
+                }
+                else {
+                    // Bad/incomplete cached image: remove and retry.
+                    std::remove(c.path.c_str());
+                }
+            }
+
+            if (!loaded) {
+                // Important: failed downloads are allowed to retry.
+                attempted.erase(c.id);
+            }
+
+            while (covers.size() > 24) {
+                auto oldCover = covers.begin();
+
+                SDL_DestroyTexture(
+                    oldCover->second
+                );
+
+                attempted.erase(
+                    oldCover->first
+                );
+
+                covers.erase(oldCover);
+            }
         }
+
         if (pendingDebridCheck.valid() && pendingDebridCheck.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto result = pendingDebridCheck.get();
             for (auto& pair : result.rows) debridStatuses[pair.first] = std::move(pair.second);
@@ -1044,64 +1166,55 @@ int main(int, char**) {
                 }
 
                 if (
-                    !pendingCover.valid() &&
+                    coverJobs.size() < 4 &&
                     !attempted.count(g.id) &&
                     !g.cover.empty()
                 ) {
                     attempted.insert(g.id);
 
-                    std::string path =
-                        root +
-                        "covers/" +
-                        digest(g.cover) +
-                        ".img";
+                    std::string coverUrl = g.cover;
+                    std::string id = g.id;
 
-                    std::string coverUrl =
-                        g.cover;
-
-                    std::string id =
-                        g.id;
-
-                    pendingCover =
+                    coverJobs.emplace_back(
                         std::async(
                             std::launch::async,
-                            [
-                                path,
-                                coverUrl,
-                                id
-                            ]() -> CoverResult {
-                                try {
-                                    std::ifstream cached(
-                                        path
-                                    );
+                            [coverUrl, id]() -> CoverResult {
+                                for (
+                                    const auto& candidate :
+                                    coverCandidates(coverUrl)
+                                ) {
+                                    try {
+                                        std::string path =
+                                            root +
+                                            "covers/" +
+                                            digest(candidate) +
+                                            ".img";
 
-                                    bool exists =
-                                        cached.good();
+                                        std::ifstream cached(path);
+                                        bool exists = cached.good();
+                                        cached.close();
 
-                                    cached.close();
+                                        if (!exists) {
+                                            atomicWrite(
+                                                path,
+                                                get(
+                                                    candidate,
+                                                    4 * 1024 * 1024
+                                                )
+                                            );
+                                        }
 
-                                    if (!exists)
-                                        atomicWrite(
-                                            path,
-                                            get(
-                                                coverUrl,
-                                                4 * 1024 * 1024
-                                            )
-                                        );
-
-                                    return {
-                                        id,
-                                        path
-                                    };
+                                        return {id, path};
+                                    }
+                                    catch (...) {
+                                        // Try the next IGDB size.
+                                    }
                                 }
-                                catch (...) {
-                                    return {
-                                        id,
-                                        ""
-                                    };
-                                }
+
+                                return {id, ""};
                             }
-                        );
+                        )
+                    );
                 }
 
                 label(
@@ -1152,7 +1265,7 @@ int main(int, char**) {
         label(renderer,small,status,32,675,1216,green);
         SDL_RenderPresent(renderer);
     }
-    stopping = true; if (pending.valid()) pending.wait(); if (pendingCover.valid()) pendingCover.wait();
+    stopping = true; if (pending.valid()) pending.wait(); for (auto& job : coverJobs) if (job.valid()) job.wait();
     if (pendingDebridCheck.valid()) pendingDebridCheck.wait();
     if (pendingDebridAdd.valid()) pendingDebridAdd.wait();
     saveState(); for (auto& p : covers) SDL_DestroyTexture(p.second);

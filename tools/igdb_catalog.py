@@ -91,7 +91,7 @@ def _switch_release_date(game):
 def _cover_url(game):
     image_id = (game.get("cover") or {}).get("image_id", "")
     return (
-        f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
+        f"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/{image_id}.jpg"
         if image_id else ""
     )
 
