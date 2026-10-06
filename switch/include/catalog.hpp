@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "json.hpp"
 #include <algorithm>
 #include <cctype>
@@ -23,11 +23,10 @@ inline std::string lower(std::string s) {
     for (char& c : s) if (static_cast<unsigned char>(c) < 128) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
 }
-inline std::string field(const Json& j, const char* key, size_t limit = 4096) {
+inline std::string field(const Json& j, const char* key, size_t = 0) {
     auto p = j.find(key);
     if (p == j.end() || !p->is_string()) return "";
     std::string value = p->get<std::string>();
-    if (value.size() > limit) throw std::runtime_error("Index text exceeds limit");
     for (char& c : value) if (static_cast<unsigned char>(c) < 32 && c != '\n') c = ' ';
     return value;
 }

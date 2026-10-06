@@ -22,7 +22,7 @@ class IgdbCatalogTests(unittest.TestCase):
         result = catalog._visible_catalog(rows)
 
         ids = {game["id"] for game in result}
-        self.assertEqual(ids, {"1", "4", "5"})
+        self.assertEqual(ids, {"1", "5"})
 
         base = next(game for game in result if game["id"] == "1")
 

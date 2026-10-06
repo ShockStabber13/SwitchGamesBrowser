@@ -12,6 +12,11 @@ GAMES_URL = "https://api.igdb.com/v4/games"
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 SWITCH_PLATFORM_ID = 130
 
+# Visible standalone/base game entries.
+# main_game, standalone_expansion, remake, remaster,
+# expanded_game, port, fork
+CATALOG_GAME_TYPES = {0, 4, 8, 9, 10, 11, 12}
+
 # Hidden child content attached to its parent for torrent searching.
 # dlc_addon, expansion, pack, update
 ATTACHED_CONTENT_TYPES = {1, 2, 13, 14}
@@ -121,10 +126,7 @@ def _visible_catalog(rows):
     for game in rows:
         kind = _game_type_id(game.get("gameType"))
 
-        # Only hide true child content. Bundles, episodes, seasons,
-        # remakes, remasters, expanded games, ports, etc. remain
-        # visible if IGDB says they are Nintendo Switch titles.
-        if kind in ATTACHED_CONTENT_TYPES:
+        if kind not in CATALOG_GAME_TYPES:
             continue
 
         row = dict(game)
@@ -177,7 +179,7 @@ def fetch_switch_games(client_id, client_secret):
             "release_dates.date,release_dates.platform,first_release_date,"
             "rating,rating_count,aggregated_rating,aggregated_rating_count,"
             "cover.image_id,artworks.image_id,screenshots.image_id,summary;"
-            f"where id > {last_id} & platforms = {SWITCH_PLATFORM_ID};"
+            f"where id > {last_id} & platforms = ({SWITCH_PLATFORM_ID});"
             "sort id asc; limit 500;"
         )
         page = igdb_request(headers, body)
