@@ -56,23 +56,18 @@ jobs:
       - name: Build torrent shards
         run: python tools/build_torrent_shards.py
 
-      - name: Commit torrent index
+      - name: Commit torrent shards
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add \
-            data/provider-releases.json \
-            data/switch-index.json \
-            data/manifest.json \
-            data/scraper-status.json
+          git add data/torrent-manifest.json
+          git add data/torrent-index-*.json
+          git add data/scraper-status.json
 
           if git diff --cached --quiet; then
-            echo "No torrent/index changes."
+            echo "No torrent-index changes."
           else
-            git add data/torrent-manifest.json
-git add data/torrent-index-*.json
-git add data/scraper-status.json
-git commit -m "Refresh torrent index"
+            git commit -m "Update torrent index shards"
             git push
           fi
