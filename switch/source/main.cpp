@@ -110,6 +110,11 @@ struct CoverCacheStats {
     size_t total = 0;
 };
 
+static std::atomic<int> catalogRefreshPhase{0};
+static std::atomic<size_t> catalogCoverDone{0};
+static std::atomic<size_t> catalogCoverTotal{0};
+static std::atomic<size_t> catalogCoverCached{0};
+
 static std::vector<std::string> offlineCoverCandidates(
     const std::string& url
 ) {
@@ -224,6 +229,10 @@ static CoverCacheStats cacheCatalogCovers(
         });
     }
 
+    catalogCoverTotal.store(jobs.size());
+    catalogCoverDone.store(0);
+    catalogCoverCached.store(0);
+
     std::atomic<size_t> next{0};
     std::atomic<size_t> cached{0};
 
@@ -238,6 +247,8 @@ static CoverCacheStats cacheCatalogCovers(
 
             if (cachedImageValid(job.path)) {
                 cached.fetch_add(1);
+                catalogCoverCached.fetch_add(1);
+                catalogCoverDone.fetch_add(1);
                 continue;
             }
 
@@ -262,12 +273,15 @@ static CoverCacheStats cacheCatalogCovers(
                     );
 
                     cached.fetch_add(1);
+                    catalogCoverCached.fetch_add(1);
                     break;
                 }
                 catch (...) {
                     // Try fallback URL.
                 }
             }
+
+            catalogCoverDone.fetch_add(1);
         }
     };
 
@@ -293,6 +307,11 @@ static Refresh refreshCatalog(
     const std::vector<sgb::Game>& current
 ) {
     try {
+        catalogRefreshPhase.store(1);
+        catalogCoverDone.store(0);
+        catalogCoverTotal.store(0);
+        catalogCoverCached.store(0);
+
         auto url = siblingUrl(
             indexUrl,
             "igdb-switch-games.json"
@@ -315,6 +334,8 @@ static Refresh refreshCatalog(
             root + "igdb-switch-games.json",
             bytes
         );
+
+        catalogRefreshPhase.store(2);
 
         auto covers =
             cacheCatalogCovers(catalog);
@@ -703,7 +724,8 @@ int main(int, char**) {
         padUpdate(&pad); u64 keys = padGetButtonsDown(&pad);
         if (keys & HidNpadButton_Plus) break;
         if (pending.valid() && pending.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-            auto result = pending.get(); status = result.message;
+            auto result = pending.get();
+            catalogRefreshPhase.store(0); status = result.message;
             if (!result.games.empty()) {
                 for (auto& item : covers)
                     SDL_DestroyTexture(item.second);
@@ -1236,6 +1258,48 @@ int main(int, char**) {
                     32,560,1216,muted
                 );
             }
+            int refreshPhase =
+                catalogRefreshPhase.load();
+
+            if (refreshPhase == 1) {
+                label(
+                    renderer,
+                    small,
+                    "Catalog: downloading metadata...",
+                    32,650,1216,green
+                );
+            }
+            else if (refreshPhase == 2) {
+                size_t done =
+                    catalogCoverDone.load();
+
+                size_t total =
+                    catalogCoverTotal.load();
+
+                size_t cached =
+                    catalogCoverCached.load();
+
+                size_t percent =
+                    total ? (done * 100 / total) : 0;
+
+                std::string progress =
+                    "Catalog covers: " +
+                    std::to_string(done) +
+                    "/" +
+                    std::to_string(total) +
+                    " (" +
+                    std::to_string(percent) +
+                    "%)  cached: " +
+                    std::to_string(cached);
+
+                label(
+                    renderer,
+                    small,
+                    progress,
+                    32,650,1216,green
+                );
+            }
+
         } else if (page == Page::Detail && !rows.empty()) {
             const auto& g = games[rows[cursor]];
             label(renderer,big,g.title,32,85,1200);
