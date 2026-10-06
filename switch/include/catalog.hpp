@@ -147,6 +147,101 @@ inline std::vector<Game> parseIgdbCatalog(const std::string& bytes) {
     return result;
 }
 
+
+inline std::vector<Game> parseTorrentShard(
+    const std::string& bytes
+) {
+    auto root = Json::parse(bytes);
+
+    if (
+        root.value("schemaVersion", 0) != 1 ||
+        !root.contains("games") ||
+        !root["games"].is_object()
+    ) {
+        throw std::runtime_error(
+            "Invalid torrent shard"
+        );
+    }
+
+    std::vector<Game> result;
+
+    for (
+        auto gameIt = root["games"].begin();
+        gameIt != root["games"].end();
+        ++gameIt
+    ) {
+        if (!gameIt.value().is_array())
+            continue;
+
+        Game game{};
+        game.id = gameIt.key();
+
+        for (const auto& row : gameIt.value()) {
+            if (!row.is_object())
+                continue;
+
+            std::vector<std::string> files;
+
+            if (
+                row.contains("files") &&
+                row["files"].is_array()
+            ) {
+                for (const auto& file : row["files"]) {
+                    if (!file.is_string())
+                        continue;
+
+                    auto value =
+                        file.get<std::string>();
+
+                    if (
+                        !value.empty() &&
+                        value.size() <= 4096
+                    ) {
+                        files.push_back(
+                            std::move(value)
+                        );
+                    }
+                }
+            }
+
+            std::string source =
+                field(row, "source", 1024);
+
+            // Shards also preserve all provider names.
+            // Release currently stores one display source,
+            // so use the first source if "source" is empty.
+            if (
+                source.empty() &&
+                row.contains("sources") &&
+                row["sources"].is_array() &&
+                !row["sources"].empty() &&
+                row["sources"][0].is_string()
+            ) {
+                source =
+                    row["sources"][0]
+                        .get<std::string>();
+            }
+
+            game.releases.push_back(
+                Release{
+                    field(row, "title", 16384),
+                    field(row, "magnet", 65536),
+                    field(row, "size", 1024),
+                    field(row, "infoHash", 256),
+                    source,
+                    std::move(files)
+                }
+            );
+        }
+
+        result.push_back(
+            std::move(game)
+        );
+    }
+
+    return result;
+}
+
 inline void mergeReleases(
     std::vector<Game>& catalog,
     const std::vector<Game>& torrentIndex

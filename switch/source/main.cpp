@@ -356,69 +356,241 @@ static Refresh refreshCatalog(
     }
 }
 
+static bool mergeCachedTorrentShards(
+    std::vector<sgb::Game>& games
+) {
+    try {
+        if (games.empty())
+            return false;
+
+        auto manifestBytes =
+            sgb::read(
+                root + "torrent-manifest.json"
+            );
+
+        auto manifest =
+            sgb::Json::parse(
+                manifestBytes
+            );
+
+        if (
+            manifest.value("schemaVersion", 0) != 1 ||
+            !manifest.contains("shards") ||
+            !manifest["shards"].is_array()
+        ) {
+            return false;
+        }
+
+        // Remove stale release data before applying
+        // the current shard set.
+        for (auto& game : games)
+            game.releases.clear();
+
+        for (
+            const auto& info :
+            manifest["shards"]
+        ) {
+            if (!info.is_object())
+                continue;
+
+            std::string filename =
+                info.value("file", "");
+
+            size_t expectedBytes =
+                info.value("bytes", 0u);
+
+            std::string expectedHash =
+                info.value("sha256", "");
+
+            if (
+                filename.empty() ||
+                expectedBytes == 0 ||
+                expectedHash.empty()
+            ) {
+                return false;
+            }
+
+            auto bytes =
+                sgb::read(root + filename);
+
+            if (
+                bytes.size() != expectedBytes ||
+                digest(bytes) != expectedHash
+            ) {
+                return false;
+            }
+
+            auto shard =
+                sgb::parseTorrentShard(
+                    bytes
+                );
+
+            sgb::mergeReleases(
+                games,
+                shard
+            );
+        }
+
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
 static Refresh refreshTorrents(
     const std::string& indexUrl,
     const std::vector<sgb::Game>& current
 ) {
     try {
-        auto url = siblingUrl(
-            indexUrl,
-            "switch-index.json"
-        );
+        if (current.empty()) {
+            throw std::runtime_error(
+                "Refresh Catalog Index first"
+            );
+        }
 
-        auto manifestUrl = siblingUrl(
-            indexUrl,
-            "manifest.json"
-        );
+        auto manifestUrl =
+            siblingUrl(
+                indexUrl,
+                "torrent-manifest.json"
+            );
 
-        auto manifest = sgb::Json::parse(
+        auto manifestBytes =
             get(
                 manifestUrl,
-                64 * 1024
-            )
-        );
-
-        if (manifest.at("schemaVersion") != 1)
-            throw std::runtime_error(
-                "Unsupported manifest"
+                2 * 1024 * 1024
             );
 
-        auto bytes = get(
-            url,
-            SIZE_MAX
-        );
+        auto manifest =
+            sgb::Json::parse(
+                manifestBytes
+            );
 
         if (
-            manifest.at("bytes") != bytes.size() ||
-            manifest.at("sha256") != digest(bytes)
+            manifest.value("schemaVersion", 0) != 1 ||
+            !manifest.contains("shards") ||
+            !manifest["shards"].is_array()
         ) {
             throw std::runtime_error(
-                "Torrent index changed during refresh"
+                "Unsupported torrent manifest"
             );
         }
 
-        auto torrents = sgb::parse(bytes);
+        const auto& shards =
+            manifest["shards"];
 
-        std::vector<sgb::Game> merged = current;
+        std::vector<sgb::Game> merged =
+            current;
 
-        if (merged.empty()) {
-            merged = torrents;
-        }
-        else {
+        // Important: remove old torrent results.
+        // Anything absent from the new shards should
+        // disappear instead of remaining stale.
+        for (auto& game : merged)
+            game.releases.clear();
+
+        size_t done = 0;
+        size_t cached = 0;
+
+        for (const auto& info : shards) {
+            if (!info.is_object()) {
+                throw std::runtime_error(
+                    "Invalid torrent shard entry"
+                );
+            }
+
+            std::string filename =
+                info.value("file", "");
+
+            size_t expectedBytes =
+                info.value("bytes", 0u);
+
+            std::string expectedHash =
+                info.value("sha256", "");
+
+            if (
+                filename.empty() ||
+                expectedBytes == 0 ||
+                expectedHash.empty()
+            ) {
+                throw std::runtime_error(
+                    "Invalid torrent shard metadata"
+                );
+            }
+
+            std::string localPath =
+                root + filename;
+
+            std::string bytes;
+            bool localGood = false;
+
+            try {
+                bytes =
+                    sgb::read(localPath);
+
+                localGood =
+                    bytes.size() == expectedBytes &&
+                    digest(bytes) == expectedHash;
+            }
+            catch (...) {
+                localGood = false;
+            }
+
+            if (localGood) {
+                ++cached;
+            }
+            else {
+                bytes =
+                    get(
+                        siblingUrl(
+                            indexUrl,
+                            filename
+                        ),
+                        SIZE_MAX
+                    );
+
+                if (
+                    bytes.size() != expectedBytes ||
+                    digest(bytes) != expectedHash
+                ) {
+                    throw std::runtime_error(
+                        "Torrent shard verification failed: " +
+                        filename
+                    );
+                }
+
+                atomicWrite(
+                    localPath,
+                    bytes
+                );
+            }
+
+            auto shard =
+                sgb::parseTorrentShard(
+                    bytes
+                );
+
             sgb::mergeReleases(
                 merged,
-                torrents
+                shard
             );
+
+            ++done;
         }
 
+        // Write manifest last so an interrupted refresh
+        // never points to incomplete shard files.
         atomicWrite(
-            root + "switch-index.json",
-            bytes
+            root + "torrent-manifest.json",
+            manifestBytes
         );
 
         return {
             std::move(merged),
-            "Torrent index refreshed"
+            "Torrent index refreshed; " +
+            std::to_string(done) +
+            " shards ready (" +
+            std::to_string(cached) +
+            " cached)"
         };
     }
     catch (const std::exception& e) {
