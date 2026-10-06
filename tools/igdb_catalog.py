@@ -89,12 +89,22 @@ def _switch_release_date(game):
 
 
 def _cover_url(game):
-    image_id = (game.get("cover") or {}).get("image_id", "")
-    return (
-        f"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/{image_id}.jpg"
-        if image_id else ""
-    )
+    cover = game.get("cover") or {}
 
+    if isinstance(cover, dict) and cover.get("image_id"):
+        image_id = cover["image_id"]
+        return f"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/{image_id}.jpg"
+
+    for key, size in (
+        ("artworks", "t_720p"),
+        ("screenshots", "t_screenshot_big"),
+    ):
+        for image in game.get(key) or []:
+            if isinstance(image, dict) and image.get("image_id"):
+                image_id = image["image_id"]
+                return f"https://images.igdb.com/igdb/image/upload/{size}/{image_id}.jpg"
+
+    return ""
 
 
 def _game_type_id(value):
@@ -167,7 +177,7 @@ def fetch_switch_games(client_id, client_secret):
             "fields id,name,slug,game_type,parent_game,genres.name,platforms,"
             "release_dates.date,release_dates.platform,first_release_date,"
             "rating,rating_count,aggregated_rating,aggregated_rating_count,"
-            "cover.image_id,summary;"
+            "cover.image_id,artworks.image_id,screenshots.image_id,summary;"
             f"where id > {last_id} & platforms = {SWITCH_PLATFORM_ID};"
             "sort id asc; limit 500;"
         )

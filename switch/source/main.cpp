@@ -13,6 +13,8 @@
 #include <memory>
 #include <optional>
 #include <sys/stat.h>
+#include <set>
+#include <thread>
 #include <vector>
 
 static const std::string root = "sdmc:/switch/SwitchGamesBrowser/";
@@ -102,6 +104,190 @@ static std::string siblingUrl(
     return indexUrl.substr(0, slash + 1) + filename;
 }
 
+
+struct CoverCacheStats {
+    size_t cached = 0;
+    size_t total = 0;
+};
+
+static std::vector<std::string> offlineCoverCandidates(
+    const std::string& url
+) {
+    std::vector<std::string> urls;
+
+    auto add = [&](const std::string& value) {
+        if (
+            !value.empty() &&
+            std::find(urls.begin(), urls.end(), value) == urls.end()
+        ) {
+            urls.push_back(value);
+        }
+    };
+
+    const std::string big2x = "/t_cover_big_2x/";
+    const std::string big = "/t_cover_big/";
+
+    if (url.find(big2x) != std::string::npos) {
+        add(url);
+
+        std::string fallback = url;
+        fallback.replace(
+            fallback.find(big2x),
+            big2x.size(),
+            big
+        );
+
+        add(fallback);
+    } else {
+        add(url);
+    }
+
+    return urls;
+}
+
+static bool validImageBytes(const std::string& bytes) {
+    if (bytes.size() < 12)
+        return false;
+
+    const auto* p =
+        reinterpret_cast<const unsigned char*>(bytes.data());
+
+    // JPEG
+    if (p[0] == 0xff && p[1] == 0xd8)
+        return true;
+
+    // PNG
+    if (
+        p[0] == 0x89 &&
+        p[1] == 0x50 &&
+        p[2] == 0x4e &&
+        p[3] == 0x47
+    )
+        return true;
+
+    // WEBP
+    if (
+        bytes.compare(0, 4, "RIFF") == 0 &&
+        bytes.compare(8, 4, "WEBP") == 0
+    )
+        return true;
+
+    return false;
+}
+
+static bool cachedImageValid(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+
+    if (!file)
+        return false;
+
+    char header[12]{};
+    file.read(header, sizeof(header));
+
+    if (file.gcount() < 12)
+        return false;
+
+    return validImageBytes(
+        std::string(header, sizeof(header))
+    );
+}
+
+static CoverCacheStats cacheCatalogCovers(
+    const std::vector<sgb::Game>& games
+) {
+    struct Job {
+        std::string url;
+        std::string path;
+    };
+
+    std::vector<Job> jobs;
+    std::set<std::string> seen;
+
+    mkdir((root + "covers").c_str(), 0777);
+
+    for (const auto& game : games) {
+        if (game.cover.empty())
+            continue;
+
+        std::string path =
+            root +
+            "covers/" +
+            digest(game.cover) +
+            ".img";
+
+        if (!seen.insert(path).second)
+            continue;
+
+        jobs.push_back({
+            game.cover,
+            path
+        });
+    }
+
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> cached{0};
+
+    auto worker = [&]() {
+        while (true) {
+            size_t i = next.fetch_add(1);
+
+            if (i >= jobs.size())
+                break;
+
+            const auto& job = jobs[i];
+
+            if (cachedImageValid(job.path)) {
+                cached.fetch_add(1);
+                continue;
+            }
+
+            std::remove(job.path.c_str());
+
+            for (
+                const auto& candidate :
+                offlineCoverCandidates(job.url)
+            ) {
+                try {
+                    auto bytes = get(
+                        candidate,
+                        8 * 1024 * 1024
+                    );
+
+                    if (!validImageBytes(bytes))
+                        continue;
+
+                    atomicWrite(
+                        job.path,
+                        bytes
+                    );
+
+                    cached.fetch_add(1);
+                    break;
+                }
+                catch (...) {
+                    // Try fallback URL.
+                }
+            }
+        }
+    };
+
+    size_t workerCount =
+        std::min<size_t>(8, jobs.size());
+
+    std::vector<std::thread> workers;
+
+    for (size_t i = 0; i < workerCount; ++i)
+        workers.emplace_back(worker);
+
+    for (auto& thread : workers)
+        thread.join();
+
+    return {
+        cached.load(),
+        jobs.size()
+    };
+}
+
 static Refresh refreshCatalog(
     const std::string& indexUrl,
     const std::vector<sgb::Game>& current
@@ -130,9 +316,16 @@ static Refresh refreshCatalog(
             bytes
         );
 
+        auto covers =
+            cacheCatalogCovers(catalog);
+
         return {
             std::move(catalog),
-            "Catalog index refreshed"
+            "Catalog refreshed; " +
+            std::to_string(covers.cached) +
+            "/" +
+            std::to_string(covers.total) +
+            " covers cached"
         };
     }
     catch (const std::exception& e) {
@@ -511,7 +704,19 @@ int main(int, char**) {
         if (keys & HidNpadButton_Plus) break;
         if (pending.valid() && pending.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto result = pending.get(); status = result.message;
-            if (!result.games.empty()) { games = std::move(result.games); page = Page::Browse; releaseIndex = torrentCursor = fileCursor = 0; selectedFiles.clear(); rebuild(); }
+            if (!result.games.empty()) {
+                for (auto& item : covers)
+                    SDL_DestroyTexture(item.second);
+
+                covers.clear();
+                attempted.clear();
+
+                games = std::move(result.games);
+                page = Page::Browse;
+                releaseIndex = torrentCursor = fileCursor = 0;
+                selectedFiles.clear();
+                rebuild();
+            }
         }
         for (auto it = coverJobs.begin(); it != coverJobs.end();) {
             if (
@@ -572,8 +777,7 @@ int main(int, char**) {
             }
 
             if (!loaded) {
-                // Important: failed downloads are allowed to retry.
-                attempted.erase(c.id);
+                // Stay on the offline placeholder until Catalog Refresh.
             }
 
             while (covers.size() > 24) {
@@ -1194,15 +1398,8 @@ int main(int, char**) {
                                         bool exists = cached.good();
                                         cached.close();
 
-                                        if (!exists) {
-                                            atomicWrite(
-                                                path,
-                                                get(
-                                                    candidate,
-                                                    4 * 1024 * 1024
-                                                )
-                                            );
-                                        }
+                                        if (!exists)
+                                            continue;
 
                                         return {id, path};
                                     }
