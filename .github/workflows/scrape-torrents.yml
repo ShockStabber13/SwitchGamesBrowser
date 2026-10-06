@@ -43,19 +43,15 @@ jobs:
       - name: Scrape providers
         run: python tools/authorized_site_scraper.py --workers 8
 
-      - name: Checkpoint scraped torrent results
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -f data/provider-releases.json data/scraper-status.json
-
-          if git diff --cached --quiet; then
-            echo "No scraped-result changes."
-          else
-            git commit -m "Checkpoint scraped torrent results"
-            git push
-          fi
+      - name: Save scraper checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-checkpoint-${{ github.run_id }}
+          path: |
+            data/provider-releases.json
+            data/scraper-status.json
+          compression-level: 9
+          retention-days: 14
 
       - name: Build Switch index
         run: python tools/build_igdb_index.py --allow-shrink
