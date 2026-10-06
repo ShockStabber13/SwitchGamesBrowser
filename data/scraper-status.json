@@ -1,10 +1,19 @@
 {
-  "generatedAt": "2026-10-05T21:20:10.936300+00:00",
-  "providers": [],
-  "catalogGames": 6850,
-  "matchedGames": 0,
-  "uniqueReleases": 0,
+  "generatedAt": "2026-10-06T14:06:14.585794+00:00",
+  "providers": [
+    "Knaben"
+  ],
+  "catalogGames": 6849,
+  "matchedGames": 1069,
+  "uniqueReleases": 202312,
   "failedSearches": 0,
-  "sourceStats": {},
+  "sourceStats": {
+    "Knaben": {
+      "searches": 7346,
+      "matchedGames": 1069,
+      "releases": 220917,
+      "failures": 0
+    }
+  },
   "failures": []
 }
