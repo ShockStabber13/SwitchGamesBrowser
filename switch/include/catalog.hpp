@@ -34,7 +34,7 @@ inline std::vector<Game> parse(const std::string& bytes) {
     auto root = Json::parse(bytes);
     if (root.at("schemaVersion") != 1 || root.at("platform") != "Nintendo Switch") throw std::runtime_error("Unsupported index format");
     auto& rows = root.at("games");
-    if (!rows.is_array() || rows.empty() || rows.size() > 20000) throw std::runtime_error("Invalid game count");
+    if (!rows.is_array() || rows.empty()) throw std::runtime_error("Invalid game count");
     std::vector<Game> result;
     std::set<std::string> ids;
     for (const auto& row : rows) {
@@ -73,7 +73,7 @@ inline std::vector<Game> parse(const std::string& bytes) {
 inline std::vector<Game> parseIgdbCatalog(const std::string& bytes) {
     auto rows = Json::parse(bytes);
 
-    if (!rows.is_array() || rows.empty() || rows.size() > 20000)
+    if (!rows.is_array() || rows.empty())
         throw std::runtime_error("Invalid IGDB catalog");
 
     std::vector<Game> result;
