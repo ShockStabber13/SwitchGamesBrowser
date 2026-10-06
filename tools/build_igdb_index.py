@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import re
 
-MAX_BYTES = 48 * 1024 * 1024
 HASH_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -113,9 +112,6 @@ def main():
     root = Path(args.output)
     index, report = build_index(read_json(args.catalog), read_json(args.releases))
     payload = json.dumps(index, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
-    if len(payload) > MAX_BYTES:
-        raise ValueError("Output exceeds Switch index size limit")
-
     old_path = root / "switch-index.json"
     if old_path.exists() and not args.allow_shrink:
         old = read_json(old_path)

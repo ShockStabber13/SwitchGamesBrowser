@@ -1,4 +1,4 @@
-﻿name: Scrape torrents
+name: Scrape torrents
 
 on:
   workflow_dispatch:
@@ -42,6 +42,20 @@ jobs:
 
       - name: Scrape providers
         run: python tools/authorized_site_scraper.py --workers 8
+
+      - name: Checkpoint scraped torrent results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/provider-releases.json data/scraper-status.json
+
+          if git diff --cached --quiet; then
+            echo "No scraped-result changes."
+          else
+            git commit -m "Checkpoint scraped torrent results"
+            git push
+          fi
 
       - name: Build Switch index
         run: python tools/build_igdb_index.py --allow-shrink

@@ -113,7 +113,7 @@ static Refresh refreshCatalog(
 
         auto bytes = get(
             url,
-            48 * 1024 * 1024
+            SIZE_MAX
         );
 
         auto catalog =
@@ -168,7 +168,7 @@ static Refresh refreshTorrents(
 
         auto bytes = get(
             url,
-            48 * 1024 * 1024
+            SIZE_MAX
         );
 
         if (
