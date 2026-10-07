@@ -104,9 +104,7 @@ bool resolveCandidateForDebrid(
             const std::string torrent =
                 sgb_api::httpGet(
                     item.torrentUrl,
-                    "application/x-bittorrent, application/octet-stream, */*",
-                    0L,
-                    30L);
+                    "application/x-bittorrent, application/octet-stream, */*");
 
             constexpr size_t maxTorrentBytes =
                 8 * 1024 * 1024;
@@ -572,4 +570,3 @@ LiveSearchResult runLiveSearch(
     return output;
 }
 } // namespace sgb
-

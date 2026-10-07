@@ -149,9 +149,7 @@ inline std::vector<sgb::ProviderResult> search(
     const std::string xml =
         sgb_api::httpGet(
             url,
-            "application/rss+xml, application/xml, text/xml, */*",
-            0L,
-            0L);
+            "application/rss+xml, application/xml, text/xml, */*");
 
     static const std::regex itemRe(
         R"(<item\b[\s\S]*?</item>)",
@@ -282,5 +280,4 @@ inline std::vector<sgb::ProviderResult> search(
 }
 
 } // namespace sgb_jackett
-
 
