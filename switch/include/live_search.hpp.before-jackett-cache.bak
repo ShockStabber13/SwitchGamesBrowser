@@ -50,7 +50,6 @@ struct LiveSearchResult {
     std::vector<Release> releases;
     std::map<std::string, DebridTorrentStatus> statuses;
     std::string message;
-    bool success = false;
 };
 
 std::set<std::string> enabledProviderIds(const std::string& configPath);

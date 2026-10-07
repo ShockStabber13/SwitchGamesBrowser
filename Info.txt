@@ -1,0 +1,4 @@
+
+.\Update-Jackett-Providers.ps1 `
+  -JackettUrl "http://192.168.10.123:9117" `
+  -ApiKey "o503z7wdwojqzarrwxzvjtwqol5i95e0"

@@ -7,7 +7,6 @@
 #include "debrid.hpp"
 #include "provider.hpp"
 #include "live_search.hpp"
-#include "scrape_cache.hpp"
 #include "provider_diagnostics.hpp"
 #include <atomic>
 #include <chrono>
@@ -1062,7 +1061,7 @@ static std::vector<std::string> coverCandidates(
 
 struct DebridCheckResult { std::map<std::string, sgb::DebridTorrentStatus> rows; std::string message; };
 struct DebridAddResult { std::string hash; sgb::DebridTorrentStatus state; std::string message; };
-enum class Page { Browse, Detail, Torrents, Files, Settings, Providers, SearchProgress, Options, ScrapeChoice };
+enum class Page { Browse, Detail, Torrents, Files, Settings, Providers, SearchProgress, Options };
 
 static DebridCheckResult liveDebridCheck(
     const sgb::DebridConfig& config,
@@ -1245,12 +1244,6 @@ int main(int, char**) {
     std::future<sgb::LiveSearchResult> pendingLiveSearch;
     sgb::LiveSearchProgress liveSearchProgress;
     size_t liveSearchGameIndex = 0;
-
-    size_t scrapeChoiceGameIndex = 0;
-    size_t scrapeChoiceCursor = 0;
-    bool scrapeChoiceHasCache = false;
-    std::time_t scrapeChoiceSavedAt = 0;
-    size_t scrapeChoiceReleaseCount = 0;
     std::map<std::string, SDL_Texture*> covers; std::set<std::string> attempted;
     auto rebuild = [&]() { rows = sgb::browse(games, filter, favourites); cursor = std::min(cursor, rows.empty() ? size_t(0) : rows.size()-1); dirty = true; };
     auto filesFor = [&](const sgb::Release& release) {
@@ -1306,30 +1299,6 @@ int main(int, char**) {
         pendingDebridAdd = std::async(std::launch::async, [configCopy, hash, magnet]() {
             return liveDebridAdd(configCopy, hash, magnet);
         });
-    };
-    auto openScrapeChoice = [&](size_t gameIndex) {
-        if (gameIndex >= games.size())
-            return;
-
-        scrapeChoiceGameIndex = gameIndex;
-        scrapeChoiceCursor = 0;
-
-        const auto cache =
-            sgb::scrapeCacheInfo(
-                root,
-                games[gameIndex].title,
-                debridConfig.service);
-
-        scrapeChoiceHasCache =
-            cache.available;
-
-        scrapeChoiceSavedAt =
-            cache.savedAt;
-
-        scrapeChoiceReleaseCount =
-            cache.releaseCount;
-
-        page = Page::ScrapeChoice;
     };
     auto startLiveSearch = [&](size_t gameIndex) {
         if (gameIndex >= games.size())
@@ -1458,124 +1427,7 @@ int main(int, char**) {
 
                 // First usable torrent: show the normal torrent screen.
                 // A/X/Up/Down work immediately while more rows append.
-                if (page == Page::ScrapeChoice) {
-            const std::string gameTitle =
-                scrapeChoiceGameIndex < games.size()
-                    ? games[scrapeChoiceGameIndex].title
-                    : "";
-
-            label(
-                renderer,
-                big,
-                "SCRAPE OPTIONS",
-                32,
-                72,
-                1200,
-                green);
-
-            label(
-                renderer,
-                big,
-                gameTitle,
-                32,
-                118,
-                1200,
-                white);
-
-            SDL_Rect cachedRow{
-                32,
-                205,
-                1216,
-                94
-            };
-
-            SDL_Rect newRow{
-                32,
-                320,
-                1216,
-                94
-            };
-
-            rect(
-                renderer,
-                cachedRow,
-                scrapeChoiceCursor == 0
-                    ? SDL_Color{28,28,28,255}
-                    : SDL_Color{14,14,14,255});
-
-            rect(
-                renderer,
-                newRow,
-                scrapeChoiceCursor == 1
-                    ? SDL_Color{28,28,28,255}
-                    : SDL_Color{14,14,14,255});
-
-            label(
-                renderer,
-                big,
-                "Cached Scrape",
-                54,
-                222,
-                1140,
-                scrapeChoiceCursor == 0
-                    ? green
-                    : white);
-
-            if (scrapeChoiceHasCache) {
-                label(
-                    renderer,
-                    small,
-                    std::to_string(
-                        scrapeChoiceReleaseCount) +
-                    " torrent(s)  |  " +
-                    sgb::scrapeCacheAgeText(
-                        scrapeChoiceSavedAt) +
-                    "  |  availability cached",
-                    54,
-                    266,
-                    1140,
-                    muted);
-            }
-            else {
-                label(
-                    renderer,
-                    small,
-                    "No cache for the current debrid service",
-                    54,
-                    266,
-                    1140,
-                    muted);
-            }
-
-            label(
-                renderer,
-                big,
-                "New Scrape",
-                54,
-                337,
-                1140,
-                scrapeChoiceCursor == 1
-                    ? green
-                    : white);
-
-            label(
-                renderer,
-                small,
-                "Search enabled providers and refresh cached availability",
-                54,
-                381,
-                1140,
-                muted);
-
-            label(
-                renderer,
-                small,
-                "A Select    B Back",
-                32,
-                650,
-                1200,
-                muted);
-        } else if (page == Page::SearchProgress) {
+                if (page == Page::SearchProgress) {
                     page = Page::Torrents;
                     status =
                         "Live search still running; "
@@ -1591,18 +1443,6 @@ int main(int, char**) {
             auto result = pendingLiveSearch.get();
 
             if (liveSearchGameIndex < games.size()) {
-                const bool scrapeSucceeded =
-                    result.success;
-
-                const bool scrapeCached =
-                    !scrapeSucceeded ||
-                    sgb::saveScrapeCache(
-                        root,
-                        games[liveSearchGameIndex].title,
-                        debridConfig.service,
-                        result.releases,
-                        result.statuses);
-
                 games[liveSearchGameIndex].releases =
                     std::move(result.releases);
 
@@ -1629,85 +1469,7 @@ int main(int, char**) {
                 }
             }
         }
-        if (page == Page::ScrapeChoice) {
-            if (keys & HidNpadButton_B) {
-                page = Page::Detail;
-            }
-
-            if (keys & HidNpadButton_AnyUp) {
-                scrapeChoiceCursor =
-                    scrapeChoiceCursor == 0
-                        ? 1
-                        : 0;
-            }
-
-            if (keys & HidNpadButton_AnyDown) {
-                scrapeChoiceCursor =
-                    scrapeChoiceCursor == 0
-                        ? 1
-                        : 0;
-            }
-
-            if (keys & HidNpadButton_A) {
-                if (
-                    scrapeChoiceGameIndex >=
-                    games.size()
-                ) {
-                    status =
-                        "Selected game is no longer available";
-                    page = Page::Browse;
-                }
-                else if (scrapeChoiceCursor == 0) {
-                    std::vector<sgb::Release> cached;
-                    std::map<
-                        std::string,
-                        sgb::DebridTorrentStatus
-                    > cachedStatuses;
-                    std::time_t savedAt = 0;
-
-                    if (
-                        !sgb::loadScrapeCache(
-                            root,
-                            games[
-                                scrapeChoiceGameIndex
-                            ].title,
-                            debridConfig.service,
-                            cached,
-                            cachedStatuses,
-                            &savedAt)
-                    ) {
-                        status =
-                            "No cached scrape available for this game";
-                    }
-                    else {
-                        games[
-                            scrapeChoiceGameIndex
-                        ].releases =
-                            std::move(cached);
-
-                        for (auto& pair : cachedStatuses) {
-                            debridStatuses[pair.first] =
-                                std::move(pair.second);
-                        }
-
-                        torrentCursor = 0;
-                        selectedFiles.clear();
-
-                        status =
-                            "Loaded cached scrape (" +
-                            sgb::scrapeCacheAgeText(
-                                savedAt) +
-                            ")";
-
-                        page = Page::Torrents;
-                    }
-                }
-                else {
-                    startLiveSearch(
-                        scrapeChoiceGameIndex);
-                }
-            }
-        } else if (page == Page::Browse) {
+        if (page == Page::Browse) {
             if ((keys & HidNpadButton_Left) && cursor) --cursor;
             if ((keys & HidNpadButton_Right) && cursor+1 < rows.size()) ++cursor;
             if ((keys & HidNpadButton_Up) && cursor >= 5) cursor -= 5;
@@ -2032,7 +1794,7 @@ int main(int, char**) {
                 if (keys & HidNpadButton_B) page = Page::Browse;
                 if (keys & HidNpadButton_X) { if (favourites.count(g.id)) favourites.erase(g.id); else favourites.insert(g.id); dirty = true; }
                 if (keys & HidNpadButton_A) {
-                    openScrapeChoice(rows[cursor]);
+                    startLiveSearch(rows[cursor]);
                 }
             } else if (page == Page::Torrents) {
                 if (keys & HidNpadButton_B) page = Page::Detail;
@@ -2711,164 +2473,6 @@ int main(int, char**) {
                 );
             }
 
-        } else if (page == Page::ScrapeChoice) {
-            // SCRAPE OPTIONS RENDERER - correct main render chain.
-
-            const std::string gameTitle =
-                scrapeChoiceGameIndex < games.size()
-                    ? games[scrapeChoiceGameIndex].title
-                    : "";
-
-            label(
-                renderer,
-                big,
-                "SCRAPE OPTIONS",
-                32,
-                72,
-                1200,
-                green
-            );
-
-            label(
-                renderer,
-                big,
-                gameTitle,
-                32,
-                118,
-                1200,
-                white
-            );
-
-            label(
-                renderer,
-                small,
-                "Debrid: " +
-                    sgb::debridServiceName(
-                        debridConfig.service
-                    ),
-                32,
-                165,
-                1200,
-                muted
-            );
-
-            SDL_Rect cachedRow{
-                32,
-                215,
-                1216,
-                105
-            };
-
-            SDL_Rect newRow{
-                32,
-                345,
-                1216,
-                105
-            };
-
-            rect(
-                renderer,
-                cachedRow,
-                SDL_Color{18,18,18,255}
-            );
-
-            rect(
-                renderer,
-                newRow,
-                SDL_Color{18,18,18,255}
-            );
-
-            if (scrapeChoiceCursor == 0) {
-                rect(
-                    renderer,
-                    cachedRow,
-                    green,
-                    true
-                );
-            }
-
-            if (scrapeChoiceCursor == 1) {
-                rect(
-                    renderer,
-                    newRow,
-                    green,
-                    true
-                );
-            }
-
-            label(
-                renderer,
-                big,
-                "Cached Scrape",
-                52,
-                230,
-                1140,
-                scrapeChoiceCursor == 0
-                    ? green
-                    : white
-            );
-
-            if (scrapeChoiceHasCache) {
-                label(
-                    renderer,
-                    small,
-                    std::to_string(
-                        scrapeChoiceReleaseCount
-                    ) +
-                    " torrent(s)  |  " +
-                    sgb::scrapeCacheAgeText(
-                        scrapeChoiceSavedAt
-                    ) +
-                    "  |  availability cached",
-                    52,
-                    278,
-                    1140,
-                    muted
-                );
-            }
-            else {
-                label(
-                    renderer,
-                    small,
-                    "No cached scrape for this debrid service",
-                    52,
-                    278,
-                    1140,
-                    muted
-                );
-            }
-
-            label(
-                renderer,
-                big,
-                "New Scrape",
-                52,
-                360,
-                1140,
-                scrapeChoiceCursor == 1
-                    ? green
-                    : white
-            );
-
-            label(
-                renderer,
-                small,
-                "Search providers and refresh debrid availability",
-                52,
-                408,
-                1140,
-                muted
-            );
-
-            label(
-                renderer,
-                small,
-                "Up/Down Select  |  A Confirm  |  B Back",
-                32,
-                620,
-                1216,
-                green
-            );
         } else if (page == Page::Detail && !rows.empty()) {
             const auto& g = games[rows[cursor]];
             label(renderer,big,g.title,32,85,1200);
@@ -2881,7 +2485,7 @@ int main(int, char**) {
             SDL_RenderSetClipRect(renderer,nullptr);
             label(renderer,small,"Debrid: " + sgb::debridServiceName(debridConfig.service),32,535,1200,muted);
             label(renderer,small,favourites.count(g.id) ? "Saved to favourites" : "X: Add to favourites",32,575,1200,green);
-            label(renderer,small,"A Scrape | X Favourite | B Back",32,620,1200);
+            label(renderer,small,"A Torrents | X Favourite | B Back",32,620,1200);
         } else if (page == Page::Torrents && !rows.empty()) {
             const auto& g = games[rows[cursor]];
             label(renderer,big,g.title,32,78,1200);

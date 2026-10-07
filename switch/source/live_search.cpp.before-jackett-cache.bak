@@ -486,7 +486,6 @@ LiveSearchResult runLiveSearch(
                 output.releases.size()) +
             " valid Switch torrent(s)";
 
-        output.success = true;
         progress.setText(
             "Complete",
             "");

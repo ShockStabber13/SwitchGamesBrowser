@@ -25,32 +25,16 @@ struct LiveSearchProgress {
     std::string stage;
     std::string currentProvider;
 
-    // Validated results are published here while providers are still
-    // searching. The SDL/main thread only reads snapshots.
-    mutable std::mutex resultMutex;
-    std::vector<Release> liveReleases;
-    std::map<std::string, DebridTorrentStatus> liveStatuses;
-
     void reset();
     void setText(const std::string& newStage, const std::string& provider = "");
     std::string stageText() const;
     std::string providerText() const;
-
-    void publishResult(
-        const Release& release,
-        const std::string& hash,
-        const DebridTorrentStatus& status);
-
-    void snapshotResults(
-        std::vector<Release>& releases,
-        std::map<std::string, DebridTorrentStatus>& statuses) const;
 };
 
 struct LiveSearchResult {
     std::vector<Release> releases;
     std::map<std::string, DebridTorrentStatus> statuses;
     std::string message;
-    bool success = false;
 };
 
 std::set<std::string> enabledProviderIds(const std::string& configPath);
