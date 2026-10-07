@@ -196,8 +196,8 @@ public:
             if (hash.size() == 40 && seen.insert(hash).second) hashes.push_back(hash);
         }
 
-        for (size_t offset = 0; offset < hashes.size(); offset += 10) {
-            const size_t end = std::min(offset + 10, hashes.size());
+        for (size_t offset = 0; offset < hashes.size(); offset += 100) {
+            const size_t end = std::min(offset + 100, hashes.size());
             std::string joined;
             for (size_t i = offset; i < end; ++i) {
                 if (!joined.empty()) joined += ",";
@@ -397,8 +397,8 @@ public:
         std::map<std::string, DebridTorrentStatus> out;
         const auto existingIds = existingMagnetIds();
 
-        for (size_t offset = 0; offset < candidates.size(); offset += 10) {
-            const size_t end = std::min(offset + 10, candidates.size());
+        for (size_t offset = 0; offset < candidates.size(); offset += 100) {
+            const size_t end = std::min(offset + 100, candidates.size());
             std::string body;
             for (size_t i = offset; i < end; ++i) {
                 if (!body.empty()) body += "&";
@@ -776,7 +776,6 @@ std::unique_ptr<DebridBackend> createDebridBackend(const DebridConfig& config) {
 }
 
 } // namespace sgb
-
 
 
 

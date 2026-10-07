@@ -130,51 +130,7 @@ public:
 };
 
 
-constexpr size_t maxConcurrentTorrentProcessing = 10;
-
-std::mutex torrentProcessingMutex;
-std::condition_variable torrentProcessingCv;
-size_t activeTorrentProcessing = 0;
-
-class TorrentProcessingSlot {
-public:
-    TorrentProcessingSlot()
-    {
-        std::unique_lock<std::mutex> lock(
-            torrentProcessingMutex);
-
-        torrentProcessingCv.wait(
-            lock,
-            []() {
-                return activeTorrentProcessing <
-                    maxConcurrentTorrentProcessing;
-            });
-
-        ++activeTorrentProcessing;
-    }
-
-    ~TorrentProcessingSlot()
-    {
-        {
-            std::lock_guard<std::mutex> lock(
-                torrentProcessingMutex);
-
-            if (activeTorrentProcessing > 0)
-                --activeTorrentProcessing;
-        }
-
-        torrentProcessingCv.notify_one();
-    }
-
-    TorrentProcessingSlot(
-        const TorrentProcessingSlot&) = delete;
-
-    TorrentProcessingSlot& operator=(
-        const TorrentProcessingSlot&) = delete;
-};
-
-
-bool resolveExistingHashOrMagnet(
+bool resolveCandidateForDebrid(
     ProviderResult& item)
 {
     std::string hash =
@@ -185,6 +141,43 @@ bool resolveExistingHashOrMagnet(
         hash =
             hashFromMagnet(
                 item.magnet);
+    }
+
+    // Jackett may only give us a .torrent URL.
+    // Resolve it HERE, during the Debrid Checked stage,
+    // rather than during provider scraping.
+    if (
+        hash.size() != 40 &&
+        !item.torrentUrl.empty()
+    ) {
+        try {
+            // Global cap: no more than 10 .torrent downloads
+            // anywhere in the live search at the same time.
+            TorrentDownloadSlot downloadSlot;
+
+            const std::string torrent =
+                sgb_api::httpGet(
+                    item.torrentUrl,
+                    "application/x-bittorrent, application/octet-stream, */*",
+                    0L,
+                    30L);
+
+            constexpr size_t maxTorrentBytes =
+                8 * 1024 * 1024;
+
+            if (
+                !torrent.empty() &&
+                torrent.size() <= maxTorrentBytes
+            ) {
+                hash =
+                    lowerAscii(
+                        sgb_torrent::infoHashV1(
+                            torrent));
+            }
+        }
+        catch (...) {
+            hash.clear();
+        }
     }
 
     if (hash.size() != 40)
@@ -200,82 +193,6 @@ bool resolveExistingHashOrMagnet(
     }
 
     return !item.magnet.empty();
-}
-
-
-bool downloadTorrentPayload(
-    const ProviderResult& item,
-    std::string& torrent)
-{
-    if (item.torrentUrl.empty())
-        return false;
-
-    try {
-        // Maximum 10 simultaneous .torrent downloads
-        // across the live search.
-        TorrentDownloadSlot downloadSlot;
-
-        torrent =
-            sgb_api::httpGet(
-                item.torrentUrl,
-                "application/x-bittorrent, application/octet-stream, */*",
-                0L,
-                30L);
-
-        constexpr size_t maxTorrentBytes =
-            8 * 1024 * 1024;
-
-        if (
-            torrent.empty() ||
-            torrent.size() > maxTorrentBytes
-        ) {
-            torrent.clear();
-            return false;
-        }
-
-        return true;
-    }
-    catch (...) {
-        torrent.clear();
-        return false;
-    }
-}
-
-
-bool processTorrentPayload(
-    ProviderResult& item,
-    const std::string& torrent)
-{
-    if (torrent.empty())
-        return false;
-
-    try {
-        // Separate processing stage:
-        // maximum 10 simultaneous hash calculations.
-        TorrentProcessingSlot processingSlot;
-
-        const std::string hash =
-            lowerAscii(
-                sgb_torrent::infoHashV1(
-                    torrent));
-
-        if (hash.size() != 40)
-            return false;
-
-        item.infoHash = hash;
-
-        if (item.magnet.empty()) {
-            item.magnet =
-                sgb_api::magnetFromHash(
-                    hash,
-                    item.title);
-        }
-
-        return !item.magnet.empty();
-    }
-    catch (...) {
-        return false;
-    }
 }
 
 std::string candidateKey(const Candidate& candidate) {
@@ -423,9 +340,8 @@ LiveSearchResult runLiveSearch(
         // especially after adding many Jackett-backed providers.
         // Four workers keeps RAM/socket pressure predictable.
         constexpr size_t maxWorkers = 4;
-        constexpr size_t debridBatchSize = 10;
-        constexpr size_t torrentDownloadWorkers = 10;
-        constexpr size_t torrentProcessingWorkers = 10;
+        constexpr size_t debridBatchSize = 100;
+        constexpr size_t torrentResolverWorkers = 10;
 
         std::atomic<size_t> nextJob{0};
         std::mutex dedupeMutex;
@@ -535,19 +451,17 @@ LiveSearchResult runLiveSearch(
                             resolvedIndexes.reserve(
                                 end - offset);
 
-                            // Existing hashes/magnets use the normal
-                            // MoviesAndSeries-style path immediately.
+                            // Resolve the current group concurrently.
                             //
-                            // Torrent-only results take one extra
-                            // preprocessing path:
+                            // Existing hashes/magnets complete almost
+                            // immediately.
                             //
-                            //   10 parallel downloads
-                            //       ->
-                            //   10 parallel hash calculations
-                            //       ->
-                            //   generated magnet
-                            //       ->
-                            //   normal debrid flow
+                            // Candidates that only have a .torrent URL
+                            // are downloaded and hashed concurrently.
+                            //
+                            // The global TorrentDownloadSlot above
+                            // guarantees a maximum of 10 active
+                            // .torrent downloads across ALL providers.
 
                             const size_t candidateCount =
                                 end - offset;
@@ -556,175 +470,54 @@ LiveSearchResult runLiveSearch(
                                 candidateCount,
                                 0);
 
-                            std::vector<std::string> torrentPayloads(
-                                candidateCount);
+                            std::atomic<size_t> nextResolve{
+                                offset
+                            };
 
-                            std::vector<size_t> torrentIndexes;
+                            auto resolverWorker = [&]() {
+                                while (true) {
+                                    const size_t i =
+                                        nextResolve.fetch_add(1);
 
-                            torrentIndexes.reserve(
-                                candidateCount);
+                                    if (i >= end)
+                                        break;
 
-                            // First separate candidates that already
-                            // have usable hashes/magnets from candidates
-                            // that require downloading a .torrent.
+                                    if (
+                                        resolveCandidateForDebrid(
+                                            fresh[i].provider)
+                                    ) {
+                                        resolved[
+                                            i - offset
+                                        ] = 1;
+                                    }
+                                }
+                            };
+
+                            const size_t resolverCount =
+                                std::min(
+                                    torrentResolverWorkers,
+                                    candidateCount);
+
+                            std::vector<std::thread>
+                                resolverThreads;
+
+                            resolverThreads.reserve(
+                                resolverCount);
+
                             for (
-                                size_t i = offset;
-                                i < end;
+                                size_t i = 0;
+                                i < resolverCount;
                                 ++i
                             ) {
-                                if (
-                                    resolveExistingHashOrMagnet(
-                                        fresh[i].provider)
-                                ) {
-                                    resolved[
-                                        i - offset
-                                    ] = 1;
-
-                                    continue;
-                                }
-
-                                if (
-                                    !fresh[i]
-                                        .provider
-                                        .torrentUrl
-                                        .empty()
-                                ) {
-                                    torrentIndexes.push_back(i);
-                                }
+                                resolverThreads.emplace_back(
+                                    resolverWorker);
                             }
 
-
-                            // =========================================
-                            // Stage 1:
-                            // Download up to 10 .torrent files in
-                            // parallel.
-                            // =========================================
-
-                            if (!torrentIndexes.empty()) {
-                                std::atomic<size_t> nextDownload{
-                                    0
-                                };
-
-                                auto downloadWorker = [&]() {
-                                    while (true) {
-                                        const size_t position =
-                                            nextDownload.fetch_add(1);
-
-                                        if (
-                                            position >=
-                                            torrentIndexes.size()
-                                        ) {
-                                            break;
-                                        }
-
-                                        const size_t i =
-                                            torrentIndexes[
-                                                position
-                                            ];
-
-                                        downloadTorrentPayload(
-                                            fresh[i].provider,
-                                            torrentPayloads[
-                                                i - offset
-                                            ]);
-                                    }
-                                };
-
-                                const size_t downloadWorkerCount =
-                                    std::min(
-                                        torrentDownloadWorkers,
-                                        torrentIndexes.size());
-
-                                std::vector<std::thread>
-                                    downloadThreads;
-
-                                downloadThreads.reserve(
-                                    downloadWorkerCount);
-
-                                for (
-                                    size_t i = 0;
-                                    i < downloadWorkerCount;
-                                    ++i
-                                ) {
-                                    downloadThreads.emplace_back(
-                                        downloadWorker);
-                                }
-
-                                for (
-                                    auto& thread :
-                                        downloadThreads
-                                ) {
-                                    thread.join();
-                                }
-
-
-                                // =====================================
-                                // Stage 2:
-                                // Process/hash up to 10 downloaded
-                                // torrents in parallel.
-                                // =====================================
-
-                                std::atomic<size_t> nextProcess{
-                                    0
-                                };
-
-                                auto processWorker = [&]() {
-                                    while (true) {
-                                        const size_t position =
-                                            nextProcess.fetch_add(1);
-
-                                        if (
-                                            position >=
-                                            torrentIndexes.size()
-                                        ) {
-                                            break;
-                                        }
-
-                                        const size_t i =
-                                            torrentIndexes[
-                                                position
-                                            ];
-
-                                        if (
-                                            processTorrentPayload(
-                                                fresh[i].provider,
-                                                torrentPayloads[
-                                                    i - offset
-                                                ])
-                                        ) {
-                                            resolved[
-                                                i - offset
-                                            ] = 1;
-                                        }
-                                    }
-                                };
-
-                                const size_t processWorkerCount =
-                                    std::min(
-                                        torrentProcessingWorkers,
-                                        torrentIndexes.size());
-
-                                std::vector<std::thread>
-                                    processThreads;
-
-                                processThreads.reserve(
-                                    processWorkerCount);
-
-                                for (
-                                    size_t i = 0;
-                                    i < processWorkerCount;
-                                    ++i
-                                ) {
-                                    processThreads.emplace_back(
-                                        processWorker);
-                                }
-
-                                for (
-                                    auto& thread :
-                                        processThreads
-                                ) {
-                                    thread.join();
-                                }
+                            for (
+                                auto& thread :
+                                    resolverThreads
+                            ) {
+                                thread.join();
                             }
 
                             // Preserve original candidate order when
@@ -904,10 +697,6 @@ LiveSearchResult runLiveSearch(
     return output;
 }
 } // namespace sgb
-
-
-
-
 
 
 

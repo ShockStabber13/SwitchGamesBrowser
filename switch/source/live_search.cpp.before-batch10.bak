@@ -423,7 +423,7 @@ LiveSearchResult runLiveSearch(
         // especially after adding many Jackett-backed providers.
         // Four workers keeps RAM/socket pressure predictable.
         constexpr size_t maxWorkers = 4;
-        constexpr size_t debridBatchSize = 10;
+        constexpr size_t debridBatchSize = 100;
         constexpr size_t torrentDownloadWorkers = 10;
         constexpr size_t torrentProcessingWorkers = 10;
 
@@ -904,7 +904,6 @@ LiveSearchResult runLiveSearch(
     return output;
 }
 } // namespace sgb
-
 
 
 
