@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <condition_variable>
 #include <future>
 #include <set>
 #include <stdexcept>
@@ -81,55 +80,6 @@ struct Candidate {
     std::string source;
 };
 
-
-// ============================================================
-// Global .torrent download limiter
-// ============================================================
-
-constexpr size_t maxConcurrentTorrentDownloads = 10;
-
-std::mutex torrentDownloadMutex;
-std::condition_variable torrentDownloadCv;
-size_t activeTorrentDownloads = 0;
-
-class TorrentDownloadSlot {
-public:
-    TorrentDownloadSlot()
-    {
-        std::unique_lock<std::mutex> lock(
-            torrentDownloadMutex);
-
-        torrentDownloadCv.wait(
-            lock,
-            []() {
-                return activeTorrentDownloads <
-                    maxConcurrentTorrentDownloads;
-            });
-
-        ++activeTorrentDownloads;
-    }
-
-    ~TorrentDownloadSlot()
-    {
-        {
-            std::lock_guard<std::mutex> lock(
-                torrentDownloadMutex);
-
-            if (activeTorrentDownloads > 0)
-                --activeTorrentDownloads;
-        }
-
-        torrentDownloadCv.notify_one();
-    }
-
-    TorrentDownloadSlot(
-        const TorrentDownloadSlot&) = delete;
-
-    TorrentDownloadSlot& operator=(
-        const TorrentDownloadSlot&) = delete;
-};
-
-
 bool resolveCandidateForDebrid(
     ProviderResult& item)
 {
@@ -151,10 +101,6 @@ bool resolveCandidateForDebrid(
         !item.torrentUrl.empty()
     ) {
         try {
-            // Global cap: no more than 10 .torrent downloads
-            // anywhere in the live search at the same time.
-            TorrentDownloadSlot downloadSlot;
-
             const std::string torrent =
                 sgb_api::httpGet(
                     item.torrentUrl,
@@ -340,8 +286,7 @@ LiveSearchResult runLiveSearch(
         // especially after adding many Jackett-backed providers.
         // Four workers keeps RAM/socket pressure predictable.
         constexpr size_t maxWorkers = 4;
-        constexpr size_t debridBatchSize = 100;
-        constexpr size_t torrentResolverWorkers = 10;
+        constexpr size_t debridBatchSize = 16;
 
         std::atomic<size_t> nextJob{0};
         std::mutex dedupeMutex;
@@ -451,86 +396,16 @@ LiveSearchResult runLiveSearch(
                             resolvedIndexes.reserve(
                                 end - offset);
 
-                            // Resolve the current group concurrently.
-                            //
-                            // Existing hashes/magnets complete almost
-                            // immediately.
-                            //
-                            // Candidates that only have a .torrent URL
-                            // are downloaded and hashed concurrently.
-                            //
-                            // The global TorrentDownloadSlot above
-                            // guarantees a maximum of 10 active
-                            // .torrent downloads across ALL providers.
-
-                            const size_t candidateCount =
-                                end - offset;
-
-                            std::vector<unsigned char> resolved(
-                                candidateCount,
-                                0);
-
-                            std::atomic<size_t> nextResolve{
-                                offset
-                            };
-
-                            auto resolverWorker = [&]() {
-                                while (true) {
-                                    const size_t i =
-                                        nextResolve.fetch_add(1);
-
-                                    if (i >= end)
-                                        break;
-
-                                    if (
-                                        resolveCandidateForDebrid(
-                                            fresh[i].provider)
-                                    ) {
-                                        resolved[
-                                            i - offset
-                                        ] = 1;
-                                    }
-                                }
-                            };
-
-                            const size_t resolverCount =
-                                std::min(
-                                    torrentResolverWorkers,
-                                    candidateCount);
-
-                            std::vector<std::thread>
-                                resolverThreads;
-
-                            resolverThreads.reserve(
-                                resolverCount);
-
-                            for (
-                                size_t i = 0;
-                                i < resolverCount;
-                                ++i
-                            ) {
-                                resolverThreads.emplace_back(
-                                    resolverWorker);
-                            }
-
-                            for (
-                                auto& thread :
-                                    resolverThreads
-                            ) {
-                                thread.join();
-                            }
-
-                            // Preserve original candidate order when
-                            // constructing the debrid batch.
+                            // Resolve torrent metadata as part of
+                            // the Debrid Checked stage.
                             for (
                                 size_t i = offset;
                                 i < end;
                                 ++i
                             ) {
                                 if (
-                                    !resolved[
-                                        i - offset
-                                    ]
+                                    !resolveCandidateForDebrid(
+                                        fresh[i].provider)
                                 ) {
                                     continue;
                                 }
@@ -697,9 +572,4 @@ LiveSearchResult runLiveSearch(
     return output;
 }
 } // namespace sgb
-
-
-
-
-
 
