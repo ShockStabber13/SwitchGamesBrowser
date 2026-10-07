@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "provider.hpp"
 #include "provider_api_utils.hpp"
@@ -129,8 +129,7 @@ inline std::vector<sgb::ProviderResult> search(
 {
     std::vector<sgb::ProviderResult> results;
 
-    const std::string clean =
-        sgb_api::trim(query);
+    const std::string clean = sgb_api::trim(query);
 
     if (clean.empty())
         return results;
@@ -155,6 +154,8 @@ inline std::vector<sgb::ProviderResult> search(
         R"(<item\b[\s\S]*?</item>)",
         std::regex::icase);
 
+    std::unordered_set<std::string> seen;
+
     for (
         auto it =
             std::sregex_iterator(
@@ -164,29 +165,15 @@ inline std::vector<sgb::ProviderResult> search(
         it != std::sregex_iterator();
         ++it
     ) {
-        const std::string item =
-            it->str();
+        const std::string item = it->str();
 
         const std::string title =
             sgb_api::trim(
-                sgb_api::tagValue(
-                    item,
-                    "title"));
-
-        if (title.empty())
-            continue;
+                sgb_api::tagValue(item, "title"));
 
         const std::string link =
             sgb_api::trim(
-                sgb_api::tagValue(
-                    item,
-                    "link"));
-
-        const std::string guid =
-            sgb_api::trim(
-                sgb_api::tagValue(
-                    item,
-                    "guid"));
+                sgb_api::tagValue(item, "link"));
 
         std::string magnet =
             sgb_api::trim(
@@ -204,16 +191,20 @@ inline std::vector<sgb::ProviderResult> search(
 
         if (
             magnet.empty() &&
-            link.rfind("magnet:",0) == 0
+            link.rfind("magnet:", 0) == 0
         ) {
             magnet = link;
         }
 
-        if (
-            magnet.empty() &&
-            guid.rfind("magnet:",0) == 0
-        ) {
-            magnet = guid;
+        if (magnet.empty()) {
+            const std::string guid =
+                sgb_api::trim(
+                    sgb_api::tagValue(
+                        item,
+                        "guid"));
+
+            if (guid.rfind("magnet:", 0) == 0)
+                magnet = guid;
         }
 
         std::string hash =
@@ -223,61 +214,62 @@ inline std::vector<sgb::ProviderResult> search(
                         item,
                         "infohash")));
 
-        if (
-            !sgb_api::validInfoHash(hash) &&
-            sgb_api::validInfoHash(guid)
-        ) {
+        if (hash.empty() && !magnet.empty())
+            hash = sgb_api::hashFromMagnet(magnet);
+
+        // Some Jackett indexers, especially private trackers, return only a
+        // .torrent enclosure instead of an info hash or magnet. Resolve that
+        // generically by downloading the metainfo through Jackett and hashing
+        // the raw bencoded "info" dictionary (BitTorrent v1 info hash).
+        if (!sgb_api::validInfoHash(hash)) {
+            std::string torrentUrl =
+                resolveUrl(
+                    config,
+                    enclosureUrl(item));
+
+            // Standard Torznab commonly uses <link> as the download URL when
+            // there is no enclosure. Only use it when it is HTTP(S), never a
+            // details page represented by another scheme.
+            if (
+                torrentUrl.empty() &&
+                (link.rfind("http://", 0) == 0 ||
+                 link.rfind("https://", 0) == 0)
+            ) {
+                torrentUrl = link;
+            }
+
             hash =
-                sgb_api::lowerAscii(guid);
+                infoHashFromTorrentUrl(
+                    torrentUrl);
         }
 
         if (
-            hash.empty() &&
-            !magnet.empty()
-        ) {
-            hash =
-                sgb_api::hashFromMagnet(
-                    magnet);
-        }
-
-        std::string torrentUrl =
-            resolveUrl(
-                config,
-                enclosureUrl(item));
-
-        if (
-            torrentUrl.empty() &&
-            (
-                link.rfind("http://",0) == 0 ||
-                link.rfind("https://",0) == 0
-            )
-        ) {
-            torrentUrl = link;
-        }
-
-        // Keep the raw Jackett candidate now.
-        // Torrent metadata resolution happens later
-        // in the Debrid Checked stage.
-        if (
-            hash.empty() &&
-            magnet.empty() &&
-            torrentUrl.empty()
+            title.empty() ||
+            !sgb_api::validInfoHash(hash)
         ) {
             continue;
+        }
+
+        hash = sgb_api::lowerAscii(hash);
+
+        if (!seen.insert(hash).second)
+            continue;
+
+        if (magnet.empty()) {
+            magnet =
+                sgb_api::magnetFromHash(
+                    hash,
+                    title);
         }
 
         sgb::ProviderResult row;
         row.title = title;
         row.magnet = magnet;
         row.infoHash = hash;
-        row.torrentUrl = torrentUrl;
-
-        results.push_back(
-            std::move(row));
+        results.push_back(std::move(row));
     }
 
     return results;
 }
 
 } // namespace sgb_jackett
-

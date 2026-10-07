@@ -1,8 +1,6 @@
-﻿#include "live_search.hpp"
+#include "live_search.hpp"
 #include "provider.hpp"
 #include "provider_diagnostics.hpp"
-#include "provider_api_utils.hpp"
-#include "torrent_metainfo.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -79,65 +77,6 @@ struct Candidate {
     ProviderResult provider;
     std::string source;
 };
-
-bool resolveCandidateForDebrid(
-    ProviderResult& item)
-{
-    std::string hash =
-        lowerAscii(
-            item.infoHash);
-
-    if (hash.size() != 40) {
-        hash =
-            hashFromMagnet(
-                item.magnet);
-    }
-
-    // Jackett may only give us a .torrent URL.
-    // Resolve it HERE, during the Debrid Checked stage,
-    // rather than during provider scraping.
-    if (
-        hash.size() != 40 &&
-        !item.torrentUrl.empty()
-    ) {
-        try {
-            const std::string torrent =
-                sgb_api::httpGet(
-                    item.torrentUrl,
-                    "application/x-bittorrent, application/octet-stream, */*");
-
-            constexpr size_t maxTorrentBytes =
-                8 * 1024 * 1024;
-
-            if (
-                !torrent.empty() &&
-                torrent.size() <= maxTorrentBytes
-            ) {
-                hash =
-                    lowerAscii(
-                        sgb_torrent::infoHashV1(
-                            torrent));
-            }
-        }
-        catch (...) {
-            hash.clear();
-        }
-    }
-
-    if (hash.size() != 40)
-        return false;
-
-    item.infoHash = hash;
-
-    if (item.magnet.empty()) {
-        item.magnet =
-            sgb_api::magnetFromHash(
-                hash,
-                item.title);
-    }
-
-    return !item.magnet.empty();
-}
 
 std::string candidateKey(const Candidate& candidate) {
     std::string hash = lowerAscii(candidate.provider.infoHash);
@@ -318,30 +257,49 @@ LiveSearchResult runLiveSearch(
                             provider->search(query);
 
                         providerRows = found.size();
-
-                        // "Candidates" means exactly what the
-                        // provider/indexer returned.
-                        progress.candidatesFound.fetch_add(
-                            providerRows);
-
                         fresh.reserve(found.size());
 
                         for (auto& item : found) {
                             if (item.title.empty())
                                 continue;
 
+                            if (item.infoHash.empty()) {
+                                item.infoHash =
+                                    hashFromMagnet(
+                                        item.magnet);
+                            }
+
                             if (
                                 item.infoHash.empty() &&
-                                item.magnet.empty() &&
-                                item.torrentUrl.empty()
+                                item.magnet.empty()
                             ) {
                                 continue;
                             }
 
-                            fresh.push_back({
+                            Candidate candidate{
                                 std::move(item),
                                 job.id
-                            });
+                            };
+
+                            const std::string key =
+                                candidateKey(candidate);
+
+                            if (key == "m:")
+                                continue;
+
+                            bool inserted = false;
+
+                            {
+                                std::lock_guard<std::mutex>
+                                    lock(dedupeMutex);
+
+                                inserted =
+                                    seen.insert(key).second;
+                            }
+
+                            if (inserted)
+                                fresh.push_back(
+                                    std::move(candidate));
                         }
                     }
                 }
@@ -357,6 +315,8 @@ LiveSearchResult runLiveSearch(
                     providerRows,
                     providerError);
 
+                progress.candidatesFound.fetch_add(
+                    fresh.size());
 
                 progress.debridTotal.fetch_add(
                     fresh.size());
@@ -385,46 +345,34 @@ LiveSearchResult runLiveSearch(
                             std::vector<DebridCandidate>
                                 batch;
 
-                            std::vector<size_t>
-                                resolvedIndexes;
-
                             batch.reserve(
                                 end - offset);
 
-                            resolvedIndexes.reserve(
-                                end - offset);
-
-                            // Resolve torrent metadata as part of
-                            // the Debrid Checked stage.
                             for (
                                 size_t i = offset;
                                 i < end;
                                 ++i
                             ) {
-                                if (
-                                    !resolveCandidateForDebrid(
-                                        fresh[i].provider)
-                                ) {
-                                    continue;
+                                std::string hash =
+                                    lowerAscii(
+                                        fresh[i]
+                                            .provider
+                                            .infoHash);
+
+                                if (hash.empty()) {
+                                    hash =
+                                        hashFromMagnet(
+                                            fresh[i]
+                                                .provider
+                                                .magnet);
                                 }
 
                                 batch.push_back({
-                                    fresh[i]
-                                        .provider
-                                        .infoHash,
+                                    hash,
                                     fresh[i]
                                         .provider
                                         .magnet
                                 });
-
-                                resolvedIndexes.push_back(i);
-                            }
-
-                            if (batch.empty()) {
-                                progress.debridChecked
-                                    .fetch_add(
-                                        end - offset);
-                                continue;
                             }
 
                             std::map<
@@ -445,14 +393,23 @@ LiveSearchResult runLiveSearch(
                             }
 
                             for (
-                                size_t freshIndex :
-                                    resolvedIndexes
+                                size_t i = offset;
+                                i < end;
+                                ++i
                             ) {
-                                const std::string hash =
+                                std::string hash =
                                     lowerAscii(
-                                        fresh[freshIndex]
+                                        fresh[i]
                                             .provider
                                             .infoHash);
+
+                                if (hash.empty()) {
+                                    hash =
+                                        hashFromMagnet(
+                                            fresh[i]
+                                                .provider
+                                                .magnet);
+                                }
 
                                 auto state =
                                     checked.find(hash);
@@ -460,50 +417,25 @@ LiveSearchResult runLiveSearch(
                                 if (
                                     state ==
                                         checked.end() ||
-                                    !state->second.cached ||
                                     !hasSwitchExtension(
                                         state->second.files)
                                 ) {
                                     continue;
                                 }
 
-                                // Deduplicate only AFTER the
-                                // candidate has reached the debrid
-                                // stage. Raw candidate count remains
-                                // untouched.
-                                bool firstResult = false;
-
-                                {
-                                    std::lock_guard<std::mutex>
-                                        lock(dedupeMutex);
-
-                                    firstResult =
-                                        seen.insert(
-                                            "h:" + hash)
-                                            .second;
-                                }
-
-                                if (!firstResult)
-                                    continue;
-
                                 Release release;
-
                                 release.title =
-                                    fresh[freshIndex]
+                                    fresh[i]
                                         .provider
                                         .title;
-
                                 release.magnet =
-                                    fresh[freshIndex]
+                                    fresh[i]
                                         .provider
                                         .magnet;
-
                                 release.infoHash =
                                     hash;
-
                                 release.source =
-                                    fresh[freshIndex]
-                                        .source;
+                                    fresh[i].source;
 
                                 progress.publishResult(
                                     release,

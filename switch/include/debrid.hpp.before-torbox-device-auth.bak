@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "json.hpp"
 #include <map>
@@ -118,21 +118,6 @@ public:
 };
 
 
-struct TorBoxDeviceAuth {
-    std::string deviceCode;
-    std::string code;
-    std::string verificationUrl;
-    std::string friendlyVerificationUrl;
-    int interval = 5;
-    int expiresIn = 600;
-};
-
-struct TorBoxDeviceCheck {
-    bool activated = false;
-    std::string apiKey;
-    std::string message;
-};
-
 struct AllDebridPinAuth {
     std::string pin;
     std::string check;
@@ -146,13 +131,9 @@ struct AllDebridPinCheck {
     int expiresIn = 0;
 };
 
-TorBoxDeviceAuth beginTorBoxDeviceAuth();
-TorBoxDeviceCheck checkTorBoxDeviceAuth(const TorBoxDeviceAuth& auth);
-
 AllDebridPinAuth beginAllDebridPinAuth();
 AllDebridPinCheck checkAllDebridPinAuth(const AllDebridPinAuth& auth);
 
 std::unique_ptr<DebridBackend> createDebridBackend(const DebridConfig& config);
 
 } // namespace sgb
-

@@ -10,7 +10,6 @@ struct ProviderResult {
     std::string title;
     std::string magnet;
     std::string infoHash;
-    std::string torrentUrl;
 };
 
 class Provider {
@@ -75,4 +74,3 @@ public:
             &sgbCreateProvider_##CLASS                \
         );                                            \
     }
-

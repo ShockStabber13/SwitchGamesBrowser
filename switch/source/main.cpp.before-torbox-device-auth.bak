@@ -1,4 +1,4 @@
-﻿#include <switch.h>
+#include <switch.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <SDL2/SDL_image.h>
@@ -1233,7 +1233,6 @@ int main(int, char**) {
     size_t cursor = 0, releaseIndex = 0, torrentCursor = 0, fileCursor = 0;
     size_t settingsCursor = 0, providerCursor = 0;
     size_t optionsCursor = 0;
-    std::optional<sgb::TorBoxDeviceAuth> torBoxDeviceAuth;
     std::optional<sgb::AllDebridPinAuth> allDebridPin;
     loadCoverPackManifest();
 
@@ -1825,7 +1824,6 @@ int main(int, char**) {
                             : sgb::DebridService::TorBox;
 
                     debridConfig.apiKey.clear();
-                    torBoxDeviceAuth.reset();
                     allDebridPin.reset();
                     debridStatuses.clear();
 
@@ -1838,56 +1836,26 @@ int main(int, char**) {
 
                 else if (settingsCursor == 1) {
                     if (debridConfig.service == sgb::DebridService::TorBox) {
-                        try {
-                            if (!torBoxDeviceAuth.has_value()) {
-                                torBoxDeviceAuth =
-                                    sgb::beginTorBoxDeviceAuth();
+                        std::string token = keyboard(
+                            "Paste TorBox API token",
+                            ""
+                        );
 
-                                status =
-                                    "TorBox code: " +
-                                    torBoxDeviceAuth->code;
-                            }
-                            else {
-                                auto result =
-                                    sgb::checkTorBoxDeviceAuth(
-                                        *torBoxDeviceAuth
-                                    );
+                        if (token.empty()) {
+                            status = "TorBox token unchanged";
+                        } else {
+                            debridConfig.apiKey = token;
+                            debridStatuses.clear();
 
-                                if (
-                                    result.activated &&
-                                    !result.apiKey.empty()
-                                ) {
-                                    debridConfig.apiKey =
-                                        result.apiKey;
+                            try {
+                                atomicWrite(
+                                    root + "debrid-status.json",
+                                    "{}"
+                                );
+                            } catch (...) {}
 
-                                    debridStatuses.clear();
-
-                                    try {
-                                        atomicWrite(
-                                            root +
-                                            "debrid-status.json",
-                                            "{}"
-                                        );
-                                    } catch (...) {}
-
-                                    saveConfig();
-
-                                    torBoxDeviceAuth.reset();
-
-                                    status =
-                                        "TorBox authorized";
-                                }
-                                else {
-                                    status =
-                                        result.message.empty()
-                                            ? "Waiting for TorBox approval"
-                                            : result.message;
-                                }
-                            }
-                        }
-                        catch (const std::exception& e) {
-                            status = e.what();
-                            torBoxDeviceAuth.reset();
+                            saveConfig();
+                            status = "TorBox authorized";
                         }
                     }
 
@@ -2560,9 +2528,7 @@ int main(int, char**) {
                 sgb::DebridService::TorBox
             ) {
                 authLabel =
-                    torBoxDeviceAuth.has_value()
-                        ? "Check TorBox Authorization"
-                        : "Authorize TorBox";
+                    "Authorize / Set TorBox API Token";
             }
 
             if (
@@ -2711,31 +2677,7 @@ int main(int, char**) {
             );
 
 
-            if (torBoxDeviceAuth.has_value()) {
-                label(
-                    renderer,
-                    big,
-                    "TorBox Code: " +
-                        torBoxDeviceAuth->code,
-                    32,
-                    600,
-                    700,
-                    green
-                );
-
-                label(
-                    renderer,
-                    small,
-                    "Visit: " +
-                        torBoxDeviceAuth
-                            ->friendlyVerificationUrl,
-                    32,
-                    638,
-                    1216,
-                    white
-                );
-            }
-            else if (allDebridPin.has_value()) {
+            if (allDebridPin.has_value()) {
                 label(
                     renderer,big,
                     "PIN: " + allDebridPin->pin,
@@ -3164,4 +3106,3 @@ int main(int, char**) {
     IMG_Quit(); TTF_Quit(); SDL_Quit(); plExit(); curl_global_cleanup(); romfsExit(); socketExit();
     return 0;
 }
-
