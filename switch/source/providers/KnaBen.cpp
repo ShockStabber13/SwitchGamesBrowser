@@ -38,66 +38,84 @@ public:
         if (clean.empty())
             return results;
 
-        const std::string url =
-            "https://api.knaben.org/v2/search?q=" +
-            sgb_api::urlEncode(clean) +
-            "&sf=title&o=seeders&d=desc&s=300&f=0";
-
-        const std::string body =
-            sgb_api::httpGet(url, "application/json");
-
-        const Json root = Json::parse(body, nullptr, false);
-        if (root.is_discarded())
-            throw std::runtime_error("Knaben returned invalid JSON");
-
-        const Json* items = nullptr;
-        if (root.is_array()) {
-            items = &root;
-        }
-        else if (root.is_object()) {
-            if (root.contains("hits") && root["hits"].is_array())
-                items = &root["hits"];
-            else if (root.contains("results") && root["results"].is_array())
-                items = &root["results"];
-            else if (root.contains("data") && root["data"].is_array())
-                items = &root["data"];
-        }
-
-        if (!items)
-            throw std::runtime_error("Knaben API missing result array");
-
+        constexpr size_t pageSize = 300;
+        size_t offset = 0;
         std::unordered_set<std::string> seen;
 
-        for (const auto& item : *items) {
-            if (!item.is_object())
-                continue;
+        while (true) {
+            const std::string url =
+                "https://api.knaben.org/v2/search?q=" +
+                sgb_api::urlEncode(clean) +
+                "&sf=title&o=seeders&d=desc&s=" +
+                std::to_string(pageSize) +
+                "&f=" + std::to_string(offset);
 
-            const std::string title = sgb_api::trim(
-                stringField(item, "title", "name"));
+            const std::string body =
+                sgb_api::httpGet(url, "application/json");
 
-            std::string magnet = sgb_api::trim(
-                stringField(item, "magnetUrl", "magnetUri", "magnet"));
+            const Json root = Json::parse(body, nullptr, false);
+            if (root.is_discarded())
+                throw std::runtime_error("Knaben returned invalid JSON");
 
-            std::string hash = sgb_api::lowerAscii(sgb_api::trim(
-                stringField(item, "hash", "infohash", "infoHash")));
+            const Json* items = nullptr;
+            if (root.is_array()) {
+                items = &root;
+            }
+            else if (root.is_object()) {
+                if (root.contains("hits") && root["hits"].is_array())
+                    items = &root["hits"];
+                else if (root.contains("results") && root["results"].is_array())
+                    items = &root["results"];
+                else if (root.contains("data") && root["data"].is_array())
+                    items = &root["data"];
+            }
 
-            if (hash.empty() && !magnet.empty())
-                hash = sgb_api::hashFromMagnet(magnet);
+            if (!items)
+                throw std::runtime_error("Knaben API missing result array");
 
-            if (title.empty() || !sgb_api::validInfoHash(hash))
-                continue;
+            const size_t batchSize = items->size();
+            if (batchSize == 0)
+                break;
 
-            if (!seen.insert(hash).second)
-                continue;
+            size_t newResults = 0;
 
-            if (magnet.empty())
-                magnet = sgb_api::magnetFromHash(hash, title);
+            for (const auto& item : *items) {
+                if (!item.is_object())
+                    continue;
 
-            sgb::ProviderResult result;
-            result.title = title;
-            result.magnet = magnet;
-            result.infoHash = hash;
-            results.push_back(std::move(result));
+                const std::string title = sgb_api::trim(
+                    stringField(item, "title", "name"));
+
+                std::string magnet = sgb_api::trim(
+                    stringField(item, "magnetUrl", "magnetUri", "magnet"));
+
+                std::string hash = sgb_api::lowerAscii(sgb_api::trim(
+                    stringField(item, "hash", "infohash", "infoHash")));
+
+                if (hash.empty() && !magnet.empty())
+                    hash = sgb_api::hashFromMagnet(magnet);
+
+                if (title.empty() || !sgb_api::validInfoHash(hash))
+                    continue;
+
+                if (!seen.insert(hash).second)
+                    continue;
+
+                if (magnet.empty())
+                    magnet = sgb_api::magnetFromHash(hash, title);
+
+                sgb::ProviderResult result;
+                result.title = title;
+                result.magnet = magnet;
+                result.infoHash = hash;
+                results.push_back(std::move(result));
+                ++newResults;
+            }
+
+            if (batchSize < pageSize || newResults == 0)
+                break;
+
+            offset += pageSize;
         }
 
         return results;

@@ -1164,7 +1164,7 @@ int main(int, char**) {
         );
 
         url = sgb::field(config, "indexUrl", 2048);
-        langegenUrl = "https://raw.githubusercontent.com/Langegen/switch-game-collection/main/EN_catalog.json";
+        langegenUrl = config.value("langegenUrl", "");
 
         debridConfig.service = sgb::parseDebridService(
             config.value("debridService", "")
@@ -1218,6 +1218,7 @@ int main(int, char**) {
                 root + "config.json",
                 sgb::Json{
                     {"indexUrl", url},
+                    {"langegenUrl", langegenUrl},
                     {"debridService", service},
                     {"debridApiKey", debridConfig.apiKey},
                     {"enabledProviders", providerArray}
@@ -1657,7 +1658,15 @@ int main(int, char**) {
                             "Langegen catalog download already running";
                     }
                     else {
-                        
+                        if (langegenUrl.empty()) {
+                            langegenUrl = keyboard(
+                                "Paste JSON catalog HTTPS URL",
+                                langegenUrl
+                            );
+
+                            if (!langegenUrl.empty())
+                                saveConfig();
+                        }
 
                         if (langegenUrl.empty()) {
                             status =

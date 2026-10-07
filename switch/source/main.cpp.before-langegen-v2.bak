@@ -601,108 +601,6 @@ static Refresh refreshTorrents(
     }
 }
 
-static std::string downloadLangegenCatalog(
-    const std::string& sourceUrl
-) {
-    try {
-        if (sourceUrl.empty())
-            throw std::runtime_error(
-                "Configure Langegen catalog URL first");
-
-        auto bytes = get(
-            sourceUrl,
-            SIZE_MAX
-        );
-
-        auto json = sgb::Json::parse(
-            bytes,
-            nullptr,
-            false
-        );
-
-        if (json.is_discarded())
-            throw std::runtime_error(
-                "Downloaded Langegen catalog is invalid JSON");
-
-        const sgb::Json* rows = nullptr;
-
-        if (json.is_array()) {
-            rows = &json;
-        }
-        else if (json.is_object()) {
-            if (
-                json.contains("data") &&
-                json["data"].is_array()
-            ) {
-                rows = &json["data"];
-            }
-            else if (
-                json.contains("games") &&
-                json["games"].is_array()
-            ) {
-                rows = &json["games"];
-            }
-        }
-
-        if (!rows || rows->empty())
-            throw std::runtime_error(
-                "Downloaded Langegen catalog has no rows");
-
-        size_t usable = 0;
-
-        for (const auto& row : *rows) {
-            if (!row.is_object())
-                continue;
-
-            std::string title;
-
-            if (
-                row.contains("title") &&
-                row["title"].is_string()
-            ) {
-                title =
-                    row["title"].get<std::string>();
-            }
-            else if (
-                row.contains("name") &&
-                row["name"].is_string()
-            ) {
-                title =
-                    row["name"].get<std::string>();
-            }
-
-            if (
-                !title.empty() &&
-                row.contains("magnet") &&
-                row["magnet"].is_string() &&
-                row["magnet"]
-                    .get<std::string>()
-                    .rfind("magnet:?", 0) == 0
-            ) {
-                ++usable;
-            }
-        }
-
-        if (usable == 0)
-            throw std::runtime_error(
-                "Langegen catalog contains no usable torrent rows");
-
-        // atomicWrite preserves the previous working cache
-        // until the replacement has been written successfully.
-        atomicWrite(
-            root + "langegen.json",
-            bytes
-        );
-
-        return
-            "Langegen catalog updated: " +
-            std::to_string(usable) +
-            " rows";
-    }
-    catch (const std::exception& e) {
-        return e.what();
-    }
-}
 static std::string keyboard(const char* label, const std::string& initial) {
     SwkbdConfig config; char out[256]{};
     if (R_FAILED(swkbdCreate(&config, 0))) return initial;
@@ -1121,7 +1019,7 @@ int main(int, char**) {
     PadState pad; padConfigureInput(1, HidNpadStyleSet_NpadStandard); padInitializeDefault(&pad);
     std::vector<sgb::Game> games; std::set<std::string> favourites;
     sgb::Filter filter;
-    std::string url, langegenUrl, status = "Press - for Options";
+    std::string url, status = "Press - for Options";
     sgb::DebridConfig debridConfig;
     std::map<std::string, sgb::DebridTorrentStatus> debridStatuses;
 
@@ -1164,7 +1062,6 @@ int main(int, char**) {
         );
 
         url = sgb::field(config, "indexUrl", 2048);
-        langegenUrl = "https://raw.githubusercontent.com/Langegen/switch-game-collection/main/EN_catalog.json";
 
         debridConfig.service = sgb::parseDebridService(
             config.value("debridService", "")
@@ -1237,8 +1134,7 @@ int main(int, char**) {
 
     Page page = Page::Browse; bool dirty = false;
     std::set<size_t> selectedFiles;
-    std::future<Refresh> pending;
-    std::future<std::string> pendingLangegen; 
+    std::future<Refresh> pending; 
     std::future<DebridCheckResult> pendingDebridCheck;
     std::future<DebridAddResult> pendingDebridAdd;
     std::future<sgb::LiveSearchResult> pendingLiveSearch;
@@ -1365,14 +1261,6 @@ int main(int, char**) {
         }
 
 
-        if (
-            pendingLangegen.valid() &&
-            pendingLangegen.wait_for(
-                std::chrono::milliseconds(0)
-            ) == std::future_status::ready
-        ) {
-            status = pendingLangegen.get();
-        }
         if (pendingDebridCheck.valid() && pendingDebridCheck.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto result = pendingDebridCheck.get();
             for (auto& pair : result.rows) debridStatuses[pair.first] = std::move(pair.second);
@@ -1521,7 +1409,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 5)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 4)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -1647,40 +1535,12 @@ int main(int, char**) {
                         );
                     }
                 }
+
                 else if (settingsCursor == 3) {
                     providerCursor = 0;
                     page = Page::Providers;
                 }
-                else if (settingsCursor == 4) {
-                    if (pendingLangegen.valid()) {
-                        status =
-                            "Langegen catalog download already running";
-                    }
-                    else {
-                        
 
-                        if (langegenUrl.empty()) {
-                            status =
-                                "Langegen catalog URL not configured";
-                        }
-                        else {
-                            status =
-                                "Downloading Langegen catalog...";
-
-                            const std::string sourceUrl =
-                                langegenUrl;
-
-                            pendingLangegen = std::async(
-                                std::launch::async,
-                                [sourceUrl]() {
-                                    return downloadLangegenCatalog(
-                                        sourceUrl
-                                    );
-                                }
-                            );
-                        }
-                    }
-                }
                 else {
                     page = Page::Browse;
                 }
@@ -2290,53 +2150,10 @@ int main(int, char**) {
                 "Scrape Providers",
                 52,396,1100
             );
-            SDL_Rect langegenBox{
-                32,450,1216,65
-            };
 
-            rect(
-                renderer,
-                langegenBox,
-                SDL_Color{18,18,18,255}
-            );
-
-            if (settingsCursor == 4)
-                rect(
-                    renderer,
-                    langegenBox,
-                    green,
-                    true
-                );
-
-            label(
-                renderer,small,
-                "Download / Update Langegen Catalog",
-                52,471,760
-            );
-
-            {
-                std::ifstream catalogFile(
-                    root + "langegen.json",
-                    std::ios::binary
-                );
-
-                label(
-                    renderer,
-                    small,
-                    catalogFile.good()
-                        ? "Installed"
-                        : "Not downloaded",
-                    990,
-                    471,
-                    220,
-                    catalogFile.good()
-                        ? green
-                        : muted
-                );
-            }
 
             SDL_Rect backBox{
-                32,525,1216,65
+                32,450,1216,65
             };
 
             rect(
@@ -2345,7 +2162,7 @@ int main(int, char**) {
                 SDL_Color{18,18,18,255}
             );
 
-            if (settingsCursor == 5)
+            if (settingsCursor == 4)
                 rect(
                     renderer,
                     backBox,
@@ -2356,7 +2173,7 @@ int main(int, char**) {
             label(
                 renderer,small,
                 "Back",
-                52,546,1100
+                52,471,1100
             );
 
 
@@ -2364,20 +2181,20 @@ int main(int, char**) {
                 label(
                     renderer,big,
                     "PIN: " + allDebridPin->pin,
-                    32,605,500,green
+                    32,545,500,green
                 );
 
                 label(
                     renderer,small,
                     "Enter PIN at alldebrid.com/pin, then select Authorize again.",
-                    32,635,1216,white
+                    32,590,1216,white
                 );
             }
             else {
                 label(
                     renderer,small,
                     "Catalog and torrent indexes are cached separately on the SD card.",
-                    32,610,1216,muted
+                    32,560,1216,muted
                 );
             }
             int refreshPhase =
@@ -2622,7 +2439,6 @@ int main(int, char**) {
         SDL_RenderPresent(renderer);
     }
     stopping = true; if (pending.valid()) pending.wait();
-    if (pendingLangegen.valid()) pendingLangegen.wait();
     if (pendingLiveSearch.valid()) pendingLiveSearch.wait(); 
     if (pendingDebridCheck.valid()) pendingDebridCheck.wait();
     if (pendingDebridAdd.valid()) pendingDebridAdd.wait();

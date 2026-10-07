@@ -9,16 +9,10 @@
 
 namespace {
 
-struct TorznabPage {
-    std::vector<sgb::ProviderResult> results;
-    size_t rawItems = 0;
-};
-
-TorznabPage parseTorznab(
-    const std::string& xml,
-    std::unordered_set<std::string>& seen)
+std::vector<sgb::ProviderResult> parseTorznab(const std::string& xml)
 {
-    TorznabPage page;
+    std::vector<sgb::ProviderResult> results;
+    std::unordered_set<std::string> seen;
 
     static const std::regex itemRe(
         R"(<item\b[\s\S]*?</item>)",
@@ -26,7 +20,6 @@ TorznabPage parseTorznab(
 
     for (auto it = std::sregex_iterator(xml.begin(), xml.end(), itemRe);
          it != std::sregex_iterator(); ++it) {
-        ++page.rawItems;
         const std::string item = it->str();
 
         const std::string title = sgb_api::trim(
@@ -69,10 +62,10 @@ TorznabPage parseTorznab(
         result.title = title;
         result.magnet = magnet;
         result.infoHash = hash;
-        page.results.push_back(std::move(result));
+        results.push_back(std::move(result));
     }
 
-    return page;
+    return results;
 }
 
 } // namespace
@@ -83,45 +76,17 @@ public:
 
     std::vector<sgb::ProviderResult> search(const std::string& query) override
     {
-        std::vector<sgb::ProviderResult> results;
         const std::string clean = sgb_api::trim(query);
         if (clean.empty())
-            return results;
+            return {};
 
-        constexpr size_t pageSize = 100;
-        size_t offset = 0;
-        std::unordered_set<std::string> seen;
+        const std::string url =
+            "https://www.torlock.com/torznab/api?t=search&q=" +
+            sgb_api::urlEncode(clean) +
+            "&limit=100&offset=0";
 
-        while (true) {
-            const std::string url =
-                "https://www.torlock.com/torznab/api?t=search&q=" +
-                sgb_api::urlEncode(clean) +
-                "&limit=" + std::to_string(pageSize) +
-                "&offset=" + std::to_string(offset);
-
-            const std::string xml = sgb_api::httpGet(
-                url,
-                "application/rss+xml, application/xml, text/xml");
-
-            TorznabPage page = parseTorznab(xml, seen);
-
-            if (page.rawItems == 0)
-                break;
-
-            const size_t newResults = page.results.size();
-
-            results.insert(
-                results.end(),
-                std::make_move_iterator(page.results.begin()),
-                std::make_move_iterator(page.results.end()));
-
-            if (page.rawItems < pageSize || newResults == 0)
-                break;
-
-            offset += pageSize;
-        }
-
-        return results;
+        return parseTorznab(
+            sgb_api::httpGet(url, "application/rss+xml, application/xml, text/xml"));
     }
 };
 

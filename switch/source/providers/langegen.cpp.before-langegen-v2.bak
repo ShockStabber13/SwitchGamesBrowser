@@ -1,0 +1,191 @@
+#include "provider.hpp"
+#include "provider_api_utils.hpp"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace {
+using Json = nlohmann::json;
+
+const char* kCatalogPath =
+    "sdmc:/switch/SwitchGamesBrowser/langegen.json";
+
+std::string lowerAscii(std::string value)
+{
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+    return value;
+}
+
+std::string stringField(
+    const Json& item,
+    const char* first,
+    const char* second = nullptr)
+{
+    if (item.contains(first) && item[first].is_string())
+        return item[first].get<std::string>();
+
+    if (second && item.contains(second) && item[second].is_string())
+        return item[second].get<std::string>();
+
+    return "";
+}
+
+std::string readCatalog()
+{
+    std::ifstream file(
+        kCatalogPath,
+        std::ios::binary | std::ios::ate);
+
+    if (!file)
+        throw std::runtime_error(
+            "Langegen catalog not downloaded");
+
+    const auto size = file.tellg();
+    if (size <= 0)
+        throw std::runtime_error(
+            "Langegen catalog is empty");
+
+    std::string bytes(
+        static_cast<size_t>(size),
+        '\0');
+
+    file.seekg(0);
+    file.read(
+        bytes.data(),
+        static_cast<std::streamsize>(bytes.size()));
+
+    if (!file)
+        throw std::runtime_error(
+            "Could not read Langegen catalog");
+
+    return bytes;
+}
+
+} // namespace
+
+class LangegenProvider final : public sgb::Provider {
+public:
+    std::string id() const override {
+        return "langegen";
+    }
+
+    std::vector<sgb::ProviderResult>
+    search(const std::string& query) override
+    {
+        std::vector<sgb::ProviderResult> results;
+
+        const std::string needle =
+            lowerAscii(sgb_api::trim(query));
+
+        if (needle.empty())
+            return results;
+
+        const Json root = Json::parse(
+            readCatalog(),
+            nullptr,
+            false);
+
+        if (root.is_discarded())
+            throw std::runtime_error(
+                "Invalid Langegen catalog JSON");
+
+        const Json* items = nullptr;
+
+        if (root.is_array()) {
+            items = &root;
+        }
+        else if (root.is_object()) {
+            if (
+                root.contains("data") &&
+                root["data"].is_array()
+            ) {
+                items = &root["data"];
+            }
+            else if (
+                root.contains("games") &&
+                root["games"].is_array()
+            ) {
+                items = &root["games"];
+            }
+        }
+
+        if (!items)
+            throw std::runtime_error(
+                "Unsupported Langegen catalog format");
+
+        std::unordered_set<std::string> seen;
+
+        for (const auto& item : *items) {
+            if (!item.is_object())
+                continue;
+
+            const std::string title =
+                sgb_api::trim(
+                    stringField(item, "title", "name"));
+
+            if (
+                title.empty() ||
+                lowerAscii(title).find(needle) ==
+                    std::string::npos
+            ) {
+                continue;
+            }
+
+            const std::string magnet =
+                sgb_api::trim(
+                    stringField(item, "magnet"));
+
+            if (magnet.empty())
+                continue;
+
+            std::string hash =
+                sgb_api::lowerAscii(
+                    sgb_api::trim(
+                        stringField(
+                            item,
+                            "infoHash",
+                            "infohash")));
+
+            if (hash.empty())
+                hash =
+                    sgb_api::hashFromMagnet(magnet);
+
+            // The current debrid pipeline expects normal
+            // 40-character BitTorrent v1 info hashes.
+            if (
+                hash.size() != 40 ||
+                !sgb_api::validInfoHash(hash)
+            ) {
+                continue;
+            }
+
+            if (!seen.insert(hash).second)
+                continue;
+
+            sgb::ProviderResult result;
+            result.title = title;
+            result.magnet = magnet;
+            result.infoHash = hash;
+
+            results.push_back(
+                std::move(result));
+        }
+
+        return results;
+    }
+};
+
+SGB_REGISTER_PROVIDER(LangegenProvider);
