@@ -1,4 +1,4 @@
-#include "provider.hpp"
+﻿#include "provider.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -95,18 +95,7 @@ ProviderRegistrar::ProviderRegistrar(
 
 const std::vector<ProviderEntry>&
 providerRegistry() {
-    auto& registry =
-        mutableRegistry();
-
-    std::sort(
-        registry.begin(),
-        registry.end(),
-        [](const ProviderEntry& a, const ProviderEntry& b) {
-            return a.id < b.id;
-        }
-    );
-
-    return registry;
+    return mutableRegistry();
 }
 
 } // namespace sgb

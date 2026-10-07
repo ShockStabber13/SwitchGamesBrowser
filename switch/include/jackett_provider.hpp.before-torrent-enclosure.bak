@@ -2,7 +2,6 @@
 
 #include "provider.hpp"
 #include "provider_api_utils.hpp"
-#include "torrent_metainfo.hpp"
 
 #include <fstream>
 #include <regex>
@@ -64,65 +63,6 @@ inline Config loadConfig()
     return config;
 }
 
-inline std::string enclosureUrl(const std::string& item)
-{
-    static const std::regex re(
-        R"(<enclosure\b[^>]*\burl=["']([^"']+)["'][^>]*>)",
-        std::regex::icase);
-
-    std::smatch match;
-    if (!std::regex_search(item, match, re))
-        return "";
-
-    return sgb_api::trim(
-        sgb_api::xmlDecode(match[1].str()));
-}
-
-inline std::string resolveUrl(
-    const Config& config,
-    std::string value)
-{
-    value = sgb_api::trim(value);
-
-    if (
-        value.rfind("http://", 0) == 0 ||
-        value.rfind("https://", 0) == 0
-    ) {
-        return value;
-    }
-
-    if (!value.empty() && value.front() == '/')
-        return config.url + value;
-
-    return "";
-}
-
-inline std::string infoHashFromTorrentUrl(
-    const std::string& torrentUrl)
-{
-    if (torrentUrl.empty())
-        return "";
-
-    try {
-        const std::string torrent =
-            sgb_api::httpGet(
-                torrentUrl,
-                "application/x-bittorrent, application/octet-stream, */*");
-
-        // Torrent metainfo is normally tiny. Refuse unexpectedly large
-        // responses so a bad indexer cannot consume excessive Switch RAM.
-        constexpr size_t maxTorrentBytes = 8 * 1024 * 1024;
-        if (torrent.empty() || torrent.size() > maxTorrentBytes)
-            return "";
-
-        return sgb_torrent::infoHashV1(torrent);
-    }
-    catch (...) {
-        // One broken download URL should not fail the entire indexer search.
-        return "";
-    }
-}
-
 inline std::vector<sgb::ProviderResult> search(
     const std::string& indexerId,
     const std::string& query)
@@ -171,10 +111,6 @@ inline std::vector<sgb::ProviderResult> search(
             sgb_api::trim(
                 sgb_api::tagValue(item, "title"));
 
-        const std::string link =
-            sgb_api::trim(
-                sgb_api::tagValue(item, "link"));
-
         std::string magnet =
             sgb_api::trim(
                 sgb_api::torznabAttr(
@@ -189,11 +125,15 @@ inline std::vector<sgb::ProviderResult> search(
                         "magnet"));
         }
 
-        if (
-            magnet.empty() &&
-            link.rfind("magnet:", 0) == 0
-        ) {
-            magnet = link;
+        if (magnet.empty()) {
+            const std::string link =
+                sgb_api::trim(
+                    sgb_api::tagValue(
+                        item,
+                        "link"));
+
+            if (link.rfind("magnet:", 0) == 0)
+                magnet = link;
         }
 
         if (magnet.empty()) {
@@ -217,40 +157,12 @@ inline std::vector<sgb::ProviderResult> search(
         if (hash.empty() && !magnet.empty())
             hash = sgb_api::hashFromMagnet(magnet);
 
-        // Some Jackett indexers, especially private trackers, return only a
-        // .torrent enclosure instead of an info hash or magnet. Resolve that
-        // generically by downloading the metainfo through Jackett and hashing
-        // the raw bencoded "info" dictionary (BitTorrent v1 info hash).
-        if (!sgb_api::validInfoHash(hash)) {
-            std::string torrentUrl =
-                resolveUrl(
-                    config,
-                    enclosureUrl(item));
-
-            // Standard Torznab commonly uses <link> as the download URL when
-            // there is no enclosure. Only use it when it is HTTP(S), never a
-            // details page represented by another scheme.
-            if (
-                torrentUrl.empty() &&
-                (link.rfind("http://", 0) == 0 ||
-                 link.rfind("https://", 0) == 0)
-            ) {
-                torrentUrl = link;
-            }
-
-            hash =
-                infoHashFromTorrentUrl(
-                    torrentUrl);
-        }
-
         if (
             title.empty() ||
             !sgb_api::validInfoHash(hash)
         ) {
             continue;
         }
-
-        hash = sgb_api::lowerAscii(hash);
 
         if (!seen.insert(hash).second)
             continue;

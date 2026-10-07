@@ -1999,21 +1999,6 @@ int main(int, char**) {
                     ++providerCursor;
                 }
 
-                if (keys & HidNpadButton_L) {
-                    providerCursor =
-                        providerCursor >= 8
-                            ? providerCursor - 8
-                            : 0;
-                }
-
-                if (keys & HidNpadButton_R) {
-                    providerCursor =
-                        std::min(
-                            providerCursor + 8,
-                            providers.size() - 1
-                        );
-                }
-
                 if (keys & HidNpadButton_A) {
                     const auto& id =
                         providers[providerCursor].id;
@@ -2359,28 +2344,15 @@ int main(int, char**) {
             const auto& providers =
                 sgb::providerRegistry();
 
-            const std::string providerHeader =
-                "SCRAPE PROVIDERS (" +
-                std::to_string(providers.size()) +
-                " total)";
-
-            const std::string providerControls =
-                providers.empty()
-                    ? "0 / 0  |  A Toggle  |  L/R Page  |  X All  |  Y None  |  B Back"
-                    : std::to_string(providerCursor + 1) +
-                        " / " +
-                        std::to_string(providers.size()) +
-                        "  |  A Toggle  |  L/R Page  |  X All  |  Y None  |  B Back";
-
             label(
                 renderer,big,
-                providerHeader,
+                "SCRAPE PROVIDERS",
                 32,70,1200,green
             );
 
             label(
                 renderer,small,
-                providerControls,
+                "A Toggle  |  X Enable All  |  Y Disable All  |  B Back",
                 32,112,1200,muted
             );
 
