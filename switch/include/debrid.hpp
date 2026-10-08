@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "json.hpp"
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
@@ -162,6 +163,9 @@ TorBoxDeviceCheck checkTorBoxDeviceAuth(const TorBoxDeviceAuth& auth);
 
 AllDebridPinAuth beginAllDebridPinAuth();
 AllDebridPinCheck checkAllDebridPinAuth(const AllDebridPinAuth& auth);
+
+void setDebridCancelFlag(
+    const std::atomic<bool>* flag);
 
 std::unique_ptr<DebridBackend> createDebridBackend(const DebridConfig& config);
 

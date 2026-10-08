@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -59,7 +60,9 @@ LiveSearchResult runLiveSearch(
     const std::string& query,
     const std::string& configPath,
     const DebridConfig& debridConfig,
-    LiveSearchProgress& progress
+    LiveSearchProgress& progress,
+    const std::shared_ptr<
+        std::atomic<bool>>& cancelRequested
 );
 
 } // namespace sgb

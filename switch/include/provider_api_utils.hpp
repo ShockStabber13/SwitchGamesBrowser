@@ -5,12 +5,40 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <regex>
 #include <stdexcept>
 #include <string>
 
 namespace sgb_api {
+
+inline const std::atomic<bool>*& httpCancelFlag()
+{
+    static thread_local const std::atomic<bool>* flag = nullptr;
+    return flag;
+}
+
+inline void setHttpCancelFlag(
+    const std::atomic<bool>* flag)
+{
+    httpCancelFlag() = flag;
+}
+
+inline int httpProgressCallback(
+    void*,
+    curl_off_t,
+    curl_off_t,
+    curl_off_t,
+    curl_off_t)
+{
+    const auto* flag = httpCancelFlag();
+
+    return (
+        flag &&
+        flag->load()
+    ) ? 1 : 0;
+}
 
 inline size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
@@ -42,6 +70,8 @@ inline std::string httpGet(
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, httpProgressCallback);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
@@ -77,8 +107,21 @@ inline std::string httpGet(
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
-    if (code != CURLE_OK)
-        throw std::runtime_error(curl_easy_strerror(code));
+    if (code != CURLE_OK) {
+        const auto* flag = httpCancelFlag();
+
+        if (
+            code == CURLE_ABORTED_BY_CALLBACK &&
+            flag &&
+            flag->load()
+        ) {
+            throw std::runtime_error(
+                "Search cancelled");
+        }
+
+        throw std::runtime_error(
+            curl_easy_strerror(code));
+    }
 
     if (httpStatus < 200 || httpStatus >= 300)
         throw std::runtime_error("HTTP " + std::to_string(httpStatus));
