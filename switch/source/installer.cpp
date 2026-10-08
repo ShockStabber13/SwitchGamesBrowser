@@ -1180,12 +1180,27 @@ public:
 
     void finish()
     {
+        // A normal NCA is not required to be 0x4000 bytes long.
+        // Sphaira only needs the encrypted NCA header itself (0xC00)
+        // to determine the real NCA size. We normally buffer 0x4000
+        // so we can detect the NCZ section header at offset 0x4000,
+        // but a small plain NCA may legitimately end before that.
         if (
-            header_.size() !=
+            header_.size() <
                 NcaHeaderSize
         ) {
-            throw std::runtime_error(
-                "NCA header incomplete");
+            if (
+                header_.size() <
+                    sizeof(NcaHeader)
+            ) {
+                throw std::runtime_error(
+                    "NCA header incomplete");
+            }
+
+            // End-of-entry before 0x4000 means this cannot contain
+            // an NCZ section header. Treat the bytes we have as a
+            // complete plain NCA and validate its true size below.
+            flushHeader();
         }
 
         if (ncz_) {
