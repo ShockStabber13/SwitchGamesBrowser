@@ -1278,6 +1278,17 @@ int main(int, char**) {
     std::future<DebridManagerResult> pendingDebridManager;
     sgb::LiveSearchProgress liveSearchProgress;
 
+    std::shared_ptr<std::atomic<bool>>
+        liveSearchCancel;
+
+    std::optional<size_t>
+        queuedLiveSearchGameIndex;
+
+    std::map<
+        std::string,
+        sgb::DebridAccountTorrent
+    > debridAccountByRemoteId;
+
     std::vector<sgb::DebridAccountTorrent>
         debridManagerRows;
 
@@ -1514,43 +1525,92 @@ int main(int, char**) {
 
         page = Page::ScrapeChoice;
     };
+    auto launchLiveSearch = [&](size_t gameIndex) {
+        liveSearchGameIndex = gameIndex;
+        torrentCursor = 0;
+        selectedFiles.clear();
+        torrentTextFilter.clear();
+
+        games[gameIndex].releases.clear();
+
+        page = Page::SearchProgress;
+
+        const std::string query =
+            games[gameIndex].title;
+
+        const std::string configPath =
+            root + "config.json";
+
+        auto configCopy =
+            debridConfig;
+
+        liveSearchCancel =
+            std::make_shared<
+                std::atomic<bool>>(false);
+
+        auto cancelCopy =
+            liveSearchCancel;
+
+        pendingLiveSearch =
+            std::async(
+                std::launch::async,
+                [
+                    query,
+                    configPath,
+                    configCopy,
+                    cancelCopy,
+                    &liveSearchProgress
+                ]() {
+                    return sgb::runLiveSearch(
+                        query,
+                        configPath,
+                        configCopy,
+                        liveSearchProgress,
+                        cancelCopy
+                    );
+                }
+            );
+    };
+
+    auto cancelLiveSearch = [&]() {
+        if (
+            pendingLiveSearch.valid() &&
+            liveSearchCancel
+        ) {
+            liveSearchCancel->store(true);
+            status =
+                "Stopping live search...";
+        }
+    };
+
     auto startLiveSearch = [&](size_t gameIndex) {
         if (gameIndex >= games.size())
             return;
 
         if (
-            debridConfig.service == sgb::DebridService::None ||
+            debridConfig.service ==
+                sgb::DebridService::None ||
             debridConfig.apiKey.empty()
         ) {
-            status = "Authorize TorBox or AllDebrid first";
+            status =
+                "Authorize TorBox or AllDebrid first";
             return;
         }
 
         if (pendingLiveSearch.valid()) {
-            status = "Live search already running";
+            queuedLiveSearchGameIndex =
+                gameIndex;
+
+            cancelLiveSearch();
+
+            page =
+                Page::SearchProgress;
+
             return;
         }
 
-        liveSearchGameIndex = gameIndex;
-        torrentCursor = 0;
-        selectedFiles.clear();
-        page = Page::SearchProgress;
-
-        const std::string query = games[gameIndex].title;
-        const std::string configPath = root + "config.json";
-        auto configCopy = debridConfig;
-
-        pendingLiveSearch = std::async(
-            std::launch::async,
-            [query, configPath, configCopy, &liveSearchProgress]() {
-                return sgb::runLiveSearch(
-                    query,
-                    configPath,
-                    configCopy,
-                    liveSearchProgress
-                );
-            }
-        );
+        launchLiveSearch(
+            gameIndex);
     };
         
 
@@ -1593,10 +1653,29 @@ int main(int, char**) {
             saveDebridStatuses();
             status = result.message;
         }
-        if (pendingDebridAdd.valid() && pendingDebridAdd.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-            auto result = pendingDebridAdd.get();
-            if (!result.hash.empty()) { debridStatuses[result.hash] = std::move(result.state); saveDebridStatuses(); }
-            status = result.message;
+        if (
+            pendingDebridAdd.valid() &&
+            pendingDebridAdd.wait_for(
+                std::chrono::milliseconds(0)) ==
+                std::future_status::ready
+        ) {
+            auto result =
+                pendingDebridAdd.get();
+
+            if (!result.hash.empty()) {
+                debridStatuses[
+                    result.hash] =
+                        std::move(
+                            result.state);
+
+                saveDebridStatuses();
+
+                nextDebridManagerRefresh =
+                    std::chrono::steady_clock::now();
+            }
+
+            status =
+                result.message;
         }
         if (
             pendingDebridManager.valid() &&
@@ -1610,6 +1689,19 @@ int main(int, char**) {
             debridManagerRows =
                 std::move(result.rows);
 
+            debridAccountByRemoteId.clear();
+
+            for (
+                const auto& torrent :
+                    debridManagerRows
+            ) {
+                if (!torrent.remoteId.empty()) {
+                    debridAccountByRemoteId[
+                        torrent.remoteId] =
+                            torrent;
+                }
+            }
+
             if (
                 debridManagerCursor >=
                     debridManagerRows.size()
@@ -1620,25 +1712,81 @@ int main(int, char**) {
                         : debridManagerRows.size() - 1;
             }
 
-            status =
-                result.message;
+            if (
+                page ==
+                    Page::DebridManager
+            ) {
+                status =
+                    result.message;
+            }
         }
 
         if (
-            page == Page::DebridManager &&
+            (
+                page == Page::DebridManager ||
+                page == Page::Torrents
+            ) &&
             !pendingDebridManager.valid() &&
             std::chrono::steady_clock::now() >=
                 nextDebridManagerRefresh
         ) {
-            startDebridManagerRefresh();
+            bool shouldRefresh =
+                page == Page::DebridManager;
+
+            if (
+                !shouldRefresh &&
+                page == Page::Torrents &&
+                !rows.empty()
+            ) {
+                const auto& game =
+                    games[rows[cursor]];
+
+                for (const auto& release :
+                     game.releases) {
+                    auto state =
+                        debridStatuses.find(
+                            release.infoHash);
+
+                    if (
+                        state ==
+                            debridStatuses.end() ||
+                        !state->second.downloaded ||
+                        state->second.remoteId.empty()
+                    ) {
+                        continue;
+                    }
+
+                    auto account =
+                        debridAccountByRemoteId.find(
+                            state->second.remoteId);
+
+                    if (
+                        account ==
+                            debridAccountByRemoteId.end() ||
+                        !account->second.complete
+                    ) {
+                        shouldRefresh = true;
+                        break;
+                    }
+                }
+            }
+
+            if (shouldRefresh)
+                startDebridManagerRefresh();
         }
-        // Stream validated live-search results into the torrent page while
-        // provider/debrid workers continue in the background.
+
+        // Stream each debrid-checked result into the list immediately.
         if (
             pendingLiveSearch.valid() &&
-            liveSearchGameIndex < games.size()
+            liveSearchGameIndex < games.size() &&
+            (
+                !liveSearchCancel ||
+                !liveSearchCancel->load()
+            )
         ) {
-            std::vector<sgb::Release> liveRows;
+            std::vector<sgb::Release>
+                liveRows;
+
             std::map<
                 std::string,
                 sgb::DebridTorrentStatus
@@ -1658,9 +1806,14 @@ int main(int, char**) {
                 liveGame.releases =
                     std::move(liveRows);
 
-                for (auto& pair : liveStatuses) {
-                    debridStatuses[pair.first] =
-                        std::move(pair.second);
+                for (
+                    auto& pair :
+                        liveStatuses
+                ) {
+                    debridStatuses[
+                        pair.first] =
+                            std::move(
+                                pair.second);
                 }
 
                 if (
@@ -1673,180 +1826,109 @@ int main(int, char**) {
                             : liveGame.releases.size() - 1;
                 }
 
-                // First usable torrent: show the normal torrent screen.
-                // A/X/Up/Down work immediately while more rows append.
-                if (page == Page::ScrapeChoice) {
-            const std::string gameTitle =
-                scrapeChoiceGameIndex < games.size()
-                    ? games[scrapeChoiceGameIndex].title
-                    : "";
+                if (
+                    page ==
+                        Page::SearchProgress
+                ) {
+                    page =
+                        Page::Torrents;
 
-            label(
-                renderer,
-                big,
-                "SCRAPE OPTIONS",
-                32,
-                72,
-                1200,
-                green);
-
-            label(
-                renderer,
-                big,
-                gameTitle,
-                32,
-                118,
-                1200,
-                white);
-
-            SDL_Rect cachedRow{
-                32,
-                205,
-                1216,
-                94
-            };
-
-            SDL_Rect newRow{
-                32,
-                320,
-                1216,
-                94
-            };
-
-            rect(
-                renderer,
-                cachedRow,
-                scrapeChoiceCursor == 0
-                    ? SDL_Color{28,28,28,255}
-                    : SDL_Color{14,14,14,255});
-
-            rect(
-                renderer,
-                newRow,
-                scrapeChoiceCursor == 1
-                    ? SDL_Color{28,28,28,255}
-                    : SDL_Color{14,14,14,255});
-
-            label(
-                renderer,
-                big,
-                "Cached Scrape",
-                54,
-                222,
-                1140,
-                scrapeChoiceCursor == 0
-                    ? green
-                    : white);
-
-            if (scrapeChoiceHasCache) {
-                label(
-                    renderer,
-                    small,
-                    std::to_string(
-                        scrapeChoiceReleaseCount) +
-                    " torrent(s)  |  " +
-                    sgb::scrapeCacheAgeText(
-                        scrapeChoiceSavedAt) +
-                    "  |  availability cached",
-                    54,
-                    266,
-                    1140,
-                    muted);
-            }
-            else {
-                label(
-                    renderer,
-                    small,
-                    "No cache for the current debrid service",
-                    54,
-                    266,
-                    1140,
-                    muted);
-            }
-
-            label(
-                renderer,
-                big,
-                "New Scrape",
-                54,
-                337,
-                1140,
-                scrapeChoiceCursor == 1
-                    ? green
-                    : white);
-
-            label(
-                renderer,
-                small,
-                "Search enabled providers and refresh cached availability",
-                54,
-                381,
-                1140,
-                muted);
-
-            label(
-                renderer,
-                small,
-                "A Select    B Back",
-                32,
-                650,
-                1200,
-                muted);
-        } else if (page == Page::SearchProgress) {
-                    page = Page::Torrents;
                     status =
-                        "Live search still running; "
-                        "more torrents may appear";
+                        "Debrid-checked results "
+                        "appear as they arrive";
                 }
             }
         }
+
         if (
             pendingLiveSearch.valid() &&
-            pendingLiveSearch.wait_for(std::chrono::milliseconds(0)) ==
+            pendingLiveSearch.wait_for(
+                std::chrono::milliseconds(0)) ==
                 std::future_status::ready
         ) {
-            auto result = pendingLiveSearch.get();
+            const bool wasCancelled =
+                liveSearchCancel &&
+                liveSearchCancel->load();
 
-            if (liveSearchGameIndex < games.size()) {
-                const bool scrapeSucceeded =
-                    result.success;
+            auto result =
+                pendingLiveSearch.get();
 
-                const bool scrapeCached =
-                    !scrapeSucceeded ||
-                    sgb::saveScrapeCache(
+            liveSearchCancel.reset();
+
+            if (
+                queuedLiveSearchGameIndex
+                    .has_value()
+            ) {
+                const size_t nextGame =
+                    *queuedLiveSearchGameIndex;
+
+                queuedLiveSearchGameIndex.reset();
+
+                status =
+                    "Starting new live search...";
+
+                launchLiveSearch(
+                    nextGame);
+            }
+            else if (wasCancelled) {
+                status =
+                    "Live search stopped";
+            }
+            else if (
+                liveSearchGameIndex <
+                    games.size()
+            ) {
+                if (result.success) {
+                    (void)sgb::saveScrapeCache(
                         root,
-                        games[liveSearchGameIndex].title,
+                        games[
+                            liveSearchGameIndex
+                        ].title,
                         debridConfig.service,
                         result.releases,
                         result.statuses);
+                }
 
-                games[liveSearchGameIndex].releases =
-                    std::move(result.releases);
+                games[
+                    liveSearchGameIndex
+                ].releases =
+                    std::move(
+                        result.releases);
 
-                for (auto& pair : result.statuses) {
-                    debridStatuses[pair.first] =
-                        std::move(pair.second);
+                for (
+                    auto& pair :
+                        result.statuses
+                ) {
+                    debridStatuses[
+                        pair.first] =
+                            std::move(
+                                pair.second);
                 }
 
                 saveDebridStatuses();
+
                 torrentCursor = 0;
                 selectedFiles.clear();
                 status = result.message;
 
                 if (
-                    games[liveSearchGameIndex]
-                        .releases.empty()
+                    !games[
+                        liveSearchGameIndex
+                    ].releases.empty()
                 ) {
-                    page =
-                        Page::SearchProgress;
-                }
-                else {
                     page =
                         Page::Torrents;
                 }
             }
         }
-        if (page == Page::ScrapeChoice) {
+
+        if (page == Page::SearchProgress) {
+            if (keys & HidNpadButton_B) {
+                cancelLiveSearch();
+                page = Page::Detail;
+            }
+
+        } else if (page == Page::ScrapeChoice) {
             if (keys & HidNpadButton_B) {
                 page = Page::Detail;
             }
@@ -2484,8 +2566,17 @@ int main(int, char**) {
                     openScrapeChoice(rows[cursor]);
                 }
             } else if (page == Page::Torrents) {
-                if (keys & HidNpadButton_B)
+                if (keys & HidNpadButton_B) {
+                    if (
+                        pendingLiveSearch.valid() &&
+                        liveSearchGameIndex ==
+                            rows[cursor]
+                    ) {
+                        cancelLiveSearch();
+                    }
+
                     page = Page::Detail;
+                }
 
                 auto visible =
                     torrentRowsFor(g);
@@ -2695,9 +2786,6 @@ int main(int, char**) {
                 liveSearchProgress.debridChecked.load();
             const size_t debridTotal =
                 liveSearchProgress.debridTotal.load();
-            const size_t valid =
-                liveSearchProgress.validFound.load();
-
             const std::string stage =
                 liveSearchProgress.stageText();
             const std::string provider =
@@ -2727,17 +2815,11 @@ int main(int, char**) {
                 32,315,1200,white
             );
 
-            label(
-                renderer,small,
-                "Torrent results: " + std::to_string(valid),
-                32,360,1200,green
-            );
-
             if (!provider.empty()) {
                 label(
                     renderer,small,
                     "Latest provider: " + provider,
-                    32,405,1200,muted
+                    32,360,1200,muted
                 );
             }
 
@@ -2872,7 +2954,7 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "Validated results become clickable while the search continues.",
+                "Each result appears as soon as its debrid check finishes.",
                 32,570,1200,muted
             );
         } else if (page == Page::Providers) {
@@ -3652,7 +3734,7 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "TORRENTS  |  A Add to Debrid  |  X View Files  |  - Filter  |  Y Refresh Status  |  B Back",
+                "SEARCH RESULTS  |  A Download / Add to Debrid  |  X View Files  |  - Filter  |  Y Refresh  |  B Back",
                 32,122,1200,muted
             );
 
@@ -3736,7 +3818,7 @@ int main(int, char**) {
                             rel.infoHash);
 
                     std::string state =
-                        "Cached: Unknown  Downloaded: Unknown";
+                        "Debrid checked";
 
                     SDL_Color stateColour =
                         muted;
@@ -3745,19 +3827,51 @@ int main(int, char**) {
                         st !=
                         debridStatuses.end()
                     ) {
-                        state =
-                            std::string(
-                                "Cached: ") +
-                            (st->second.cached
-                                ? "True"
-                                : "False") +
-                            "  Downloaded: " +
-                            (st->second.downloaded
-                                ? "True"
-                                : "False");
+                        if (
+                            st->second.downloaded &&
+                            !st->second.remoteId.empty()
+                        ) {
+                            auto account =
+                                debridAccountByRemoteId.find(
+                                    st->second.remoteId);
 
-                        if (st->second.cached)
-                            stateColour = green;
+                            if (
+                                account !=
+                                    debridAccountByRemoteId.end()
+                            ) {
+                                if (
+                                    account->second.complete
+                                ) {
+                                    state =
+                                        "Download completed";
+
+                                    stateColour =
+                                        green;
+                                }
+                                else {
+                                    state =
+                                        "Downloading: " +
+                                        std::to_string(
+                                            account->second.progress) +
+                                        "%";
+                                }
+                            }
+                            else {
+                                state =
+                                    "Added to Debrid";
+                            }
+                        }
+                        else if (st->second.cached) {
+                            state =
+                                "Debrid checked: Cached";
+
+                            stateColour =
+                                green;
+                        }
+                        else {
+                            state =
+                                "Debrid checked: Uncached";
+                        }
                     }
 
                     label(
@@ -3952,7 +4066,16 @@ int main(int, char**) {
         label(renderer,small,status,32,675,1216,green);
         SDL_RenderPresent(renderer);
     }
-    stopping = true; if (pending.valid()) pending.wait();
+    stopping = true;
+
+    if (
+        liveSearchCancel &&
+        pendingLiveSearch.valid()
+    ) {
+        liveSearchCancel->store(true);
+    }
+
+    if (pending.valid()) pending.wait();
     if (pendingLangegen.valid()) pendingLangegen.wait();
     if (pendingLiveSearch.valid()) pendingLiveSearch.wait(); 
     if (pendingDebridCheck.valid()) pendingDebridCheck.wait();
