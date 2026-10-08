@@ -358,7 +358,9 @@ LiveSearchResult runLiveSearch(
     const std::string& query,
     const std::string& configPath,
     const DebridConfig& debridConfig,
-    LiveSearchProgress& progress
+    LiveSearchProgress& progress,
+    const std::shared_ptr<
+        std::atomic<bool>>& cancelRequested
 ) {
     LiveSearchResult output;
     progress.reset();
@@ -409,7 +411,17 @@ LiveSearchResult runLiveSearch(
         std::set<std::string> seen;
 
         auto worker = [&]() {
+            sgb_api::setHttpCancelFlag(
+                cancelRequested.get());
+
             while (true) {
+                if (
+                    cancelRequested &&
+                    cancelRequested->load()
+                ) {
+                    break;
+                }
+
                 const size_t jobIndex =
                     nextJob.fetch_add(1);
 
@@ -434,6 +446,13 @@ LiveSearchResult runLiveSearch(
                     if (provider) {
                         auto found =
                             provider->search(query);
+
+                        if (
+                            cancelRequested &&
+                            cancelRequested->load()
+                        ) {
+                            break;
+                        }
 
                         providerRows = found.size();
 
@@ -475,6 +494,12 @@ LiveSearchResult runLiveSearch(
                     providerRows,
                     providerError);
 
+                if (
+                    cancelRequested &&
+                    cancelRequested->load()
+                ) {
+                    break;
+                }
 
                 progress.debridTotal.fetch_add(
                     fresh.size());
@@ -532,6 +557,9 @@ LiveSearchResult runLiveSearch(
                         // =================================================
 
                         auto debridWorker = [&]() {
+                            setDebridCancelFlag(
+                                cancelRequested.get());
+
                             while (true) {
 
                                 std::vector<size_t>
@@ -541,14 +569,25 @@ LiveSearchResult runLiveSearch(
                                     std::unique_lock<std::mutex>
                                         lock(readyMutex);
 
-                                    readyCv.wait(
+                                    readyCv.wait_for(
                                         lock,
+                                        std::chrono::milliseconds(100),
                                         [&]() {
                                             return
-                                                readyQueue.size() >=
-                                                    debridBatchSize ||
-                                                resolvingDone;
+                                                !readyQueue.empty() ||
+                                                resolvingDone ||
+                                                (
+                                                    cancelRequested &&
+                                                    cancelRequested->load()
+                                                );
                                         });
+
+                                    if (
+                                        cancelRequested &&
+                                        cancelRequested->load()
+                                    ) {
+                                        break;
+                                    }
 
                                     if (
                                         readyQueue.empty() &&
@@ -557,19 +596,10 @@ LiveSearchResult runLiveSearch(
                                         break;
                                     }
 
-                                    size_t take = 0;
-
-                                    if (
-                                        readyQueue.size() >=
-                                        debridBatchSize
-                                    ) {
-                                        take =
-                                            debridBatchSize;
-                                    }
-                                    else if (resolvingDone) {
-                                        take =
-                                            readyQueue.size();
-                                    }
+                                    const size_t take =
+                                        std::min(
+                                            debridBatchSize,
+                                            readyQueue.size());
 
                                     if (take == 0)
                                         continue;
@@ -622,11 +652,25 @@ LiveSearchResult runLiveSearch(
                                             batch);
                                 }
                                 catch (...) {
+                                    if (
+                                        cancelRequested &&
+                                        cancelRequested->load()
+                                    ) {
+                                        break;
+                                    }
+
                                     progress.debridChecked
                                         .fetch_add(
                                             indexes.size());
 
                                     continue;
+                                }
+
+                                if (
+                                    cancelRequested &&
+                                    cancelRequested->load()
+                                ) {
+                                    break;
                                 }
 
 
@@ -728,6 +772,13 @@ LiveSearchResult runLiveSearch(
                             ++i
                         ) {
                             if (
+                                cancelRequested &&
+                                cancelRequested->load()
+                            ) {
+                                break;
+                            }
+
+                            if (
                                 resolveExistingHashOrMagnet(
                                     fresh[i].provider)
                             ) {
@@ -775,7 +826,16 @@ LiveSearchResult runLiveSearch(
 
 
                         auto torrentWorker = [&]() {
+                            sgb_api::setHttpCancelFlag(
+                                cancelRequested.get());
+
                             while (true) {
+                                if (
+                                    cancelRequested &&
+                                    cancelRequested->load()
+                                ) {
+                                    break;
+                                }
 
                                 const size_t position =
                                     nextTorrent.fetch_add(1);
@@ -887,6 +947,13 @@ LiveSearchResult runLiveSearch(
                                 fresh.size());
                     }
                 }
+                if (
+                    cancelRequested &&
+                    cancelRequested->load()
+                ) {
+                    break;
+                }
+
                 progress.providersDone.fetch_add(1);
             }
         };
@@ -909,22 +976,52 @@ LiveSearchResult runLiveSearch(
             output.releases,
             output.statuses);
 
-        output.message =
-            "Search complete: " +
-            std::to_string(
-                output.releases.size()) +
-            " valid Switch torrent(s)";
+        if (
+            cancelRequested &&
+            cancelRequested->load()
+        ) {
+            output.message =
+                "Search cancelled";
 
-        output.success = true;
-        progress.setText(
-            "Complete",
-            "");
+            output.success = false;
+
+            progress.setText(
+                "Cancelled",
+                "");
+        }
+        else {
+            output.message =
+                "Search complete: " +
+                std::to_string(
+                    output.releases.size()) +
+                " torrent(s)";
+
+            output.success = true;
+
+            progress.setText(
+                "Complete",
+                "");
+        }
     }
     catch (const std::exception& e) {
-        output.message = e.what();
-        progress.setText(
-            "Error",
-            "");
+        if (
+            cancelRequested &&
+            cancelRequested->load()
+        ) {
+            output.message =
+                "Search cancelled";
+
+            progress.setText(
+                "Cancelled",
+                "");
+        }
+        else {
+            output.message = e.what();
+
+            progress.setText(
+                "Error",
+                "");
+        }
     }
 
     progress.running.store(false);
