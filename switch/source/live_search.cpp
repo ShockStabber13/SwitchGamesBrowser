@@ -29,29 +29,6 @@ std::string lowerAscii(std::string value) {
     return value;
 }
 
-bool hasSwitchExtension(const std::vector<DebridFile>& files) {
-    static const char* extensions[] = {
-        ".nsp", ".nsz", ".xci", ".xcz"
-    };
-
-    for (const auto& file : files) {
-        std::string name = lowerAscii(file.name);
-
-        for (const char* ext : extensions) {
-            const size_t n = std::char_traits<char>::length(ext);
-
-            if (
-                name.size() >= n &&
-                name.compare(name.size() - n, n, ext) == 0
-            ) {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
 std::string hashFromMagnet(const std::string& magnet) {
     const std::string needle = "xt=urn:btih:";
     const std::string lowered = lowerAscii(magnet);
@@ -668,8 +645,7 @@ LiveSearchResult runLiveSearch(
 
                                     if (
                                         state ==
-                                            checked.end() ||
-                                        !state->second.cached
+                                            checked.end()
                                     ) {
                                         continue;
                                     }
