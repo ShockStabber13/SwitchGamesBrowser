@@ -2,6 +2,7 @@
 
 #include "json.hpp"
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -29,6 +30,8 @@ struct DebridFile {
     std::string name;
     std::string id;
     bool selected = false;
+    std::string link;
+    std::uint64_t size = 0;
 };
 
 struct DebridTorrentStatus {
@@ -83,7 +86,13 @@ inline std::map<std::string, DebridTorrentStatus> parseDebridStatusJson(const st
                 if (f.is_string()) {
                     status.files.push_back({f.get<std::string>(), "", false});
                 } else if (f.is_object()) {
-                    status.files.push_back({f.value("name", ""), f.value("id", ""), false});
+                    status.files.push_back({
+                        f.value("name", ""),
+                        f.value("id", ""),
+                        false,
+                        f.value("link", ""),
+                        f.value("size", std::uint64_t(0))
+                    });
                 }
             }
         }
@@ -97,7 +106,12 @@ inline std::string serializeDebridStatusJson(const std::map<std::string, DebridT
     for (const auto& pair : rows) {
         nlohmann::json files = nlohmann::json::array();
         for (const auto& file : pair.second.files) {
-            files.push_back({{"name", file.name}, {"id", file.id}});
+            files.push_back({
+                {"name", file.name},
+                {"id", file.id},
+                {"link", file.link},
+                {"size", file.size}
+            });
         }
         root[pair.first] = {
             {"cached", pair.second.cached},
@@ -124,6 +138,11 @@ public:
 
     virtual std::vector<DebridFile> files(
         const DebridTorrentStatus& torrent
+    ) = 0;
+
+    virtual std::string downloadUrl(
+        const std::string& remoteId,
+        const DebridFile& file
     ) = 0;
 
     virtual std::vector<DebridAccountTorrent> accountTorrents() = 0;
