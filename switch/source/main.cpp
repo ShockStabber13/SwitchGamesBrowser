@@ -7,6 +7,7 @@
 #include "debrid.hpp"
 #include "provider.hpp"
 #include "live_search.hpp"
+#include "installer.hpp"
 #include "scrape_cache.hpp"
 #include "provider_diagnostics.hpp"
 #include <atomic>
@@ -1063,7 +1064,197 @@ static std::vector<std::string> coverCandidates(
 struct DebridCheckResult { std::map<std::string, sgb::DebridTorrentStatus> rows; std::string message; };
 struct DebridAddResult { std::string hash; sgb::DebridTorrentStatus state; std::string message; };
 struct DebridManagerResult { std::vector<sgb::DebridAccountTorrent> rows; std::string message; };
-enum class Page { Browse, Detail, Torrents, Files, Settings, Providers, SearchProgress, Options, ScrapeChoice, DebridManager, DebridManagerFiles };
+
+struct InstallQueueRow {
+    sgb::InstallJob job;
+    std::string state = "Queued";
+    int progress = 0;
+    std::string error;
+};
+
+static std::vector<InstallQueueRow> loadInstallQueue(
+    const std::string& path)
+{
+    std::vector<InstallQueueRow> out;
+    sgb::Json rootJson;
+
+    try {
+        rootJson =
+            sgb::Json::parse(
+                sgb::read(
+                    path,
+                    4 * 1024 * 1024));
+    }
+    catch (...) {
+        return out;
+    }
+
+    if (!rootJson.is_array())
+        return out;
+
+    size_t sequence = 0;
+
+    for (const auto& node : rootJson) {
+        if (!node.is_object())
+            continue;
+
+        if (
+            node.contains("file") &&
+            node["file"].is_object()
+        ) {
+            InstallQueueRow row;
+
+            row.job.id =
+                node.value(
+                    "id",
+                    "job-" +
+                        std::to_string(
+                            sequence++));
+
+            row.job.gameTitle =
+                node.value("gameTitle", "");
+
+            row.job.releaseTitle =
+                node.value("releaseTitle", "");
+
+            row.job.infoHash =
+                node.value("infoHash", "");
+
+            row.job.source =
+                node.value("source", "");
+
+            row.job.remoteId =
+                node.value("remoteId", "");
+
+            const auto& file =
+                node["file"];
+
+            row.job.file.name =
+                file.value("name", "");
+
+            row.job.file.id =
+                file.value("id", "");
+
+            row.job.file.link =
+                file.value("link", "");
+
+            row.job.file.size =
+                file.value(
+                    "size",
+                    std::uint64_t(0));
+
+            row.state =
+                node.value("state", "Queued");
+
+            row.progress =
+                std::clamp(
+                    node.value("progress", 0),
+                    0,
+                    100);
+
+            row.error =
+                node.value("error", "");
+
+            if (
+                row.state == "Downloading" ||
+                row.state == "Installing"
+            ) {
+                row.state = "Queued";
+                row.progress = 0;
+                row.error.clear();
+            }
+
+            if (!row.job.file.name.empty())
+                out.push_back(std::move(row));
+
+            continue;
+        }
+
+        if (
+            node.contains("files") &&
+            node["files"].is_array()
+        ) {
+            for (const auto& file :
+                 node["files"]) {
+                if (!file.is_string())
+                    continue;
+
+                InstallQueueRow row;
+
+                row.job.id =
+                    "legacy-" +
+                    std::to_string(sequence++);
+
+                row.job.gameTitle =
+                    node.value("gameTitle", "");
+
+                row.job.releaseTitle =
+                    node.value("releaseTitle", "");
+
+                row.job.infoHash =
+                    node.value("infoHash", "");
+
+                row.job.source =
+                    node.value("source", "");
+
+                row.job.remoteId =
+                    node.value("remoteId", "");
+
+                row.job.file.name =
+                    file.get<std::string>();
+
+                row.state = "Failed";
+                row.error =
+                    "Legacy queue entry: requeue this file";
+
+                out.push_back(std::move(row));
+            }
+        }
+    }
+
+    return out;
+}
+
+static void saveInstallQueue(
+    const std::string& path,
+    const std::vector<InstallQueueRow>& rows)
+{
+    sgb::Json output =
+        sgb::Json::array();
+
+    for (const auto& row : rows) {
+        output.push_back({
+            {"id", row.job.id},
+            {"gameTitle", row.job.gameTitle},
+            {"releaseTitle", row.job.releaseTitle},
+            {"infoHash", row.job.infoHash},
+            {"source", row.job.source},
+            {"remoteId", row.job.remoteId},
+            {
+                "file",
+                {
+                    {"name", row.job.file.name},
+                    {"id", row.job.file.id},
+                    {"link", row.job.file.link},
+                    {"size", row.job.file.size}
+                }
+            },
+            {"state", row.state},
+            {"progress", row.progress},
+            {"error", row.error}
+        });
+    }
+
+    atomicWrite(
+        path,
+        output.dump(2));
+}
+
+enum class Page {
+    Browse, Detail, Torrents, Files, Settings, Providers,
+    SearchProgress, Options, ScrapeChoice, DebridManager,
+    DebridManagerFiles, InstallManager
+};
 
 static DebridCheckResult liveDebridCheck(
     const sgb::DebridConfig& config,
@@ -1276,7 +1467,24 @@ int main(int, char**) {
     std::future<DebridAddResult> pendingDebridAdd;
     std::future<sgb::LiveSearchResult> pendingLiveSearch;
     std::future<DebridManagerResult> pendingDebridManager;
+    std::future<sgb::InstallResult> pendingInstall;
     sgb::LiveSearchProgress liveSearchProgress;
+
+    std::shared_ptr<sgb::InstallProgress>
+        activeInstallProgress;
+
+    std::shared_ptr<std::atomic<bool>>
+        installCancel;
+
+    std::optional<size_t>
+        activeInstallIndex;
+
+    std::vector<InstallQueueRow>
+        installRows =
+            loadInstallQueue(
+                root + "install-queue.json");
+
+    size_t installManagerCursor = 0;
 
     std::shared_ptr<std::atomic<bool>>
         liveSearchCancel;
@@ -1358,17 +1566,122 @@ int main(int, char**) {
         if (files.empty()) files = release.files;
         return files;
     };
-    auto queueSelectedFiles = [&](const sgb::Game& g, const sgb::Release& release, const std::vector<std::string>& files) {
-        if (selectedFiles.empty()) { status = "Select at least one file"; return; }
-        auto queue = sgb::Json::array();
-        try { queue = sgb::Json::parse(sgb::read(root + "install-queue.json", 4 * 1024 * 1024)); } catch (...) {}
-        if (!queue.is_array()) throw std::runtime_error("Install queue format invalid");
-        sgb::Json chosen = sgb::Json::array();
-        for (size_t i : selectedFiles) if (i < files.size()) chosen.push_back(files[i]);
-        queue.push_back({{"gameId",g.id},{"gameTitle",g.title},{"releaseTitle",release.title},{"magnet",release.magnet},{"infoHash",release.infoHash},{"source",release.source},{"files",chosen}});
-        atomicWrite(root + "install-queue.json", queue.dump(2));
-        status = "Queued " + std::to_string(chosen.size()) + " selected file(s)";
+    auto persistInstallQueue = [&]() {
+        try {
+            saveInstallQueue(
+                root + "install-queue.json",
+                installRows);
+        }
+        catch (const std::exception& e) {
+            status = e.what();
+        }
     };
+
+    auto appendInstallJob =
+        [&](const std::string& gameTitle,
+            const std::string& releaseTitle,
+            const std::string& infoHash,
+            const std::string& source,
+            const std::string& remoteId,
+            const sgb::DebridFile& file)
+    {
+        InstallQueueRow row;
+
+        row.job.id =
+            std::to_string(
+                static_cast<unsigned long long>(
+                    std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now()
+                                .time_since_epoch())
+                            .count())) +
+            "-" +
+            std::to_string(
+                installRows.size());
+
+        row.job.gameTitle = gameTitle;
+        row.job.releaseTitle = releaseTitle;
+        row.job.infoHash = infoHash;
+        row.job.source = source;
+        row.job.remoteId = remoteId;
+        row.job.file = file;
+        row.state = "Queued";
+
+        installRows.push_back(
+            std::move(row));
+    };
+
+    auto queueSelectedFiles =
+        [&](const sgb::Game& g,
+            const sgb::Release& release)
+    {
+        if (selectedFiles.empty()) {
+            status = "Select at least one file";
+            return;
+        }
+
+        auto state =
+            debridStatuses.find(
+                release.infoHash);
+
+        if (
+            state == debridStatuses.end() ||
+            !state->second.downloaded ||
+            state->second.remoteId.empty()
+        ) {
+            status =
+                "Add this torrent to Debrid first";
+            return;
+        }
+
+        if (state->second.files.empty()) {
+            status =
+                "Debrid file list is not available";
+            return;
+        }
+
+        size_t queued = 0;
+
+        for (size_t index :
+             selectedFiles) {
+            if (
+                index >=
+                    state->second.files.size()
+            ) {
+                continue;
+            }
+
+            const auto& file =
+                state->second.files[index];
+
+            if (file.name.empty())
+                continue;
+
+            appendInstallJob(
+                g.title,
+                release.title,
+                release.infoHash,
+                release.source,
+                state->second.remoteId,
+                file);
+
+            ++queued;
+        }
+
+        if (!queued) {
+            status =
+                "No installable files selected";
+            return;
+        }
+
+        persistInstallQueue();
+
+        status =
+            "Queued " +
+            std::to_string(queued) +
+            " file(s) for install";
+    };
+
     auto queueDebridManagerFiles =
         [&](const sgb::DebridAccountTorrent& torrent)
     {
@@ -1377,64 +1690,55 @@ int main(int, char**) {
             return;
         }
 
-        auto queue =
-            sgb::Json::array();
-
-        try {
-            queue =
-                sgb::Json::parse(
-                    sgb::read(
-                        root + "install-queue.json",
-                        4 * 1024 * 1024));
-        }
-        catch (...) {}
-
-        if (!queue.is_array()) {
-            throw std::runtime_error(
-                "Install queue format invalid");
-        }
-
-        sgb::Json chosen =
-            sgb::Json::array();
-
-        for (
-            size_t i :
-                debridManagerSelectedFiles
-        ) {
-            if (
-                i < torrent.files.size() &&
-                !torrent.files[i].name.empty()
-            ) {
-                chosen.push_back(
-                    torrent.files[i].name);
-            }
-        }
-
-        if (chosen.empty()) {
-            status = "Select at least one file";
+        if (!torrent.complete) {
+            status = "Download is not complete";
             return;
         }
 
-        queue.push_back({
-            {"gameId", ""},
-            {"gameTitle", torrent.name},
-            {"releaseTitle", torrent.name},
-            {"magnet", ""},
-            {"infoHash", torrent.infoHash},
-            {"source", sgb::debridServiceName(
-                debridConfig.service)},
-            {"remoteId", torrent.remoteId},
-            {"files", chosen}
-        });
+        if (torrent.remoteId.empty()) {
+            status = "Debrid torrent ID is missing";
+            return;
+        }
 
-        atomicWrite(
-            root + "install-queue.json",
-            queue.dump(2));
+        size_t queued = 0;
+
+        for (
+            size_t index :
+                debridManagerSelectedFiles
+        ) {
+            if (index >= torrent.files.size())
+                continue;
+
+            const auto& file =
+                torrent.files[index];
+
+            if (file.name.empty())
+                continue;
+
+            appendInstallJob(
+                torrent.name,
+                torrent.name,
+                torrent.infoHash,
+                sgb::debridServiceName(
+                    debridConfig.service),
+                torrent.remoteId,
+                file);
+
+            ++queued;
+        }
+
+        if (!queued) {
+            status =
+                "No installable files selected";
+            return;
+        }
+
+        persistInstallQueue();
 
         status =
             "Queued " +
-            std::to_string(chosen.size()) +
-            " selected file(s) for install";
+            std::to_string(queued) +
+            " file(s) for install";
     };
 
     auto saveDebridStatuses = [&]() {
@@ -1689,6 +1993,35 @@ int main(int, char**) {
             debridManagerRows =
                 std::move(result.rows);
 
+            for (auto& torrent :
+                 debridManagerRows) {
+                if (!torrent.complete)
+                    continue;
+
+                torrent.files.erase(
+                    std::remove_if(
+                        torrent.files.begin(),
+                        torrent.files.end(),
+                        [](const sgb::DebridFile& file) {
+                            const std::string name =
+                                sgb::lower(file.name);
+
+                            if (name.size() < 4)
+                                return true;
+
+                            const std::string ext =
+                                name.substr(
+                                    name.size() - 4);
+
+                            return !(
+                                ext == ".nsp" ||
+                                ext == ".nsz" ||
+                                ext == ".xci" ||
+                                ext == ".xcz");
+                        }),
+                    torrent.files.end());
+            }
+
             debridAccountByRemoteId.clear();
 
             for (
@@ -1773,6 +2106,129 @@ int main(int, char**) {
 
             if (shouldRefresh)
                 startDebridManagerRefresh();
+        }
+
+        if (
+            pendingInstall.valid() &&
+            activeInstallIndex &&
+            *activeInstallIndex <
+                installRows.size() &&
+            activeInstallProgress
+        ) {
+            std::string stage;
+            std::string detail;
+            int percent = 0;
+
+            activeInstallProgress->snapshot(
+                stage,
+                percent,
+                detail);
+
+            auto& row =
+                installRows[
+                    *activeInstallIndex];
+
+            row.state = stage;
+            row.progress = percent;
+
+            if (
+                pendingInstall.wait_for(
+                    std::chrono::milliseconds(0)) ==
+                    std::future_status::ready
+            ) {
+                auto result =
+                    pendingInstall.get();
+
+                row.state =
+                    result.success
+                        ? "Completed"
+                        : (
+                            result.cancelled
+                                ? "Cancelled"
+                                : "Failed"
+                        );
+
+                if (result.success)
+                    row.progress = 100;
+
+                row.error =
+                    result.success
+                        ? ""
+                        : result.message;
+
+                status = result.message;
+
+                activeInstallIndex.reset();
+                activeInstallProgress.reset();
+                installCancel.reset();
+
+                persistInstallQueue();
+            }
+        }
+
+        if (!pendingInstall.valid()) {
+            for (
+                size_t i = 0;
+                i < installRows.size();
+                ++i
+            ) {
+                if (
+                    installRows[i].state !=
+                        "Queued"
+                ) {
+                    continue;
+                }
+
+                activeInstallIndex = i;
+
+                activeInstallProgress =
+                    std::make_shared<
+                        sgb::InstallProgress>();
+
+                installCancel =
+                    std::make_shared<
+                        std::atomic<bool>>(false);
+
+                auto job =
+                    installRows[i].job;
+
+                auto configCopy =
+                    debridConfig;
+
+                auto progressCopy =
+                    activeInstallProgress;
+
+                auto cancelCopy =
+                    installCancel;
+
+                installRows[i].state =
+                    "Downloading";
+
+                installRows[i].progress = 0;
+                installRows[i].error.clear();
+
+                persistInstallQueue();
+
+                pendingInstall =
+                    std::async(
+                        std::launch::async,
+                        [
+                            configCopy,
+                            job,
+                            progressCopy,
+                            cancelCopy
+                        ]() {
+                            return sgb::runInstallJob(
+                                configCopy,
+                                job,
+                                root + "install-cache",
+                                *progressCopy,
+                                cancelCopy);
+                        }
+                    );
+
+                break;
+            }
         }
 
         // Stream each debrid-checked result into the list immediately.
@@ -2160,7 +2616,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 5)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 6)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -2351,7 +2807,7 @@ int main(int, char**) {
                         }
                     }
                 }
-                else {
+                else if (settingsCursor == 5) {
                     debridManagerRows.clear();
                     debridManagerCursor = 0;
                     debridManagerFileCursor = 0;
@@ -2359,6 +2815,24 @@ int main(int, char**) {
                     page = Page::DebridManager;
                     status = "Loading debrid manager...";
                     startDebridManagerRefresh();
+                }
+                else {
+                    if (
+                        installManagerCursor >=
+                            installRows.size()
+                    ) {
+                        installManagerCursor =
+                            installRows.empty()
+                                ? 0
+                                : installRows.size() - 1;
+                    }
+
+                    page = Page::InstallManager;
+
+                    status =
+                        installRows.empty()
+                            ? "Install queue is empty"
+                            : "Install Manager";
                 }
             }
 
@@ -2538,6 +3012,115 @@ int main(int, char**) {
                         catch (const std::exception& e) {
                             status = e.what();
                         }
+                    }
+                }
+            }
+
+        } else if (page == Page::InstallManager) {
+            if (keys & HidNpadButton_B) {
+                settingsCursor = 6;
+                page = Page::Settings;
+            }
+
+            if (!installRows.empty()) {
+                if (
+                    (keys & HidNpadButton_Up) &&
+                    installManagerCursor > 0
+                ) {
+                    --installManagerCursor;
+                }
+
+                if (
+                    (keys & HidNpadButton_Down) &&
+                    installManagerCursor + 1 <
+                        installRows.size()
+                ) {
+                    ++installManagerCursor;
+                }
+
+                if (keys & HidNpadButton_L) {
+                    installManagerCursor =
+                        installManagerCursor >= 8
+                            ? installManagerCursor - 8
+                            : 0;
+                }
+
+                if (keys & HidNpadButton_R) {
+                    installManagerCursor =
+                        std::min(
+                            installManagerCursor + 8,
+                            installRows.size() - 1);
+                }
+
+                if (keys & HidNpadButton_A) {
+                    const auto& row =
+                        installRows[
+                            installManagerCursor];
+
+                    status =
+                        row.error.empty()
+                            ? row.state +
+                                " - " +
+                                row.job.file.name
+                            : row.state +
+                                ": " +
+                                row.error;
+                }
+
+                if (keys & HidNpadButton_Y) {
+                    auto& row =
+                        installRows[
+                            installManagerCursor];
+
+                    if (
+                        row.state == "Failed" ||
+                        row.state == "Cancelled"
+                    ) {
+                        row.state = "Queued";
+                        row.progress = 0;
+                        row.error.clear();
+
+                        persistInstallQueue();
+
+                        status =
+                            "Install queued again";
+                    }
+                }
+
+                if (keys & HidNpadButton_X) {
+                    if (
+                        activeInstallIndex &&
+                        *activeInstallIndex ==
+                            installManagerCursor &&
+                        pendingInstall.valid()
+                    ) {
+                        if (installCancel)
+                            installCancel->store(true);
+
+                        status =
+                            "Cancelling install...";
+                    }
+                    else {
+                        installRows.erase(
+                            installRows.begin() +
+                            static_cast<
+                                std::ptrdiff_t>(
+                                    installManagerCursor));
+
+                        if (
+                            installManagerCursor >=
+                                installRows.size()
+                        ) {
+                            installManagerCursor =
+                                installRows.empty()
+                                    ? 0
+                                    : installRows.size() - 1;
+                        }
+
+                        persistInstallQueue();
+
+                        status =
+                            "Install entry removed";
                     }
                 }
             }
@@ -2738,7 +3321,7 @@ int main(int, char**) {
                     else { selectedFiles.clear(); for (size_t i = 0; i < files.size(); ++i) selectedFiles.insert(i); }
                 }
                 if (keys & HidNpadButton_Y) {
-                    try { queueSelectedFiles(g, release, files); }
+                    try { queueSelectedFiles(g, release); }
                     catch (const std::exception& e) { status = e.what(); }
                 }
             }
@@ -3293,6 +3876,120 @@ int main(int, char**) {
                 }
             }
 
+        } else if (page == Page::InstallManager) {
+            label(
+                renderer,big,
+                "INSTALL MANAGER",
+                32,70,1200,green
+            );
+
+            label(
+                renderer,small,
+                "A Details | X Cancel/Remove | Y Retry | L/R Page | B Back",
+                32,112,1200,muted
+            );
+
+            if (installRows.empty()) {
+                label(
+                    renderer,big,
+                    "Install queue is empty",
+                    32,280,1200,muted
+                );
+            }
+            else {
+                const size_t start =
+                    (installManagerCursor / 8) * 8;
+
+                for (
+                    size_t slot = 0;
+                    slot < 8 &&
+                    start + slot <
+                        installRows.size();
+                    ++slot
+                ) {
+                    const size_t index =
+                        start + slot;
+
+                    const auto& row =
+                        installRows[index];
+
+                    const int y =
+                        150 +
+                        static_cast<int>(slot) *
+                            62;
+
+                    SDL_Rect box{
+                        32,y,1216,54
+                    };
+
+                    rect(
+                        renderer,
+                        box,
+                        SDL_Color{18,18,18,255}
+                    );
+
+                    if (
+                        index ==
+                            installManagerCursor
+                    ) {
+                        rect(
+                            renderer,
+                            box,
+                            green,
+                            true
+                        );
+                    }
+
+                    const std::string title =
+                        row.job.gameTitle.empty()
+                            ? row.job.file.name
+                            : row.job.gameTitle +
+                                " - " +
+                                row.job.file.name;
+
+                    label(
+                        renderer,
+                        small,
+                        title,
+                        48,y+6,1160,
+                        white
+                    );
+
+                    std::string stateText =
+                        row.state;
+
+                    if (
+                        row.state == "Downloading" ||
+                        row.state == "Installing"
+                    ) {
+                        stateText +=
+                            ": " +
+                            std::to_string(
+                                row.progress) +
+                            "%";
+                    }
+
+                    if (
+                        row.state == "Failed" &&
+                        !row.error.empty()
+                    ) {
+                        stateText +=
+                            " - " +
+                            row.error;
+                    }
+
+                    label(
+                        renderer,
+                        small,
+                        stateText,
+                        48,y+30,1160,
+                        row.state == "Completed"
+                            ? green
+                            : muted
+                    );
+                }
+            }
+
         } else if (page == Page::Settings) {
             label(
                 renderer,big,
@@ -3302,303 +3999,160 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "A Select  |  B Back",
+                "A Select | B Back",
                 32,112,1200,muted
             );
 
-            SDL_Rect serviceBox{
-                32,150,1216,65
-            };
-
-            rect(
-                renderer,
-                serviceBox,
-                SDL_Color{18,18,18,255}
-            );
-
-            if (settingsCursor == 0)
-                rect(
-                    renderer,
-                    serviceBox,
-                    green,
-                    true
-                );
-
-            label(
-                renderer,small,
+            std::vector<std::string> labels{
                 "Debrid Service",
-                52,170,500
-            );
-
-            label(
-                renderer,big,
-                sgb::debridServiceName(
-                    debridConfig.service
-                ),
-                650,163,550,green
-            );
-
-
-            SDL_Rect authBox{
-                32,225,1216,65
-            };
-
-            rect(
-                renderer,
-                authBox,
-                SDL_Color{18,18,18,255}
-            );
-
-            if (settingsCursor == 1)
-                rect(
-                    renderer,
-                    authBox,
-                    green,
-                    true
-                );
-
-            std::string authLabel =
-                "Authorize";
-
-            if (
-                debridConfig.service ==
-                sgb::DebridService::TorBox
-            ) {
-                authLabel =
-                    torBoxDeviceAuth.has_value()
-                        ? "Check TorBox Authorization"
-                        : "Authorize TorBox";
-            }
-
-            if (
-                debridConfig.service ==
-                sgb::DebridService::AllDebrid
-            ) {
-                authLabel =
-                    allDebridPin.has_value()
-                    ? "Check AllDebrid PIN"
-                    : "Authorize with AllDebrid PIN";
-            }
-
-            label(
-                renderer,small,
-                authLabel,
-                52,246,780
-            );
-
-            label(
-                renderer,small,
-                debridConfig.apiKey.empty()
-                    ? "Not authorized"
-                    : "Authorized",
-                970,246,230,
-                debridConfig.apiKey.empty()
-                    ? muted
-                    : green
-            );
-
-
-            SDL_Rect catalogBox{
-                32,300,1216,65
-            };
-
-            rect(
-                renderer,
-                catalogBox,
-                SDL_Color{18,18,18,255}
-            );
-
-            if (settingsCursor == 2)
-                rect(
-                    renderer,
-                    catalogBox,
-                    green,
-                    true
-                );
-
-            label(
-                renderer,small,
+                "Authorize",
                 "Refresh Catalog Index",
-                52,321,1100
-            );
-
-
-            SDL_Rect torrentBox{
-                32,375,1216,65
-            };
-
-            rect(
-                renderer,
-                torrentBox,
-                SDL_Color{18,18,18,255}
-            );
-
-            if (settingsCursor == 3)
-                rect(
-                    renderer,
-                    torrentBox,
-                    green,
-                    true
-                );
-
-            label(
-                renderer,small,
                 "Scrape Providers",
-                52,396,1100
-            );
-            SDL_Rect langegenBox{
-                32,450,1216,65
+                "Download / Update Langegen Catalog",
+                "Debrid Manager",
+                "Install Manager"
             };
 
-            rect(
-                renderer,
-                langegenBox,
-                SDL_Color{18,18,18,255}
-            );
+            for (
+                size_t i = 0;
+                i < labels.size();
+                ++i
+            ) {
+                const int y =
+                    145 +
+                    static_cast<int>(i) *
+                        58;
 
-            if (settingsCursor == 4)
+                SDL_Rect box{
+                    32,y,1216,50
+                };
+
                 rect(
                     renderer,
-                    langegenBox,
-                    green,
-                    true
+                    box,
+                    SDL_Color{18,18,18,255}
                 );
 
-            label(
-                renderer,small,
-                "Download / Update Langegen Catalog",
-                52,471,760
-            );
+                if (i == settingsCursor) {
+                    rect(
+                        renderer,
+                        box,
+                        green,
+                        true
+                    );
+                }
 
-            {
-                std::ifstream catalogFile(
-                    root + "langegen.json",
-                    std::ios::binary
-                );
+                std::string value;
+
+                if (i == 0) {
+                    value =
+                        sgb::debridServiceName(
+                            debridConfig.service);
+                }
+                else if (i == 1) {
+                    if (
+                        debridConfig.service ==
+                            sgb::DebridService::TorBox
+                    ) {
+                        labels[i] =
+                            torBoxDeviceAuth.has_value()
+                                ? "Check TorBox Authorization"
+                                : "Authorize TorBox";
+                    }
+                    else if (
+                        debridConfig.service ==
+                            sgb::DebridService::AllDebrid
+                    ) {
+                        labels[i] =
+                            allDebridPin.has_value()
+                                ? "Check AllDebrid PIN"
+                                : "Authorize with AllDebrid PIN";
+                    }
+
+                    value =
+                        debridConfig.apiKey.empty()
+                            ? "Not authorized"
+                            : "Authorized";
+                }
+                else if (i == 4) {
+                    std::ifstream catalogFile(
+                        root + "langegen.json",
+                        std::ios::binary);
+
+                    value =
+                        catalogFile.good()
+                            ? "Installed"
+                            : "Not downloaded";
+                }
+                else if (i == 6) {
+                    size_t active = 0;
+
+                    for (
+                        const auto& row :
+                            installRows
+                    ) {
+                        if (
+                            row.state == "Queued" ||
+                            row.state == "Downloading" ||
+                            row.state == "Installing"
+                        ) {
+                            ++active;
+                        }
+                    }
+
+                    value =
+                        std::to_string(active) +
+                        " active / " +
+                        std::to_string(
+                            installRows.size()) +
+                        " total";
+                }
 
                 label(
                     renderer,
                     small,
-                    catalogFile.good()
-                        ? "Installed"
-                        : "Not downloaded",
-                    990,
-                    471,
-                    220,
-                    catalogFile.good()
+                    labels[i],
+                    52,y+14,780,
+                    i == settingsCursor
                         ? green
-                        : muted
+                        : white
                 );
+
+                if (!value.empty()) {
+                    label(
+                        renderer,
+                        small,
+                        value,
+                        860,y+14,350,
+                        (
+                            value == "Authorized" ||
+                            value == "Installed"
+                        )
+                            ? green
+                            : muted
+                    );
+                }
             }
-
-            SDL_Rect backBox{
-                32,525,1216,65
-            };
-
-            rect(
-                renderer,
-                backBox,
-                SDL_Color{18,18,18,255}
-            );
-
-            if (settingsCursor == 5)
-                rect(
-                    renderer,
-                    backBox,
-                    green,
-                    true
-                );
-
-            label(
-                renderer,small,
-                "Debrid Manager",
-                52,546,1100
-            );
-
 
             if (torBoxDeviceAuth.has_value()) {
                 label(
                     renderer,
-                    big,
-                    "TorBox Code: " +
-                        torBoxDeviceAuth->code,
-                    32,
-                    600,
-                    700,
-                    green
-                );
-
-                label(
-                    renderer,
                     small,
-                    "Visit: " +
-                        torBoxDeviceAuth
-                            ->friendlyVerificationUrl,
-                    32,
-                    638,
-                    1216,
-                    white
+                    "TorBox Code: " +
+                        torBoxDeviceAuth->code +
+                    " | " +
+                    torBoxDeviceAuth
+                        ->friendlyVerificationUrl,
+                    32,570,1216,green
                 );
             }
             else if (allDebridPin.has_value()) {
                 label(
-                    renderer,big,
-                    "PIN: " + allDebridPin->pin,
-                    32,605,500,green
-                );
-
-                label(
-                    renderer,small,
-                    "Enter PIN at alldebrid.com/pin, then select Authorize again.",
-                    32,635,1216,white
-                );
-            }
-            else {
-                label(
-                    renderer,small,
-                    "Catalog and torrent indexes are cached separately on the SD card.",
-                    32,610,1216,muted
-                );
-            }
-            int refreshPhase =
-                catalogRefreshPhase.load();
-
-            if (refreshPhase == 1) {
-                label(
                     renderer,
                     small,
-                    "Catalog: downloading metadata...",
-                    32,650,1216,green
-                );
-            }
-            else if (refreshPhase == 2) {
-                size_t done =
-                    catalogCoverDone.load();
-
-                size_t total =
-                    catalogCoverTotal.load();
-
-                size_t cached =
-                    catalogCoverCached.load();
-
-                size_t percent =
-                    total ? (done * 100 / total) : 0;
-
-                std::string progress =
-                    "Cover packs: " +
-                    std::to_string(done) +
-                    "/" +
-                    std::to_string(total) +
-                    " (" +
-                    std::to_string(percent) +
-                    "%)  cached: " +
-                    std::to_string(cached);
-
-                label(
-                    renderer,
-                    small,
-                    progress,
-                    32,650,1216,green
+                    "AllDebrid PIN: " +
+                        allDebridPin->pin,
+                    32,570,1216,green
                 );
             }
 
@@ -4132,6 +4686,16 @@ int main(int, char**) {
     if (pendingDebridCheck.valid()) pendingDebridCheck.wait();
     if (pendingDebridAdd.valid()) pendingDebridAdd.wait();
     if (pendingDebridManager.valid()) pendingDebridManager.wait();
+
+    if (
+        installCancel &&
+        pendingInstall.valid()
+    ) {
+        installCancel->store(true);
+    }
+
+    if (pendingInstall.valid())
+        pendingInstall.wait();
     saveState(); for (auto& p : covers) SDL_DestroyTexture(p.second);
     TTF_CloseFont(small); TTF_CloseFont(big); SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window);
     IMG_Quit(); TTF_Quit(); SDL_Quit(); plExit(); curl_global_cleanup(); romfsExit(); socketExit();

@@ -227,21 +227,111 @@ void appendTorBoxFiles(const Json& files, std::vector<DebridFile>& out) {
         if (name.empty()) name = valueString(f, "path");
         std::string id = valueString(f, "file_id");
         if (id.empty()) id = valueString(f, "id");
-        if (!name.empty()) out.push_back({name, id, false});
+        if (!name.empty()) {
+            std::uint64_t size = 0;
+            auto sizeIt = f.find("size");
+
+            if (
+                sizeIt != f.end() &&
+                sizeIt->is_number_unsigned()
+            ) {
+                size = sizeIt->get<std::uint64_t>();
+            }
+            else if (
+                sizeIt != f.end() &&
+                sizeIt->is_number_integer()
+            ) {
+                const auto raw =
+                    sizeIt->get<long long>();
+
+                if (raw > 0)
+                    size =
+                        static_cast<std::uint64_t>(
+                            raw);
+            }
+
+            out.push_back({
+                name,
+                id,
+                false,
+                "",
+                size
+            });
+        }
     }
 }
 
-void appendAllDebridFiles(const Json& files, std::vector<DebridFile>& out, const std::string& prefix = "") {
-    if (!files.is_array()) return;
+void appendAllDebridFiles(
+    const Json& files,
+    std::vector<DebridFile>& out,
+    const std::string& prefix = "")
+{
+    if (!files.is_array())
+        return;
+
     for (const auto& node : files) {
-        if (!node.is_object()) continue;
-        std::string name = valueString(node, "n");
-        auto children = node.find("e");
-        if (children != node.end() && children->is_array()) {
-            appendAllDebridFiles(*children, out, prefix + (name.empty() ? "" : name + "/"));
+        if (!node.is_object())
+            continue;
+
+        const std::string name =
+            valueString(node, "n");
+
+        auto children =
+            node.find("e");
+
+        if (
+            children != node.end() &&
+            children->is_array()
+        ) {
+            appendAllDebridFiles(
+                *children,
+                out,
+                prefix +
+                    (
+                        name.empty()
+                            ? ""
+                            : name + "/"
+                    )
+            );
+
             continue;
         }
-        if (!name.empty()) out.push_back({prefix + name, "", false});
+
+        if (name.empty())
+            continue;
+
+        std::uint64_t size = 0;
+
+        auto sizeIt =
+            node.find("s");
+
+        if (
+            sizeIt != node.end() &&
+            sizeIt->is_number_unsigned()
+        ) {
+            size =
+                sizeIt->get<std::uint64_t>();
+        }
+        else if (
+            sizeIt != node.end() &&
+            sizeIt->is_number_integer()
+        ) {
+            const auto raw =
+                sizeIt->get<long long>();
+
+            if (raw > 0)
+                size =
+                    static_cast<std::uint64_t>(
+                        raw);
+        }
+
+        out.push_back({
+            prefix + name,
+            "",
+            false,
+            valueString(node, "l"),
+            size
+        });
     }
 }
 
@@ -383,6 +473,26 @@ public:
         auto f = item.find("files");
         if (f != item.end()) appendTorBoxFiles(*f, out);
         return out;
+    }
+
+    std::string downloadUrl(
+        const std::string& remoteId,
+        const DebridFile& file
+    ) override {
+        if (remoteId.empty())
+            throw std::runtime_error(
+                "TorBox torrent ID is missing");
+
+        if (file.id.empty())
+            throw std::runtime_error(
+                "TorBox file ID is missing");
+
+        return
+            "https://api.torbox.app/v1/api/torrents/requestdl"
+            "?token=" + encode(config_.apiKey) +
+            "&torrent_id=" + encode(remoteId) +
+            "&file_id=" + encode(file.id) +
+            "&redirect=true";
     }
 
 
@@ -725,6 +835,41 @@ public:
         auto rows = filesByIds({torrent.remoteId});
         auto it = rows.find(torrent.remoteId);
         return it == rows.end() ? std::vector<DebridFile>{} : it->second;
+    }
+
+    std::string downloadUrl(
+        const std::string&,
+        const DebridFile& file
+    ) override {
+        if (file.link.empty())
+            throw std::runtime_error(
+                "AllDebrid file link is missing");
+
+        auto root = apiPost(
+            "https://api.alldebrid.com/v4/link/unlock",
+            "link=" + encode(file.link),
+            "AllDebrid unlock");
+
+        auto data =
+            root.find("data");
+
+        if (
+            data == root.end() ||
+            !data->is_object()
+        ) {
+            throw std::runtime_error(
+                "AllDebrid unlock missing data");
+        }
+
+        const std::string url =
+            valueString(*data, "link");
+
+        if (url.empty()) {
+            throw std::runtime_error(
+                "AllDebrid did not return a direct link");
+        }
+
+        return url;
     }
 
 
