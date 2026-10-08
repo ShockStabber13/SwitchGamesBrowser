@@ -669,7 +669,9 @@ LiveSearchResult runLiveSearch(
                                     if (
                                         state ==
                                             checked.end() ||
-                                        !state->second.cached
+                                        !state->second.cached ||
+                                        !hasSwitchExtension(
+                                            state->second.files)
                                     ) {
                                         continue;
                                     }
@@ -955,7 +957,6 @@ LiveSearchResult runLiveSearch(
     return output;
 }
 } // namespace sgb
-
 
 
 
