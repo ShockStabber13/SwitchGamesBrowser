@@ -37,15 +37,6 @@ struct DebridTorrentStatus {
     std::vector<DebridFile> files;
 };
 
-struct DebridAccountTorrent {
-    std::string name;
-    std::string infoHash;
-    std::string remoteId;
-    bool complete = false;
-    int progress = 0;
-    std::vector<DebridFile> files;
-};
-
 inline DebridService parseDebridService(std::string value) {
     for (auto& c : value)
         if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
@@ -124,8 +115,6 @@ public:
     virtual std::vector<DebridFile> files(
         const DebridTorrentStatus& torrent
     ) = 0;
-
-    virtual std::vector<DebridAccountTorrent> accountTorrents() = 0;
 };
 
 
