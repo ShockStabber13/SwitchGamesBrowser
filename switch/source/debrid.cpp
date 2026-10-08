@@ -789,6 +789,32 @@ private:
 
 std::mutex gAllDebridCheckMutex;
 
+void waitAllDebridInterval(
+    std::chrono::seconds duration)
+{
+    const auto ticks =
+        std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+                duration).count() / 100;
+
+    for (
+        long long i = 0;
+        i < std::max<long long>(ticks, 1);
+        ++i
+    ) {
+        if (
+            gDebridCancelFlag &&
+            gDebridCancelFlag->load()
+        ) {
+            throw std::runtime_error(
+                "Search cancelled");
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(100));
+    }
+}
+
 class AllDebridBackend final : public DebridBackend {
 public:
     explicit AllDebridBackend(DebridConfig config) : config_(std::move(config)) {}
@@ -813,7 +839,12 @@ public:
                 out[hash] = {};
         }
 
-        constexpr size_t checkBatchSize = 5;
+        // MoviesAndSeries-style pacing: keep batches modest and give
+        // AllDebrid time to release temporary probe magnets before the
+        // next upload request.
+        constexpr size_t checkBatchSize = 10;
+        constexpr auto checkInterval =
+            std::chrono::seconds(5);
 
         for (
             size_t offset = 0;
@@ -830,7 +861,53 @@ public:
                 body += "magnets%5B%5D=" + encode(candidates[i].magnet);
             }
 
-            auto root = apiPost("https://api.alldebrid.com/v4/magnet/upload", body, "AllDebrid upload");
+            Json root;
+            bool uploaded = false;
+
+            for (
+                int attempt = 0;
+                attempt < 3;
+                ++attempt
+            ) {
+                try {
+                    root = apiPost(
+                        "https://api.alldebrid.com/v4/magnet/upload",
+                        body,
+                        "AllDebrid upload");
+
+                    uploaded = true;
+                    break;
+                }
+                catch (const std::exception& e) {
+                    const std::string message =
+                        e.what();
+
+                    const bool retryable =
+                        message.find(
+                            "MAGNET_TOO_MANY_ACTIVE") !=
+                            std::string::npos ||
+                        message.find(
+                            "MAGNET_UPLOAD_FAILED") !=
+                            std::string::npos ||
+                        message.find(
+                            "MAGNET_INTERNAL_ERROR") !=
+                            std::string::npos;
+
+                    if (
+                        !retryable ||
+                        attempt == 2
+                    ) {
+                        throw;
+                    }
+
+                    waitAllDebridInterval(
+                        checkInterval);
+                }
+            }
+
+            if (!uploaded)
+                continue;
+
             auto data = root.find("data");
             if (data == root.end() || !data->is_object()) continue;
             auto magnets = data->find("magnets");
@@ -908,6 +985,11 @@ public:
                 if (!existedBefore) {
                     deleteMagnet(id);
                 }
+            }
+
+            if (end < candidates.size()) {
+                waitAllDebridInterval(
+                    checkInterval);
             }
         }
         return out;
@@ -1153,10 +1235,62 @@ private:
         };
     }
 
-    Json apiPost(const std::string& url, const std::string& body, const char* label) const {
-        auto root = jsonResponse(requestRetry(url, true, authHeaders(), body), label);
-        if (root.value("status", "") != "success") throw std::runtime_error(std::string(label) + " failed");
-        return root;
+    Json apiPost(
+        const std::string& url,
+        const std::string& body,
+        const char* label) const
+    {
+        auto root =
+            jsonResponse(
+                requestRetry(
+                    url,
+                    true,
+                    authHeaders(),
+                    body),
+                label);
+
+        if (
+            root.value(
+                "status",
+                "") ==
+                "success"
+        ) {
+            return root;
+        }
+
+        std::string code;
+        std::string message;
+
+        auto error =
+            root.find("error");
+
+        if (
+            error != root.end() &&
+            error->is_object()
+        ) {
+            code =
+                valueString(
+                    *error,
+                    "code");
+
+            message =
+                valueString(
+                    *error,
+                    "message");
+        }
+
+        std::string detail =
+            std::string(label) +
+            " failed";
+
+        if (!code.empty())
+            detail += ": " + code;
+
+        if (!message.empty())
+            detail += " - " + message;
+
+        throw std::runtime_error(
+            detail);
     }
 
     std::set<std::string> existingMagnetIds() const {
