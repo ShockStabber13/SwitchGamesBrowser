@@ -1265,21 +1265,50 @@ static DebridRemoveResult liveDebridRemove(
             throw std::runtime_error(
                 "Authorize a debrid service first");
 
+        std::vector<std::string> errors;
+
         for (const auto& id : remoteIds) {
             if (id.empty())
                 continue;
 
-            backend->remove(id);
-            result.removedIds.push_back(id);
+            try {
+                backend->remove(id);
+                result.removedIds.push_back(id);
+            }
+            catch (const std::exception& e) {
+                errors.push_back(e.what());
+            }
+            catch (...) {
+                errors.push_back(
+                    "Unknown delete error");
+            }
         }
 
-        result.message =
-            "Removed " +
-            std::to_string(
-                result.removedIds.size()) +
-            " torrent(s) from " +
-            sgb::debridServiceName(
-                config.service);
+        if (errors.empty()) {
+            result.message =
+                "Removed " +
+                std::to_string(
+                    result.removedIds.size()) +
+                " torrent(s) from " +
+                sgb::debridServiceName(
+                    config.service);
+        }
+        else {
+            result.message =
+                "Removed " +
+                std::to_string(
+                    result.removedIds.size()) +
+                " of " +
+                std::to_string(
+                    remoteIds.size()) +
+                " torrent(s)";
+
+            if (!errors.front().empty()) {
+                result.message +=
+                    ": " +
+                    errors.front();
+            }
+        }
     }
     catch (const std::exception& e) {
         result.message = e.what();
@@ -1734,6 +1763,9 @@ int main(int, char**) {
     std::set<std::string>
         debridManagerSelectedTorrents;
 
+    std::optional<std::vector<std::string>>
+        queuedDebridRemoveIds;
+
     auto nextDebridManagerRefresh =
         std::chrono::steady_clock::now();
     size_t liveSearchGameIndex = 0;
@@ -2032,24 +2064,9 @@ int main(int, char**) {
             std::chrono::seconds(3);
     };
 
-    auto startDebridRemove = [&]() {
-        if (debridManagerSelectedTorrents.empty()) {
-            status = "Select at least one torrent";
-            return;
-        }
-
-        if (
-            pendingDebridRemove.valid() ||
-            pendingDebridManager.valid()
-        ) {
-            status = "Debrid request already running";
-            return;
-        }
-
-        std::vector<std::string> ids(
-            debridManagerSelectedTorrents.begin(),
-            debridManagerSelectedTorrents.end());
-
+    auto launchDebridRemove =
+        [&](std::vector<std::string> ids)
+    {
         auto configCopy =
             debridConfig;
 
@@ -2066,6 +2083,35 @@ int main(int, char**) {
                         configCopy,
                         ids);
                 });
+    };
+
+    auto startDebridRemove = [&]() {
+        if (debridManagerSelectedTorrents.empty()) {
+            status = "Select at least one torrent";
+            return;
+        }
+
+        if (pendingDebridRemove.valid()) {
+            status = "Debrid removal already running";
+            return;
+        }
+
+        std::vector<std::string> ids(
+            debridManagerSelectedTorrents.begin(),
+            debridManagerSelectedTorrents.end());
+
+        if (pendingDebridManager.valid()) {
+            queuedDebridRemoveIds =
+                std::move(ids);
+
+            status =
+                "Removal queued after current refresh";
+
+            return;
+        }
+
+        launchDebridRemove(
+            std::move(ids));
     };
 
     auto openScrapeChoice = [&](size_t gameIndex) {
@@ -2315,6 +2361,20 @@ int main(int, char**) {
                 status =
                     result.message;
             }
+
+            if (
+                queuedDebridRemoveIds.has_value() &&
+                !pendingDebridRemove.valid()
+            ) {
+                auto ids =
+                    std::move(
+                        *queuedDebridRemoveIds);
+
+                queuedDebridRemoveIds.reset();
+
+                launchDebridRemove(
+                    std::move(ids));
+            }
         }
 
         if (
@@ -2388,6 +2448,8 @@ int main(int, char**) {
                 page == Page::Torrents
             ) &&
             !pendingDebridManager.valid() &&
+            !pendingDebridRemove.valid() &&
+            !queuedDebridRemoveIds.has_value() &&
             std::chrono::steady_clock::now() >=
                 nextDebridManagerRefresh
         ) {
@@ -2438,9 +2500,6 @@ int main(int, char**) {
 
         if (
             pendingInstall.valid() &&
-            activeInstallIndex &&
-            *activeInstallIndex <
-                installRows.size() &&
             activeInstallProgress
         ) {
             std::string stage;
@@ -2452,12 +2511,19 @@ int main(int, char**) {
                 percent,
                 detail);
 
-            auto& row =
-                installRows[
-                    *activeInstallIndex];
+            const bool activeRowValid =
+                activeInstallIndex &&
+                *activeInstallIndex <
+                    installRows.size();
 
-            row.state = stage;
-            row.progress = percent;
+            if (activeRowValid) {
+                auto& row =
+                    installRows[
+                        *activeInstallIndex];
+
+                row.state = stage;
+                row.progress = percent;
+            }
 
             if (
                 pendingInstall.wait_for(
@@ -2467,22 +2533,28 @@ int main(int, char**) {
                 auto result =
                     pendingInstall.get();
 
-                row.state =
-                    result.success
-                        ? "Completed"
-                        : (
-                            result.cancelled
-                                ? "Cancelled"
-                                : "Failed"
-                        );
+                if (activeRowValid) {
+                    auto& row =
+                        installRows[
+                            *activeInstallIndex];
 
-                if (result.success)
-                    row.progress = 100;
+                    row.state =
+                        result.success
+                            ? "Completed"
+                            : (
+                                result.cancelled
+                                    ? "Cancelled"
+                                    : "Failed"
+                            );
 
-                row.error =
-                    result.success
-                        ? ""
-                        : result.message;
+                    if (result.success)
+                        row.progress = 100;
+
+                    row.error =
+                        result.success
+                            ? ""
+                            : result.message;
+                }
 
                 status = result.message;
 
@@ -3483,11 +3555,22 @@ int main(int, char**) {
                             "Cancelling install...";
                     }
                     else {
+                        const size_t removedIndex =
+                            installManagerCursor;
+
+                        if (
+                            activeInstallIndex &&
+                            removedIndex <
+                                *activeInstallIndex
+                        ) {
+                            --(*activeInstallIndex);
+                        }
+
                         installRows.erase(
                             installRows.begin() +
                             static_cast<
                                 std::ptrdiff_t>(
-                                    installManagerCursor));
+                                    removedIndex));
 
                         if (
                             installManagerCursor >=
