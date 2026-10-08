@@ -1321,8 +1321,53 @@ struct InstallQueueRow {
     sgb::InstallJob job;
     std::string state = "Queued";
     int progress = 0;
+    std::uint64_t bytesDone = 0;
+    std::uint64_t bytesTotal = 0;
+    std::uint64_t bytesPerSecond = 0;
     std::string error;
 };
+
+static std::string formatTransferBytes(
+    std::uint64_t bytes)
+{
+    constexpr double KiB = 1024.0;
+    constexpr double MiB = KiB * 1024.0;
+    constexpr double GiB = MiB * 1024.0;
+
+    char buffer[64]{};
+
+    if (bytes >= static_cast<std::uint64_t>(GiB)) {
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%.2f GB",
+            static_cast<double>(bytes) / GiB);
+    }
+    else if (bytes >= static_cast<std::uint64_t>(MiB)) {
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%.1f MB",
+            static_cast<double>(bytes) / MiB);
+    }
+    else if (bytes >= static_cast<std::uint64_t>(KiB)) {
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%.1f KB",
+            static_cast<double>(bytes) / KiB);
+    }
+    else {
+        std::snprintf(
+            buffer,
+            sizeof(buffer),
+            "%llu B",
+            static_cast<unsigned long long>(
+                bytes));
+    }
+
+    return buffer;
+}
 
 static std::vector<InstallQueueRow> loadInstallQueue(
     const std::string& path)
@@ -2505,11 +2550,19 @@ int main(int, char**) {
             std::string stage;
             std::string detail;
             int percent = 0;
+            std::uint64_t bytesDone = 0;
+            std::uint64_t bytesTotal = 0;
+            std::uint64_t bytesPerSecond = 0;
 
             activeInstallProgress->snapshot(
                 stage,
                 percent,
                 detail);
+
+            activeInstallProgress->snapshotTransfer(
+                bytesDone,
+                bytesTotal,
+                bytesPerSecond);
 
             const bool activeRowValid =
                 activeInstallIndex &&
@@ -2523,6 +2576,10 @@ int main(int, char**) {
 
                 row.state = stage;
                 row.progress = percent;
+                row.bytesDone = bytesDone;
+                row.bytesTotal = bytesTotal;
+                row.bytesPerSecond =
+                    bytesPerSecond;
             }
 
             if (
@@ -2547,8 +2604,14 @@ int main(int, char**) {
                                     : "Failed"
                             );
 
-                    if (result.success)
+                    if (result.success) {
                         row.progress = 100;
+
+                        if (row.bytesTotal > 0) {
+                            row.bytesDone =
+                                row.bytesTotal;
+                        }
+                    }
 
                     row.error =
                         result.success
@@ -2602,9 +2665,12 @@ int main(int, char**) {
                     installCancel;
 
                 installRows[i].state =
-                    "Downloading";
+                    "Installing";
 
                 installRows[i].progress = 0;
+                installRows[i].bytesDone = 0;
+                installRows[i].bytesTotal = 0;
+                installRows[i].bytesPerSecond = 0;
                 installRows[i].error.clear();
 
                 persistInstallQueue();
@@ -4450,6 +4516,24 @@ int main(int, char**) {
                             std::to_string(
                                 row.progress) +
                             "%";
+
+                        if (row.bytesTotal > 0) {
+                            stateText +=
+                                "  " +
+                                formatTransferBytes(
+                                    row.bytesDone) +
+                                " / " +
+                                formatTransferBytes(
+                                    row.bytesTotal);
+                        }
+
+                        if (row.bytesPerSecond > 0) {
+                            stateText +=
+                                "  " +
+                                formatTransferBytes(
+                                    row.bytesPerSecond) +
+                                "/s";
+                        }
                     }
 
                     if (
