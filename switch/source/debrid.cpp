@@ -495,6 +495,63 @@ public:
             "&redirect=true";
     }
 
+    void remove(
+        const std::string& remoteId
+    ) override {
+        if (remoteId.empty())
+            throw std::runtime_error(
+                "TorBox torrent ID is missing");
+
+        Json body = {
+            {"operation", "delete"},
+            {"all", false}
+        };
+
+        const bool numeric =
+            std::all_of(
+                remoteId.begin(),
+                remoteId.end(),
+                [](unsigned char ch) {
+                    return std::isdigit(ch) != 0;
+                });
+
+        if (numeric) {
+            try {
+                body["torrent_id"] =
+                    std::stoll(remoteId);
+            }
+            catch (...) {
+                body["torrent_id"] =
+                    remoteId;
+            }
+        }
+        else {
+            body["torrent_id"] =
+                remoteId;
+        }
+
+        auto root = jsonResponse(
+            requestRetry(
+                "https://api.torbox.app/v1/api/torrents/controltorrent",
+                true,
+                {
+                    "Authorization: Bearer " +
+                        config_.apiKey,
+                    "Content-Type: application/json"
+                },
+                body.dump()
+            ),
+            "TorBox delete");
+
+        if (!root.value("success", false)) {
+            throw std::runtime_error(
+                root.value(
+                    "detail",
+                    std::string(
+                        "TorBox delete failed")));
+        }
+    }
+
 
     std::vector<DebridAccountTorrent> accountTorrents() override {
         std::vector<DebridAccountTorrent> out;
@@ -870,6 +927,19 @@ public:
         }
 
         return url;
+    }
+
+    void remove(
+        const std::string& remoteId
+    ) override {
+        if (remoteId.empty())
+            throw std::runtime_error(
+                "AllDebrid magnet ID is missing");
+
+        (void)apiPost(
+            "https://api.alldebrid.com/v4/magnet/delete",
+            "id=" + encode(remoteId),
+            "AllDebrid delete");
     }
 
 
