@@ -187,7 +187,7 @@ public:
 
     std::map<std::string, DebridTorrentStatus> check(const std::vector<DebridCandidate>& candidates) override {
         std::map<std::string, DebridTorrentStatus> out;
-        auto account = accountTorrents();
+        auto account = accountTorrentMap();
 
         std::vector<std::string> hashes;
         std::set<std::string> seen;
@@ -195,6 +195,9 @@ public:
             const std::string hash = lowerHash(candidate.infoHash);
             if (hash.size() == 40 && seen.insert(hash).second) hashes.push_back(hash);
         }
+
+        for (const auto& hash : hashes)
+            out[hash] = {};
 
         for (size_t offset = 0; offset < hashes.size(); offset += 10) {
             const size_t end = std::min(offset + 10, hashes.size());
@@ -232,7 +235,7 @@ public:
 
     DebridTorrentStatus add(const std::string& infoHash, const std::string& magnet) override {
         const std::string hash = lowerHash(infoHash);
-        auto account = accountTorrents();
+        auto account = accountTorrentMap();
         auto existing = account.find(hash);
         if (existing != account.end()) {
             auto state = existing->second;
@@ -318,6 +321,139 @@ public:
         return out;
     }
 
+
+    std::vector<DebridAccountTorrent> accountTorrents() override {
+        std::vector<DebridAccountTorrent> out;
+
+        auto root = jsonResponse(requestRetry(
+            "https://api.torbox.app/v1/api/torrents/mylist?bypass_cache=true&limit=1000",
+            false,
+            authHeaders()
+        ), "TorBox mylist");
+
+        auto data = root.find("data");
+        if (data == root.end())
+            return out;
+
+        Json rows = Json::array();
+
+        if (data->is_array()) {
+            rows = *data;
+        }
+        else if (data->is_object()) {
+            auto torrents = data->find("torrents");
+
+            if (
+                torrents != data->end() &&
+                torrents->is_array()
+            ) {
+                rows = *torrents;
+            }
+            else {
+                rows.push_back(*data);
+            }
+        }
+
+        for (const auto& item : rows) {
+            if (!item.is_object())
+                continue;
+
+            DebridAccountTorrent row;
+
+            row.name = valueString(item, "name");
+            row.infoHash = lowerHash(
+                valueString(item, "hash"));
+
+            if (row.infoHash.empty()) {
+                row.infoHash = lowerHash(
+                    valueString(item, "info_hash"));
+            }
+
+            row.remoteId = valueString(item, "id");
+
+            if (row.remoteId.empty()) {
+                row.remoteId =
+                    valueString(item, "torrent_id");
+            }
+
+            auto finished =
+                item.find("download_finished");
+
+            if (
+                finished != item.end() &&
+                finished->is_boolean()
+            ) {
+                row.complete =
+                    finished->get<bool>();
+            }
+
+            auto cached =
+                item.find("cached");
+
+            if (
+                !row.complete &&
+                cached != item.end() &&
+                cached->is_boolean() &&
+                cached->get<bool>()
+            ) {
+                row.complete = true;
+            }
+
+            double progress = 0.0;
+
+            auto progressIt =
+                item.find("progress");
+
+            if (
+                progressIt != item.end() &&
+                progressIt->is_number()
+            ) {
+                progress =
+                    progressIt->get<double>();
+
+                if (
+                    progress > 0.0 &&
+                    progress <= 1.0
+                ) {
+                    progress *= 100.0;
+                }
+            }
+
+            if (row.complete)
+                progress = 100.0;
+
+            row.progress =
+                std::clamp(
+                    static_cast<int>(
+                        progress + 0.5),
+                    0,
+                    100);
+
+            if (row.complete) {
+                auto filesIt =
+                    item.find("files");
+
+                if (filesIt != item.end()) {
+                    appendTorBoxFiles(
+                        *filesIt,
+                        row.files);
+                }
+            }
+
+            if (row.name.empty()) {
+                row.name =
+                    !row.infoHash.empty()
+                        ? row.infoHash
+                        : row.remoteId;
+            }
+
+            out.push_back(
+                std::move(row));
+        }
+
+        return out;
+    }
+
 private:
     DebridConfig config_;
 
@@ -325,7 +461,7 @@ private:
         return {"Authorization: Bearer " + config_.apiKey};
     }
 
-    std::map<std::string, DebridTorrentStatus> accountTorrents() const {
+    std::map<std::string, DebridTorrentStatus> accountTorrentMap() const {
         std::map<std::string, DebridTorrentStatus> out;
         auto root = jsonResponse(requestRetry(
             "https://api.torbox.app/v1/api/torrents/mylist?bypass_cache=true&limit=1000",
@@ -396,6 +532,14 @@ public:
     std::map<std::string, DebridTorrentStatus> check(const std::vector<DebridCandidate>& candidates) override {
         std::map<std::string, DebridTorrentStatus> out;
         const auto existingIds = existingMagnetIds();
+
+        for (const auto& candidate : candidates) {
+            const std::string hash =
+                lowerHash(candidate.infoHash);
+
+            if (hash.size() == 40)
+                out[hash] = {};
+        }
 
         for (size_t offset = 0; offset < candidates.size(); offset += 10) {
             const size_t end = std::min(offset + 10, candidates.size());
@@ -474,6 +618,157 @@ public:
         auto rows = filesByIds({torrent.remoteId});
         auto it = rows.find(torrent.remoteId);
         return it == rows.end() ? std::vector<DebridFile>{} : it->second;
+    }
+
+
+    std::vector<DebridAccountTorrent> accountTorrents() override {
+        std::vector<DebridAccountTorrent> out;
+
+        auto root = apiPost(
+            "https://api.alldebrid.com/v4.1/magnet/status",
+            "",
+            "AllDebrid status");
+
+        auto data = root.find("data");
+
+        if (
+            data == root.end() ||
+            !data->is_object()
+        ) {
+            return out;
+        }
+
+        auto magnets =
+            data->find("magnets");
+
+        if (
+            magnets == data->end() ||
+            !magnets->is_array()
+        ) {
+            return out;
+        }
+
+        std::vector<std::string> completedIds;
+
+        for (const auto& item : *magnets) {
+            if (!item.is_object())
+                continue;
+
+            DebridAccountTorrent row;
+
+            row.name =
+                valueString(
+                    item,
+                    "filename");
+
+            row.remoteId =
+                valueString(
+                    item,
+                    "id");
+
+            int statusCode = -1;
+
+            auto statusIt =
+                item.find("statusCode");
+
+            if (
+                statusIt != item.end() &&
+                statusIt->is_number_integer()
+            ) {
+                statusCode =
+                    statusIt->get<int>();
+            }
+
+            row.complete =
+                statusCode == 4;
+
+            if (!row.complete) {
+                const std::string state =
+                    lowerHash(
+                        valueString(
+                            item,
+                            "status"));
+
+                row.complete =
+                    state == "ready";
+            }
+
+            long long size = 0;
+            long long downloaded = 0;
+
+            auto sizeIt =
+                item.find("size");
+
+            if (
+                sizeIt != item.end() &&
+                sizeIt->is_number()
+            ) {
+                size =
+                    static_cast<long long>(
+                        sizeIt->get<double>());
+            }
+
+            auto downloadedIt =
+                item.find("downloaded");
+
+            if (
+                downloadedIt != item.end() &&
+                downloadedIt->is_number()
+            ) {
+                downloaded =
+                    static_cast<long long>(
+                        downloadedIt->get<double>());
+            }
+
+            if (row.complete) {
+                row.progress = 100;
+            }
+            else if (size > 0) {
+                row.progress =
+                    std::clamp(
+                        static_cast<int>(
+                            downloaded * 100 / size),
+                        0,
+                        100);
+            }
+
+            if (
+                row.complete &&
+                !row.remoteId.empty()
+            ) {
+                completedIds.push_back(
+                    row.remoteId);
+            }
+
+            if (row.name.empty())
+                row.name = row.remoteId;
+
+            out.push_back(
+                std::move(row));
+        }
+
+        if (!completedIds.empty()) {
+            auto trees =
+                filesByIds(
+                    completedIds);
+
+            for (auto& row : out) {
+                if (!row.complete)
+                    continue;
+
+                auto found =
+                    trees.find(
+                        row.remoteId);
+
+                if (found != trees.end()) {
+                    row.files =
+                        std::move(
+                            found->second);
+                }
+            }
+        }
+
+        return out;
     }
 
 private:
