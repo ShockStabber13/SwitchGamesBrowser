@@ -1,6 +1,7 @@
 ﻿#include "debrid.hpp"
 #include <curl/curl.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <set>
@@ -8,9 +9,32 @@
 #include <thread>
 
 namespace sgb {
+
+thread_local const std::atomic<bool>*
+    gDebridCancelFlag = nullptr;
+
+void setDebridCancelFlag(
+    const std::atomic<bool>* flag)
+{
+    gDebridCancelFlag = flag;
+}
+
 namespace {
 
 using Json = nlohmann::json;
+
+int debridProgressCallback(
+    void*,
+    curl_off_t,
+    curl_off_t,
+    curl_off_t,
+    curl_off_t)
+{
+    return (
+        gDebridCancelFlag &&
+        gDebridCancelFlag->load()
+    ) ? 1 : 0;
+}
 
 struct Buffer {
     std::string bytes;
@@ -110,6 +134,8 @@ Response request(
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, debridProgressCallback);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, readHeader);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &buffer);
     if (headerList) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
@@ -125,8 +151,25 @@ Response request(
     if (headerList) curl_slist_free_all(headerList);
     curl_easy_cleanup(curl);
 
-    if (rc != CURLE_OK) throw std::runtime_error("Debrid network request failed");
-    return {status, std::move(buffer.bytes), buffer.retryAfter};
+    if (rc != CURLE_OK) {
+        if (
+            rc == CURLE_ABORTED_BY_CALLBACK &&
+            gDebridCancelFlag &&
+            gDebridCancelFlag->load()
+        ) {
+            throw std::runtime_error(
+                "Search cancelled");
+        }
+
+        throw std::runtime_error(
+            "Debrid network request failed");
+    }
+
+    return {
+        status,
+        std::move(buffer.bytes),
+        buffer.retryAfter
+    };
 }
 
 Response requestRetry(
@@ -138,8 +181,29 @@ Response requestRetry(
     for (int attempt = 0; attempt < 4; ++attempt) {
         auto response = request(url, post, headers, body);
         if (response.status != 429 && response.status != 503) return response;
-        const long waitSeconds = response.retryAfter > 0 ? response.retryAfter : std::min<long>(8, 1L << attempt);
-        std::this_thread::sleep_for(std::chrono::seconds(waitSeconds));
+        const long waitSeconds =
+            response.retryAfter > 0
+                ? response.retryAfter
+                : std::min<long>(
+                    8,
+                    1L << attempt);
+
+        for (
+            long tick = 0;
+            tick < waitSeconds * 10;
+            ++tick
+        ) {
+            if (
+                gDebridCancelFlag &&
+                gDebridCancelFlag->load()
+            ) {
+                throw std::runtime_error(
+                    "Search cancelled");
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(100));
+        }
     }
     throw std::runtime_error("Debrid service rate limit");
 }
