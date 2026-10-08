@@ -17,12 +17,14 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 
 namespace sgb {
 namespace {
@@ -144,6 +146,28 @@ struct Package {
 
     Package(const Package&) = delete;
     Package& operator=(const Package&) = delete;
+
+    Package(Package&& other) noexcept
+        : file(other.file),
+          entries(std::move(other.entries))
+    {
+        other.file = nullptr;
+    }
+
+    Package& operator=(Package&& other) noexcept
+    {
+        if (this == &other)
+            return *this;
+
+        if (file)
+            std::fclose(file);
+
+        file = other.file;
+        entries = std::move(other.entries);
+        other.file = nullptr;
+        return *this;
+    }
+
     Package() = default;
 };
 
@@ -246,7 +270,7 @@ void readExact(
     std::size_t size)
 {
     if (
-        std::fseeko(
+        fseeko(
             file,
             static_cast<off_t>(offset),
             SEEK_SET) != 0
@@ -1882,7 +1906,7 @@ ParsedCnmt parseCnmt(
     ) {
         if (
             packaged[i].info.content_type <=
-                NcmContentType_Data
+                NcmContentType_LegalInformation
         ) {
             out.content.push_back(
                 packaged[i].info);
