@@ -1065,7 +1065,11 @@ TorBoxDeviceCheck checkTorBoxDeviceAuth(
         }
         else if (data->is_object()) {
             result.apiKey =
-                valueString(*data, "api_token");
+                valueString(*data, "access_token");
+
+            if (result.apiKey.empty())
+                result.apiKey =
+                    valueString(*data, "api_token");
 
             if (result.apiKey.empty())
                 result.apiKey =
@@ -1083,7 +1087,11 @@ TorBoxDeviceCheck checkTorBoxDeviceAuth(
 
     if (result.apiKey.empty()) {
         result.apiKey =
-            valueString(root, "api_token");
+            valueString(root, "access_token");
+
+        if (result.apiKey.empty())
+            result.apiKey =
+                valueString(root, "api_token");
 
         if (result.apiKey.empty())
             result.apiKey =
@@ -1097,10 +1105,7 @@ TorBoxDeviceCheck checkTorBoxDeviceAuth(
     result.activated =
         !result.apiKey.empty();
 
-    if (
-        result.activated &&
-        result.message.empty()
-    ) {
+    if (result.activated) {
         result.message =
             "TorBox authorized";
     }
