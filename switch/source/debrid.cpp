@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
-#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -787,47 +786,11 @@ private:
     }
 };
 
-std::mutex gAllDebridCheckMutex;
-
-void waitAllDebridInterval(
-    std::chrono::seconds duration)
-{
-    const auto ticks =
-        std::chrono::duration_cast<
-            std::chrono::milliseconds>(
-                duration).count() / 100;
-
-    for (
-        long long i = 0;
-        i < std::max<long long>(ticks, 1);
-        ++i
-    ) {
-        if (
-            gDebridCancelFlag &&
-            gDebridCancelFlag->load()
-        ) {
-            throw std::runtime_error(
-                "Search cancelled");
-        }
-
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(100));
-    }
-}
-
 class AllDebridBackend final : public DebridBackend {
 public:
     explicit AllDebridBackend(DebridConfig config) : config_(std::move(config)) {}
 
     std::map<std::string, DebridTorrentStatus> check(const std::vector<DebridCandidate>& candidates) override {
-        // Live Search can run several provider workers at once. AllDebrid
-        // cache probing works by temporarily uploading magnets, so concurrent
-        // checks can collectively exceed the account's active-magnet limit.
-        // Serialize the complete probe lifecycle: status -> upload -> inspect
-        // -> delete, then let the next provider through.
-        std::unique_lock<std::mutex>
-            checkLock(gAllDebridCheckMutex);
-
         std::map<std::string, DebridTorrentStatus> out;
         const auto existingIds = existingMagnetIds();
 
@@ -839,74 +802,15 @@ public:
                 out[hash] = {};
         }
 
-        // Match the working MoviesAndSeries behavior:
-        // process sequential batches of 10. Temporary search magnets are
-        // deleted after a 3-second grace period instead of immediately.
-        constexpr size_t checkBatchSize = 10;
-
-        for (
-            size_t offset = 0;
-            offset < candidates.size();
-            offset += checkBatchSize
-        ) {
-            const size_t end =
-                std::min(
-                    offset + checkBatchSize,
-                    candidates.size());
-
+        for (size_t offset = 0; offset < candidates.size(); offset += 10) {
+            const size_t end = std::min(offset + 10, candidates.size());
             std::string body;
             for (size_t i = offset; i < end; ++i) {
                 if (!body.empty()) body += "&";
                 body += "magnets%5B%5D=" + encode(candidates[i].magnet);
             }
 
-            Json root;
-            bool uploaded = false;
-
-            for (
-                int attempt = 0;
-                attempt < 3;
-                ++attempt
-            ) {
-                try {
-                    root = apiPost(
-                        "https://api.alldebrid.com/v4/magnet/upload",
-                        body,
-                        "AllDebrid upload");
-
-                    uploaded = true;
-                    break;
-                }
-                catch (const std::exception& e) {
-                    const std::string message =
-                        e.what();
-
-                    const bool retryable =
-                        message.find(
-                            "MAGNET_TOO_MANY_ACTIVE") !=
-                            std::string::npos ||
-                        message.find(
-                            "MAGNET_UPLOAD_FAILED") !=
-                            std::string::npos ||
-                        message.find(
-                            "MAGNET_INTERNAL_ERROR") !=
-                            std::string::npos;
-
-                    if (
-                        !retryable ||
-                        attempt == 2
-                    ) {
-                        throw;
-                    }
-
-                    waitAllDebridInterval(
-                        std::chrono::seconds(5));
-                }
-            }
-
-            if (!uploaded)
-                continue;
-
+            auto root = apiPost("https://api.alldebrid.com/v4/magnet/upload", body, "AllDebrid upload");
             auto data = root.find("data");
             if (data == root.end() || !data->is_object()) continue;
             auto magnets = data->find("magnets");
@@ -982,10 +886,9 @@ public:
                 // everything needed from it instead of waiting for the
                 // rest of the upload batch to finish processing.
                 if (!existedBefore) {
-                    deleteMagnetDelayed(id);
+                    deleteMagnet(id);
                 }
             }
-
         }
         return out;
     }
@@ -1230,62 +1133,10 @@ private:
         };
     }
 
-    Json apiPost(
-        const std::string& url,
-        const std::string& body,
-        const char* label) const
-    {
-        auto root =
-            jsonResponse(
-                requestRetry(
-                    url,
-                    true,
-                    authHeaders(),
-                    body),
-                label);
-
-        if (
-            root.value(
-                "status",
-                "") ==
-                "success"
-        ) {
-            return root;
-        }
-
-        std::string code;
-        std::string message;
-
-        auto error =
-            root.find("error");
-
-        if (
-            error != root.end() &&
-            error->is_object()
-        ) {
-            code =
-                valueString(
-                    *error,
-                    "code");
-
-            message =
-                valueString(
-                    *error,
-                    "message");
-        }
-
-        std::string detail =
-            std::string(label) +
-            " failed";
-
-        if (!code.empty())
-            detail += ": " + code;
-
-        if (!message.empty())
-            detail += " - " + message;
-
-        throw std::runtime_error(
-            detail);
+    Json apiPost(const std::string& url, const std::string& body, const char* label) const {
+        auto root = jsonResponse(requestRetry(url, true, authHeaders(), body), label);
+        if (root.value("status", "") != "success") throw std::runtime_error(std::string(label) + " failed");
+        return root;
     }
 
     std::set<std::string> existingMagnetIds() const {
@@ -1326,58 +1177,17 @@ private:
         return out;
     }
 
-    void deleteMagnetDelayed(
-        const std::string& id) const
-    {
-        if (id.empty())
-            return;
-
-        const DebridConfig config =
-            config_;
-
-        std::thread(
-            [config, id]()
-            {
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(3));
-
-                try {
-                    const std::vector<std::string>
-                        headers = {
-                            "Authorization: Bearer " +
-                                config.apiKey
-                        };
-
-                    const auto response =
-                        requestRetry(
-                            "https://api.alldebrid.com/v4/magnet/delete?id=" +
-                                encode(id),
-                            false,
-                            headers);
-
-                    if (
-                        response.status < 200 ||
-                        response.status >= 300
-                    ) {
-                        return;
-                    }
-
-                    try {
-                        const auto root =
-                            Json::parse(
-                                response.body);
-
-                        (void)root;
-                    }
-                    catch (...) {
-                    }
-                }
-                catch (...) {
-                    // Search cleanup is best-effort and must not discard
-                    // otherwise valid cache results.
-                }
-            }
-        ).detach();
+    void deleteMagnet(const std::string& id) const {
+        if (id.empty()) return;
+        try {
+            (void)apiPost(
+                "https://api.alldebrid.com/v4/magnet/delete",
+                "id=" + encode(id),
+                "AllDebrid delete"
+            );
+        } catch (...) {
+            // A failed cleanup must not discard otherwise useful cache results.
+        }
     }
 };
 
