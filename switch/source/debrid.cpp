@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -786,11 +787,21 @@ private:
     }
 };
 
+std::mutex gAllDebridCheckMutex;
+
 class AllDebridBackend final : public DebridBackend {
 public:
     explicit AllDebridBackend(DebridConfig config) : config_(std::move(config)) {}
 
     std::map<std::string, DebridTorrentStatus> check(const std::vector<DebridCandidate>& candidates) override {
+        // Live Search can run several provider workers at once. AllDebrid
+        // cache probing works by temporarily uploading magnets, so concurrent
+        // checks can collectively exceed the account's active-magnet limit.
+        // Serialize the complete probe lifecycle: status -> upload -> inspect
+        // -> delete, then let the next provider through.
+        std::unique_lock<std::mutex>
+            checkLock(gAllDebridCheckMutex);
+
         std::map<std::string, DebridTorrentStatus> out;
         const auto existingIds = existingMagnetIds();
 
@@ -802,8 +813,17 @@ public:
                 out[hash] = {};
         }
 
-        for (size_t offset = 0; offset < candidates.size(); offset += 10) {
-            const size_t end = std::min(offset + 10, candidates.size());
+        constexpr size_t checkBatchSize = 5;
+
+        for (
+            size_t offset = 0;
+            offset < candidates.size();
+            offset += checkBatchSize
+        ) {
+            const size_t end =
+                std::min(
+                    offset + checkBatchSize,
+                    candidates.size());
             std::string body;
             for (size_t i = offset; i < end; ++i) {
                 if (!body.empty()) body += "&";
