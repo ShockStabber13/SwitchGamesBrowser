@@ -1799,44 +1799,64 @@ int main(int, char**) {
             auto& liveGame =
                 games[liveSearchGameIndex];
 
-            if (
-                liveRows.size() >
-                    liveGame.releases.size()
-            ) {
-                liveGame.releases =
-                    std::move(liveRows);
+            bool addedAny = false;
+
+            for (const auto& release : liveRows) {
+                bool alreadyPresent = false;
 
                 for (
-                    auto& pair :
-                        liveStatuses
+                    const auto& existing :
+                        liveGame.releases
                 ) {
-                    debridStatuses[
-                        pair.first] =
-                            std::move(
-                                pair.second);
+                    if (
+                        !release.infoHash.empty() &&
+                        existing.infoHash ==
+                            release.infoHash
+                    ) {
+                        alreadyPresent = true;
+                        break;
+                    }
+
+                    if (
+                        release.infoHash.empty() &&
+                        existing.magnet ==
+                            release.magnet &&
+                        existing.title ==
+                            release.title
+                    ) {
+                        alreadyPresent = true;
+                        break;
+                    }
                 }
 
-                if (
-                    torrentCursor >=
-                        liveGame.releases.size()
-                ) {
-                    torrentCursor =
-                        liveGame.releases.empty()
-                            ? 0
-                            : liveGame.releases.size() - 1;
-                }
+                if (!alreadyPresent) {
+                    liveGame.releases.push_back(
+                        release);
 
-                if (
-                    page ==
-                        Page::SearchProgress
-                ) {
-                    page =
-                        Page::Torrents;
-
-                    status =
-                        "Debrid-checked results "
-                        "appear as they arrive";
+                    addedAny = true;
                 }
+            }
+
+            for (
+                const auto& pair :
+                    liveStatuses
+            ) {
+                debridStatuses[
+                    pair.first] =
+                        pair.second;
+            }
+
+            if (
+                addedAny &&
+                page ==
+                    Page::SearchProgress
+            ) {
+                page =
+                    Page::Torrents;
+
+                status =
+                    "Debrid-checked results "
+                    "appear as they arrive";
             }
         }
 
@@ -1889,32 +1909,63 @@ int main(int, char**) {
                         result.statuses);
                 }
 
-                games[
-                    liveSearchGameIndex
-                ].releases =
-                    std::move(
-                        result.releases);
+                auto& finishedGame =
+                    games[
+                        liveSearchGameIndex];
 
                 for (
-                    auto& pair :
+                    const auto& release :
+                        result.releases
+                ) {
+                    bool alreadyPresent = false;
+
+                    for (
+                        const auto& existing :
+                            finishedGame.releases
+                    ) {
+                        if (
+                            !release.infoHash.empty() &&
+                            existing.infoHash ==
+                                release.infoHash
+                        ) {
+                            alreadyPresent = true;
+                            break;
+                        }
+
+                        if (
+                            release.infoHash.empty() &&
+                            existing.magnet ==
+                                release.magnet &&
+                            existing.title ==
+                                release.title
+                        ) {
+                            alreadyPresent = true;
+                            break;
+                        }
+                    }
+
+                    if (!alreadyPresent) {
+                        finishedGame.releases.push_back(
+                            release);
+                    }
+                }
+
+                for (
+                    const auto& pair :
                         result.statuses
                 ) {
                     debridStatuses[
                         pair.first] =
-                            std::move(
-                                pair.second);
+                            pair.second;
                 }
 
                 saveDebridStatuses();
 
-                torrentCursor = 0;
                 selectedFiles.clear();
                 status = result.message;
 
                 if (
-                    !games[
-                        liveSearchGameIndex
-                    ].releases.empty()
+                    !finishedGame.releases.empty()
                 ) {
                     page =
                         Page::Torrents;
