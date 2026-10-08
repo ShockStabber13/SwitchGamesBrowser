@@ -2220,7 +2220,16 @@ int main(int, char**) {
                 }
                 else {
                     debridManagerRows.clear();
-                    debridM        } else if (page == Page::DebridManager) {
+                    debridManagerCursor = 0;
+                    debridManagerFileCursor = 0;
+                    debridManagerSelectedFiles.clear();
+                    page = Page::DebridManager;
+                    status = "Loading debrid manager...";
+                    startDebridManagerRefresh();
+                }
+            }
+
+        } else if (page == Page::DebridManager) {
             if (keys & HidNpadButton_B) {
                 settingsCursor = 5;
                 page = Page::Settings;
@@ -2397,15 +2406,6 @@ int main(int, char**) {
                             status = e.what();
                         }
                     }
-                }
-            }
-
-anagerCursor = 0;
-                    debridManagerFileCursor = 0;
-                    debridManagerSelectedFiles.clear();
-                    page = Page::DebridManager;
-                    status = "Loading debrid manager...";
-                    startDebridManagerRefresh();
                 }
             }
 
