@@ -527,6 +527,66 @@ struct Package {
         entries;
 };
 
+struct ContentStorageRecord {
+    NcmContentMetaKey metaRecord;
+    u64 storageId;
+} __attribute__((packed));
+
+static std::atomic<bool>*
+    gInstallCancel = nullptr;
+
+bool cancelled()
+{
+    return
+        gInstallCancel &&
+        gInstallCancel->load();
+}
+
+void checkCancelled()
+{
+    if (cancelled()) {
+        throw std::runtime_error(
+            "Install cancelled");
+    }
+}
+
+std::string lowerAscii(
+    std::string value)
+{
+    for (char& c : value) {
+        const auto uc =
+            static_cast<unsigned char>(c);
+
+        if (uc < 128) {
+            c =
+                static_cast<char>(
+                    std::tolower(uc));
+        }
+    }
+
+    return value;
+}
+
+bool endsWithInsensitive(
+    const std::string& value,
+    const std::string& suffix)
+{
+    if (
+        value.size() <
+            suffix.size()
+    ) {
+        return false;
+    }
+
+    return
+        lowerAscii(
+            value.substr(
+                value.size() -
+                suffix.size())) ==
+        lowerAscii(
+            suffix);
+}
+
 void readExact(
     HttpPackageSource& source,
     u64 offset,
@@ -2510,11 +2570,6 @@ void installPackageCloud(
     std::vector<ParsedCnmt> parsed;
     parsed.reserve(
         allCnmt.size());
-
-    const int totalStages =
-        static_cast<int>(
-            allCnmt.size()) +
-        1;
 
     for (
         std::size_t i = 0;
