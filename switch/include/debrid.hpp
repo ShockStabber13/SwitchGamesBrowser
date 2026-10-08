@@ -145,6 +145,10 @@ public:
         const DebridFile& file
     ) = 0;
 
+    virtual void remove(
+        const std::string& remoteId
+    ) = 0;
+
     virtual std::vector<DebridAccountTorrent> accountTorrents() = 0;
 };
 

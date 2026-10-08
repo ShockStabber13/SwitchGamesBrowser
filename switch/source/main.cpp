@@ -1065,6 +1065,48 @@ struct DebridCheckResult { std::map<std::string, sgb::DebridTorrentStatus> rows;
 struct DebridAddResult { std::string hash; sgb::DebridTorrentStatus state; std::string message; };
 struct DebridManagerResult { std::vector<sgb::DebridAccountTorrent> rows; std::string message; };
 
+struct DebridRemoveResult {
+    std::vector<std::string> removedIds;
+    std::string message;
+};
+
+static DebridRemoveResult liveDebridRemove(
+    const sgb::DebridConfig& config,
+    const std::vector<std::string>& remoteIds)
+{
+    DebridRemoveResult result;
+
+    try {
+        auto backend =
+            sgb::createDebridBackend(config);
+
+        if (!backend)
+            throw std::runtime_error(
+                "Authorize a debrid service first");
+
+        for (const auto& id : remoteIds) {
+            if (id.empty())
+                continue;
+
+            backend->remove(id);
+            result.removedIds.push_back(id);
+        }
+
+        result.message =
+            "Removed " +
+            std::to_string(
+                result.removedIds.size()) +
+            " torrent(s) from " +
+            sgb::debridServiceName(
+                config.service);
+    }
+    catch (const std::exception& e) {
+        result.message = e.what();
+    }
+
+    return result;
+}
+
 struct InstallQueueRow {
     sgb::InstallJob job;
     std::string state = "Queued";
@@ -1467,6 +1509,7 @@ int main(int, char**) {
     std::future<DebridAddResult> pendingDebridAdd;
     std::future<sgb::LiveSearchResult> pendingLiveSearch;
     std::future<DebridManagerResult> pendingDebridManager;
+    std::future<DebridRemoveResult> pendingDebridRemove;
     std::future<sgb::InstallResult> pendingInstall;
     sgb::LiveSearchProgress liveSearchProgress;
 
@@ -1506,6 +1549,9 @@ int main(int, char**) {
 
     std::set<size_t>
         debridManagerSelectedFiles;
+
+    std::set<std::string>
+        debridManagerSelectedTorrents;
 
     auto nextDebridManagerRefresh =
         std::chrono::steady_clock::now();
@@ -1805,6 +1851,42 @@ int main(int, char**) {
             std::chrono::seconds(3);
     };
 
+    auto startDebridRemove = [&]() {
+        if (debridManagerSelectedTorrents.empty()) {
+            status = "Select at least one torrent";
+            return;
+        }
+
+        if (
+            pendingDebridRemove.valid() ||
+            pendingDebridManager.valid()
+        ) {
+            status = "Debrid request already running";
+            return;
+        }
+
+        std::vector<std::string> ids(
+            debridManagerSelectedTorrents.begin(),
+            debridManagerSelectedTorrents.end());
+
+        auto configCopy =
+            debridConfig;
+
+        status =
+            "Removing " +
+            std::to_string(ids.size()) +
+            " torrent(s)...";
+
+        pendingDebridRemove =
+            std::async(
+                std::launch::async,
+                [configCopy, ids]() {
+                    return liveDebridRemove(
+                        configCopy,
+                        ids);
+                });
+    };
+
     auto openScrapeChoice = [&](size_t gameIndex) {
         if (gameIndex >= games.size())
             return;
@@ -2052,6 +2134,71 @@ int main(int, char**) {
                 status =
                     result.message;
             }
+        }
+
+        if (
+            pendingDebridRemove.valid() &&
+            pendingDebridRemove.wait_for(
+                std::chrono::milliseconds(0)) ==
+                std::future_status::ready
+        ) {
+            auto result =
+                pendingDebridRemove.get();
+
+            if (!result.removedIds.empty()) {
+                std::set<std::string> removed(
+                    result.removedIds.begin(),
+                    result.removedIds.end());
+
+                debridManagerRows.erase(
+                    std::remove_if(
+                        debridManagerRows.begin(),
+                        debridManagerRows.end(),
+                        [&](const sgb::DebridAccountTorrent& row) {
+                            return removed.count(
+                                row.remoteId) != 0;
+                        }),
+                    debridManagerRows.end());
+
+                for (
+                    auto it = debridStatuses.begin();
+                    it != debridStatuses.end();
+                ) {
+                    if (
+                        removed.count(
+                            it->second.remoteId) != 0
+                    ) {
+                        it =
+                            debridStatuses.erase(it);
+                    }
+                    else {
+                        ++it;
+                    }
+                }
+
+                saveDebridStatuses();
+
+                for (const auto& id :
+                     result.removedIds) {
+                    debridManagerSelectedTorrents.erase(id);
+                    debridAccountByRemoteId.erase(id);
+                }
+
+                if (
+                    debridManagerCursor >=
+                        debridManagerRows.size()
+                ) {
+                    debridManagerCursor =
+                        debridManagerRows.empty()
+                            ? 0
+                            : debridManagerRows.size() - 1;
+                }
+
+                nextDebridManagerRefresh =
+                    std::chrono::steady_clock::now();
+            }
+
+            status = result.message;
         }
 
         if (
@@ -2812,6 +2959,7 @@ int main(int, char**) {
                     debridManagerCursor = 0;
                     debridManagerFileCursor = 0;
                     debridManagerSelectedFiles.clear();
+                    debridManagerSelectedTorrents.clear();
                     page = Page::DebridManager;
                     status = "Loading debrid manager...";
                     startDebridManagerRefresh();
@@ -2838,6 +2986,7 @@ int main(int, char**) {
 
         } else if (page == Page::DebridManager) {
             if (keys & HidNpadButton_B) {
+                debridManagerSelectedTorrents.clear();
                 settingsCursor = 5;
                 page = Page::Settings;
             }
@@ -2894,7 +3043,59 @@ int main(int, char**) {
                 }
             }
 
+            if (
+                (keys & HidNpadButton_X) &&
+                !debridManagerRows.empty()
+            ) {
+                const std::string id =
+                    debridManagerRows[
+                        debridManagerCursor]
+                        .remoteId;
+
+                if (id.empty()) {
+                    status =
+                        "Torrent ID is unavailable";
+                }
+                else if (
+                    debridManagerSelectedTorrents.count(
+                        id)
+                ) {
+                    debridManagerSelectedTorrents.erase(
+                        id);
+                }
+                else {
+                    debridManagerSelectedTorrents.insert(
+                        id);
+                }
+            }
+
+            if (
+                (keys & HidNpadButton_ZR) &&
+                !debridManagerRows.empty()
+            ) {
+                if (
+                    debridManagerSelectedTorrents.size() ==
+                        debridManagerRows.size()
+                ) {
+                    debridManagerSelectedTorrents.clear();
+                }
+                else {
+                    debridManagerSelectedTorrents.clear();
+
+                    for (const auto& torrent :
+                         debridManagerRows) {
+                        if (!torrent.remoteId.empty())
+                            debridManagerSelectedTorrents.insert(
+                                torrent.remoteId);
+                    }
+                }
+            }
+
             if (keys & HidNpadButton_Y) {
+                startDebridRemove();
+            }
+
+            if (keys & HidNpadButton_Minus) {
                 if (pendingDebridManager.valid()) {
                     status =
                         "Debrid refresh already running";
@@ -3701,7 +3902,9 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "A Open Files  |  Y Refresh  |  L/R Page  |  B Back",
+                std::to_string(
+                    debridManagerSelectedTorrents.size()) +
+                " selected  |  A Files  |  X Toggle  |  ZR All  |  Y Remove  |  - Refresh  |  B Back",
                 32,112,1200,muted
             );
 
@@ -3753,11 +3956,21 @@ int main(int, char**) {
                             true
                         );
 
+                    const bool selected =
+                        debridManagerSelectedTorrents.count(
+                            torrent.remoteId) != 0;
+
                     label(
                         renderer,small,
-                        torrent.name,
+                        std::string(
+                            selected
+                                ? "[x] "
+                                : "[ ] ") +
+                            torrent.name,
                         48,y+6,1160,
-                        white
+                        selected
+                            ? green
+                            : white
                     );
 
                     const std::string downloadText =
@@ -4686,6 +4899,7 @@ int main(int, char**) {
     if (pendingDebridCheck.valid()) pendingDebridCheck.wait();
     if (pendingDebridAdd.valid()) pendingDebridAdd.wait();
     if (pendingDebridManager.valid()) pendingDebridManager.wait();
+    if (pendingDebridRemove.valid()) pendingDebridRemove.wait();
 
     if (
         installCancel &&
