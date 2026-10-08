@@ -839,22 +839,60 @@ public:
                 out[hash] = {};
         }
 
-        // MoviesAndSeries-style pacing: keep batches modest and give
-        // AllDebrid time to release temporary probe magnets before the
-        // next upload request.
+        // AllDebrid caps accounts at 30 active magnets. Cache probing
+        // itself creates temporary magnets, and deletion is not reflected
+        // immediately by the API. Keep one serialized queue and do not start
+        // the next batch until the previous probe magnets have actually left
+        // the active list.
         constexpr size_t checkBatchSize = 10;
+        constexpr size_t maxActiveMagnets = 30;
         constexpr auto checkInterval =
             std::chrono::seconds(5);
 
-        for (
-            size_t offset = 0;
-            offset < candidates.size();
-            offset += checkBatchSize
-        ) {
+        size_t baselineActive =
+            activeMagnetCount();
+
+        if (baselineActive >= maxActiveMagnets) {
+            waitForActiveAtMost(
+                maxActiveMagnets - 1,
+                checkInterval);
+
+            baselineActive =
+                activeMagnetCount();
+        }
+
+        size_t offset = 0;
+
+        while (offset < candidates.size()) {
+            // Wait for temporary magnets from the previous batch to be fully
+            // released. This is the important difference from a blind delay.
+            waitForActiveAtMost(
+                baselineActive,
+                checkInterval);
+
+            const size_t activeNow =
+                activeMagnetCount();
+
+            const size_t freeSlots =
+                activeNow < maxActiveMagnets
+                    ? maxActiveMagnets - activeNow
+                    : 0;
+
+            if (!freeSlots) {
+                throw std::runtime_error(
+                    "AllDebrid account has 30 active magnets");
+            }
+
+            const size_t batchCount =
+                std::min({
+                    checkBatchSize,
+                    freeSlots,
+                    candidates.size() - offset
+                });
+
             const size_t end =
-                std::min(
-                    offset + checkBatchSize,
-                    candidates.size());
+                offset + batchCount;
+
             std::string body;
             for (size_t i = offset; i < end; ++i) {
                 if (!body.empty()) body += "&";
@@ -900,8 +938,19 @@ public:
                         throw;
                     }
 
-                    waitAllDebridInterval(
-                        checkInterval);
+                    if (
+                        message.find(
+                            "MAGNET_TOO_MANY_ACTIVE") !=
+                            std::string::npos
+                    ) {
+                        waitForActiveAtMost(
+                            baselineActive,
+                            checkInterval);
+                    }
+                    else {
+                        waitAllDebridInterval(
+                            checkInterval);
+                    }
                 }
             }
 
@@ -987,10 +1036,13 @@ public:
                 }
             }
 
-            if (end < candidates.size()) {
-                waitAllDebridInterval(
-                    checkInterval);
-            }
+            // Deletions can take a few seconds before AllDebrid stops
+            // counting those magnets as active. Do not let batches stack up.
+            waitForActiveAtMost(
+                baselineActive,
+                checkInterval);
+
+            offset = end;
         }
         return out;
     }
@@ -1291,6 +1343,75 @@ private:
 
         throw std::runtime_error(
             detail);
+    }
+
+    size_t activeMagnetCount() const
+    {
+        auto root =
+            apiPost(
+                "https://api.alldebrid.com/v4.1/magnet/status",
+                "status=active",
+                "AllDebrid active status");
+
+        auto data =
+            root.find("data");
+
+        if (
+            data == root.end() ||
+            !data->is_object()
+        ) {
+            throw std::runtime_error(
+                "AllDebrid active status missing data");
+        }
+
+        auto magnets =
+            data->find("magnets");
+
+        if (
+            magnets == data->end() ||
+            magnets->is_null()
+        ) {
+            return 0;
+        }
+
+        if (magnets->is_array())
+            return magnets->size();
+
+        if (magnets->is_object())
+            return 1;
+
+        throw std::runtime_error(
+            "AllDebrid active status invalid");
+    }
+
+    void waitForActiveAtMost(
+        size_t limit,
+        std::chrono::seconds interval) const
+    {
+        constexpr int maxPolls = 24;
+
+        for (
+            int poll = 0;
+            poll < maxPolls;
+            ++poll
+        ) {
+            const size_t active =
+                activeMagnetCount();
+
+            if (active <= limit)
+                return;
+
+            waitAllDebridInterval(
+                interval);
+        }
+
+        const size_t active =
+            activeMagnetCount();
+
+        throw std::runtime_error(
+            "AllDebrid still has " +
+            std::to_string(active) +
+            " active magnets after waiting");
     }
 
     std::set<std::string> existingMagnetIds() const {
