@@ -341,7 +341,18 @@ public:
 
     std::map<std::string, DebridTorrentStatus> check(const std::vector<DebridCandidate>& candidates) override {
         std::map<std::string, DebridTorrentStatus> out;
-        auto account = accountTorrentMap();
+
+        // Account lookup is useful for marking torrents already added,
+        // but it must not prevent the actual cache check from running.
+        std::map<std::string, DebridTorrentStatus> account;
+
+        try {
+            account =
+                accountTorrentMap();
+        }
+        catch (...) {
+            account.clear();
+        }
 
         std::vector<std::string> hashes;
         std::set<std::string> seen;
@@ -377,13 +388,32 @@ public:
         }
 
         for (const auto& hash : hashes) {
-            auto accountIt = account.find(hash);
-            if (accountIt != account.end() && out.find(hash) == out.end()) {
-                DebridTorrentStatus state = accountIt->second;
-                state.downloaded = true;
-                out[hash] = std::move(state);
+            auto accountIt =
+                account.find(hash);
+
+            if (accountIt == account.end())
+                continue;
+
+            auto& state =
+                out[hash];
+
+            state.downloaded = true;
+
+            if (state.remoteId.empty()) {
+                state.remoteId =
+                    accountIt->second.remoteId;
             }
+
+            if (state.files.empty()) {
+                state.files =
+                    accountIt->second.files;
+            }
+
+            state.cached =
+                state.cached ||
+                accountIt->second.cached;
         }
+
         return out;
     }
 
