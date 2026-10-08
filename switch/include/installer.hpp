@@ -3,6 +3,8 @@
 #include "debrid.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -23,6 +25,15 @@ struct InstallProgress {
     std::atomic<int> percent{0};
     std::atomic<bool> running{false};
 
+    std::atomic<std::uint64_t>
+        bytesDone{0};
+
+    std::atomic<std::uint64_t>
+        bytesTotal{0};
+
+    std::atomic<std::uint64_t>
+        bytesPerSecond{0};
+
     mutable std::mutex mutex;
     std::string stage = "Queued";
     std::string detail;
@@ -32,10 +43,28 @@ struct InstallProgress {
         int newPercent,
         const std::string& newDetail = "");
 
+    void beginTransfer(
+        std::uint64_t totalBytes);
+
+    void addTransferBytes(
+        std::uint64_t bytes);
+
     void snapshot(
         std::string& outStage,
         int& outPercent,
         std::string& outDetail) const;
+
+    void snapshotTransfer(
+        std::uint64_t& outDone,
+        std::uint64_t& outTotal,
+        std::uint64_t& outBytesPerSecond) const;
+
+private:
+    std::chrono::steady_clock::time_point
+        transferSampleStarted_{};
+
+    std::uint64_t
+        transferSampleBytes_ = 0;
 };
 
 struct InstallResult {
