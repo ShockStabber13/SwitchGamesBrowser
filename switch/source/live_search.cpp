@@ -400,6 +400,49 @@ LiveSearchResult runLiveSearch(
             "Searching providers",
             "");
 
+        // Some trackers/indexers treat ':' as query syntax instead of
+        // ordinary title punctuation. Search providers with a normalized
+        // title while keeping the original game title unchanged in the UI.
+        std::string providerQuery;
+        providerQuery.reserve(query.size());
+
+        bool previousSpace = false;
+
+        for (unsigned char ch : query) {
+            if (ch == ':')
+                ch = ' ';
+
+            const bool isSpace =
+                std::isspace(ch) != 0;
+
+            if (isSpace) {
+                if (
+                    providerQuery.empty() ||
+                    previousSpace
+                ) {
+                    continue;
+                }
+
+                providerQuery.push_back(' ');
+                previousSpace = true;
+            }
+            else {
+                providerQuery.push_back(
+                    static_cast<char>(ch));
+                previousSpace = false;
+            }
+        }
+
+        while (
+            !providerQuery.empty() &&
+            providerQuery.back() == ' '
+        ) {
+            providerQuery.pop_back();
+        }
+
+        if (providerQuery.empty())
+            providerQuery = query;
+
         // The Switch does not benefit from one OS thread per provider,
         // especially after adding many Jackett-backed providers.
         // Four workers keeps RAM/socket pressure predictable.
@@ -446,7 +489,8 @@ LiveSearchResult runLiveSearch(
 
                     if (provider) {
                         auto found =
-                            provider->search(query);
+                            provider->search(
+                                providerQuery);
 
                         if (
                             cancelRequested &&
