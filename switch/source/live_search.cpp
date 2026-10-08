@@ -30,6 +30,73 @@ std::string lowerAscii(std::string value) {
     return value;
 }
 
+std::string normalizeInfoHash(std::string hash) {
+    hash = lowerAscii(std::move(hash));
+
+    if (hash.size() == 40) {
+        for (unsigned char ch : hash) {
+            if (!std::isxdigit(ch))
+                return "";
+        }
+
+        return hash;
+    }
+
+    // BitTorrent v1 hashes may also be supplied as 32-character
+    // Base32 BTIH values. Convert them to the 40-character hex form
+    // expected by the debrid backends.
+    if (hash.size() != 32)
+        return "";
+
+    static const char* hex =
+        "0123456789abcdef";
+
+    std::string out;
+    out.reserve(40);
+
+    unsigned int buffer = 0;
+    int bits = 0;
+
+    for (unsigned char ch : hash) {
+        int value = -1;
+
+        if (ch >= 'a' && ch <= 'z')
+            value = ch - 'a';
+        else if (ch >= '2' && ch <= '7')
+            value = 26 + (ch - '2');
+        else
+            return "";
+
+        buffer =
+            (buffer << 5) |
+            static_cast<unsigned int>(value);
+
+        bits += 5;
+
+        while (bits >= 8) {
+            bits -= 8;
+
+            const unsigned int byte =
+                (buffer >> bits) & 0xffU;
+
+            out.push_back(hex[(byte >> 4) & 0x0fU]);
+            out.push_back(hex[byte & 0x0fU]);
+
+            if (bits == 0) {
+                buffer = 0;
+            }
+            else {
+                buffer &=
+                    (1U << bits) - 1U;
+            }
+        }
+    }
+
+    return out.size() == 40
+        ? out
+        : "";
+}
+
 std::string hashFromMagnet(const std::string& magnet) {
     const std::string needle = "xt=urn:btih:";
     const std::string lowered = lowerAscii(magnet);
@@ -41,18 +108,14 @@ std::string hashFromMagnet(const std::string& magnet) {
     pos += needle.size();
     auto end = magnet.find('&', pos);
 
-    std::string hash = magnet.substr(
-        pos,
-        end == std::string::npos
-            ? std::string::npos
-            : end - pos
+    return normalizeInfoHash(
+        magnet.substr(
+            pos,
+            end == std::string::npos
+                ? std::string::npos
+                : end - pos
+        )
     );
-
-    // Current debrid path expects the normal 40-character info hash.
-    if (hash.size() == 40)
-        return lowerAscii(hash);
-
-    return "";
 }
 
 struct Candidate {
@@ -157,16 +220,16 @@ bool resolveExistingHashOrMagnet(
     ProviderResult& item)
 {
     std::string hash =
-        lowerAscii(
+        normalizeInfoHash(
             item.infoHash);
 
-    if (hash.size() != 40) {
+    if (hash.empty()) {
         hash =
             hashFromMagnet(
                 item.magnet);
     }
 
-    if (hash.size() != 40)
+    if (hash.empty())
         return false;
 
     item.infoHash = hash;
@@ -258,7 +321,9 @@ bool processTorrentPayload(
 }
 
 std::string candidateKey(const Candidate& candidate) {
-    std::string hash = lowerAscii(candidate.provider.infoHash);
+    std::string hash =
+        normalizeInfoHash(
+            candidate.provider.infoHash);
 
     if (hash.empty())
         hash = hashFromMagnet(candidate.provider.magnet);
@@ -561,6 +626,75 @@ LiveSearchResult runLiveSearch(
                             setDebridCancelFlag(
                                 cancelRequested.get());
 
+                            auto publishChecked =
+                                [&](size_t freshIndex,
+                                    const std::map<
+                                        std::string,
+                                        DebridTorrentStatus
+                                    >& checked)
+                            {
+                                const std::string hash =
+                                    normalizeInfoHash(
+                                        fresh[freshIndex]
+                                            .provider
+                                            .infoHash);
+
+                                if (hash.empty())
+                                    return;
+
+                                auto state =
+                                    checked.find(hash);
+
+                                if (
+                                    state ==
+                                        checked.end()
+                                ) {
+                                    return;
+                                }
+
+                                bool firstResult = false;
+
+                                {
+                                    std::lock_guard<std::mutex>
+                                        lock(dedupeMutex);
+
+                                    firstResult =
+                                        seen.insert(
+                                            "h:" + hash)
+                                            .second;
+                                }
+
+                                if (!firstResult)
+                                    return;
+
+                                Release release;
+
+                                release.title =
+                                    fresh[freshIndex]
+                                        .provider
+                                        .title;
+
+                                release.magnet =
+                                    fresh[freshIndex]
+                                        .provider
+                                        .magnet;
+
+                                release.infoHash =
+                                    hash;
+
+                                release.source =
+                                    fresh[freshIndex]
+                                        .source;
+
+                                progress.publishResult(
+                                    release,
+                                    hash,
+                                    state->second);
+
+                                progress.validFound
+                                    .fetch_add(1);
+                            };
+
                             while (true) {
 
                                 std::vector<size_t>
@@ -647,24 +781,22 @@ LiveSearchResult runLiveSearch(
                                     DebridTorrentStatus
                                 > checked;
 
+                                bool batchFailed = false;
+                                std::string batchError;
+
                                 try {
                                     checked =
                                         backend->check(
                                             batch);
                                 }
+                                catch (const std::exception& e) {
+                                    batchFailed = true;
+                                    batchError = e.what();
+                                }
                                 catch (...) {
-                                    if (
-                                        cancelRequested &&
-                                        cancelRequested->load()
-                                    ) {
-                                        break;
-                                    }
-
-                                    progress.debridChecked
-                                        .fetch_add(
-                                            indexes.size());
-
-                                    continue;
+                                    batchFailed = true;
+                                    batchError =
+                                        "Unknown debrid error";
                                 }
 
                                 if (
@@ -674,73 +806,99 @@ LiveSearchResult runLiveSearch(
                                     break;
                                 }
 
+                                if (batchFailed) {
+                                    const bool systemicFailure =
+                                        batchError.find(
+                                            "rate limit") !=
+                                                std::string::npos ||
+                                        batchError.find(
+                                            "HTTP 429") !=
+                                                std::string::npos ||
+                                        batchError.find(
+                                            "HTTP 503") !=
+                                                std::string::npos ||
+                                        batchError.find(
+                                            "network request failed") !=
+                                                std::string::npos;
+
+                                    progress.setText(
+                                        "Debrid check failed",
+                                        job.id +
+                                            ": " +
+                                            batchError);
+
+                                    if (systemicFailure) {
+                                        progress.debridChecked
+                                            .fetch_add(
+                                                indexes.size());
+
+                                        continue;
+                                    }
+
+                                    // A malformed/rejected candidate must not
+                                    // discard the other candidates in its batch.
+                                    // Retry the batch one item at a time so good
+                                    // torrents can still be published.
+                                    for (
+                                        size_t freshIndex :
+                                            indexes
+                                    ) {
+                                        if (
+                                            cancelRequested &&
+                                            cancelRequested->load()
+                                        ) {
+                                            break;
+                                        }
+
+                                        std::vector<DebridCandidate>
+                                            single;
+
+                                        single.push_back({
+                                            fresh[freshIndex]
+                                                .provider
+                                                .infoHash,
+                                            fresh[freshIndex]
+                                                .provider
+                                                .magnet
+                                        });
+
+                                        try {
+                                            auto one =
+                                                backend->check(
+                                                    single);
+
+                                            publishChecked(
+                                                freshIndex,
+                                                one);
+                                        }
+                                        catch (const std::exception& e) {
+                                            progress.setText(
+                                                "Debrid item failed",
+                                                job.id +
+                                                    ": " +
+                                                    e.what());
+                                        }
+                                        catch (...) {
+                                            progress.setText(
+                                                "Debrid item failed",
+                                                job.id);
+                                        }
+
+                                        progress.debridChecked
+                                            .fetch_add(1);
+                                    }
+
+                                    continue;
+                                }
 
                                 for (
                                     size_t freshIndex :
                                         indexes
                                 ) {
-                                    const std::string hash =
-                                        lowerAscii(
-                                            fresh[freshIndex]
-                                                .provider
-                                                .infoHash);
-
-                                    auto state =
-                                        checked.find(hash);
-
-                                    if (
-                                        state ==
-                                            checked.end()
-                                    ) {
-                                        continue;
-                                    }
-
-
-                                    bool firstResult = false;
-
-                                    {
-                                        std::lock_guard<std::mutex>
-                                            lock(dedupeMutex);
-
-                                        firstResult =
-                                            seen.insert(
-                                                "h:" + hash)
-                                                .second;
-                                    }
-
-                                    if (!firstResult)
-                                        continue;
-
-
-                                    Release release;
-
-                                    release.title =
-                                        fresh[freshIndex]
-                                            .provider
-                                            .title;
-
-                                    release.magnet =
-                                        fresh[freshIndex]
-                                            .provider
-                                            .magnet;
-
-                                    release.infoHash =
-                                        hash;
-
-                                    release.source =
-                                        fresh[freshIndex]
-                                            .source;
-
-
-                                    progress.publishResult(
-                                        release,
-                                        hash,
-                                        state->second);
-
-                                    progress.validFound
-                                        .fetch_add(1);
+                                    publishChecked(
+                                        freshIndex,
+                                        checked);
                                 }
-
 
                                 progress.debridChecked
                                     .fetch_add(
