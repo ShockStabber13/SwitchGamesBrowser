@@ -619,36 +619,79 @@ public:
             auto magnets = data->find("magnets");
             if (magnets == data->end() || !magnets->is_array()) continue;
 
-            std::vector<std::string> readyIds;
-            std::map<std::string, std::string> idToHash;
-            std::vector<std::string> temporaryIds;
-
             for (const auto& item : *magnets) {
-                if (!item.is_object()) continue;
-                if (item.contains("error") && !item["error"].is_null()) continue;
-                const std::string hash = lowerHash(valueString(item, "hash"));
-                const std::string id = valueString(item, "id");
-                if (hash.empty() || id.empty()) continue;
+                if (!item.is_object())
+                    continue;
+
+                if (
+                    item.contains("error") &&
+                    !item["error"].is_null()
+                ) {
+                    continue;
+                }
+
+                const std::string hash =
+                    lowerHash(
+                        valueString(
+                            item,
+                            "hash"));
+
+                const std::string id =
+                    valueString(
+                        item,
+                        "id");
+
+                if (
+                    hash.empty() ||
+                    id.empty()
+                ) {
+                    continue;
+                }
+
+                const bool existedBefore =
+                    existingIds.count(id) != 0;
 
                 DebridTorrentStatus state;
-                state.cached = item.value("ready", false);
-                state.downloaded = existingIds.count(id) != 0;
-                state.remoteId = state.downloaded ? id : "";
-                out[hash] = state;
-                idToHash[id] = hash;
-                if (state.cached) readyIds.push_back(id);
-                if (!state.downloaded) temporaryIds.push_back(id);
-            }
+                state.cached =
+                    item.value(
+                        "ready",
+                        false);
 
-            if (!readyIds.empty()) {
-                auto trees = filesByIds(readyIds);
-                for (const auto& pair : trees) {
-                    auto h = idToHash.find(pair.first);
-                    if (h != idToHash.end()) out[h->second].files = pair.second;
+                state.downloaded =
+                    existedBefore;
+
+                state.remoteId =
+                    existedBefore
+                        ? id
+                        : "";
+
+                if (state.cached) {
+                    auto trees =
+                        filesByIds({id});
+
+                    auto found =
+                        trees.find(id);
+
+                    if (
+                        found != trees.end()
+                    ) {
+                        state.files =
+                            std::move(
+                                found->second);
+                    }
+                }
+
+                out[hash] =
+                    std::move(state);
+
+                // Search-only uploads must never remain in the account.
+                // Clean each one up immediately after we have extracted
+                // everything needed from it instead of waiting for the
+                // rest of the upload batch to finish processing.
+                if (!existedBefore) {
+                    deleteMagnet(id);
                 }
             }
-
-            for (const auto& id : temporaryIds) deleteMagnet(id);
         }
         return out;
     }
