@@ -1683,7 +1683,8 @@ std::vector<u8> readInstalledCnmt(
             &fs,
             0,
             FsFileSystemType_ContentMeta,
-            path);
+            path,
+            FsContentAttributes_None);
 
     if (R_FAILED(rc))
         throw std::runtime_error(
