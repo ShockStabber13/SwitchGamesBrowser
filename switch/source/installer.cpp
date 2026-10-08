@@ -2474,6 +2474,10 @@ void installEntry(
         [&](const u8* data,
             std::size_t bytes)
         {
+            progress.addTransferBytes(
+                static_cast<std::uint64_t>(
+                    bytes));
+
             while (bytes) {
                 if (
                     cancel &&
@@ -2537,6 +2541,30 @@ void installPackageCloud(
     if (package.entries.empty())
         throw std::runtime_error(
             "Package contains no files");
+
+    std::uint64_t transferTotal = 0;
+
+    for (const auto& entry :
+         package.entries) {
+        if (
+            endsWithInsensitive(
+                entry.name,
+                ".nca") ||
+            endsWithInsensitive(
+                entry.name,
+                ".ncz")
+        ) {
+            transferTotal +=
+                entry.size;
+        }
+    }
+
+    if (!transferTotal)
+        transferTotal =
+            knownSize;
+
+    progress.beginTransfer(
+        transferTotal);
 
     NcmContentStorage storage{};
 
@@ -2833,6 +2861,77 @@ void InstallProgress::set(
     }
 }
 
+void InstallProgress::beginTransfer(
+    std::uint64_t totalBytes)
+{
+    bytesDone.store(0);
+    bytesTotal.store(totalBytes);
+    bytesPerSecond.store(0);
+
+    std::lock_guard<std::mutex>
+        lock(mutex);
+
+    transferSampleStarted_ =
+        std::chrono::steady_clock::now();
+
+    transferSampleBytes_ = 0;
+}
+
+void InstallProgress::addTransferBytes(
+    std::uint64_t bytes)
+{
+    if (!bytes)
+        return;
+
+    const std::uint64_t done =
+        bytesDone.fetch_add(bytes) +
+        bytes;
+
+    const std::uint64_t total =
+        bytesTotal.load();
+
+    if (total) {
+        percent.store(
+            std::clamp(
+                static_cast<int>(
+                    done * 100 /
+                    total),
+                0,
+                99));
+    }
+
+    std::lock_guard<std::mutex>
+        lock(mutex);
+
+    const auto now =
+        std::chrono::steady_clock::now();
+
+    const auto elapsedMs =
+        std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+                now -
+                transferSampleStarted_)
+            .count();
+
+    if (elapsedMs >= 1000) {
+        const std::uint64_t delta =
+            done -
+            transferSampleBytes_;
+
+        bytesPerSecond.store(
+            static_cast<std::uint64_t>(
+                delta * 1000 /
+                static_cast<std::uint64_t>(
+                    elapsedMs)));
+
+        transferSampleBytes_ =
+            done;
+
+        transferSampleStarted_ =
+            now;
+    }
+}
+
 void InstallProgress::snapshot(
     std::string& outStage,
     int& outPercent,
@@ -2846,6 +2945,21 @@ void InstallProgress::snapshot(
 
     outStage = stage;
     outDetail = detail;
+}
+
+void InstallProgress::snapshotTransfer(
+    std::uint64_t& outDone,
+    std::uint64_t& outTotal,
+    std::uint64_t& outBytesPerSecond) const
+{
+    outDone =
+        bytesDone.load();
+
+    outTotal =
+        bytesTotal.load();
+
+    outBytesPerSecond =
+        bytesPerSecond.load();
 }
 
 InstallResult runInstallJob(
