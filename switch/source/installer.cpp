@@ -478,6 +478,56 @@ public:
     }
 
     void readExact(
+        u64 offset,
+        void* output,
+        std::size_t size)
+    {
+        auto* out =
+            static_cast<u8*>(
+                output);
+
+        std::size_t written = 0;
+
+        streamExact(
+            offset,
+            size,
+            [&](const u8* data,
+                std::size_t bytes)
+            {
+                std::memcpy(
+                    out + written,
+                    data,
+                    bytes);
+
+                written += bytes;
+            });
+
+        if (written != size) {
+            throw std::runtime_error(
+                "Cloud package read was incomplete");
+        }
+    }
+
+private:
+    std::string url_;
+
+    std::shared_ptr<std::atomic<bool>>
+        cancel_;
+
+    u64 knownSize_ = 0;
+
+    CURL* curl_ = nullptr;
+};
+
+struct Package {
+    std::shared_ptr<HttpPackageSource>
+        source;
+
+    std::vector<PackageEntry>
+        entries;
+};
+
+void readExact(
     HttpPackageSource& source,
     u64 offset,
     void* output,
