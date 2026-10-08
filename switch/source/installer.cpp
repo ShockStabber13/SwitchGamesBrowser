@@ -1354,7 +1354,7 @@ private:
 
         if (
             expectedSize_ <
-                NcaHeaderSize
+                sizeof(NcaHeader)
         ) {
             throw std::runtime_error(
                 "Invalid NCA size");
