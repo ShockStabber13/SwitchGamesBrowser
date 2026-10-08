@@ -3902,7 +3902,9 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "A Open Files  |  Y Refresh  |  L/R Page  |  B Back",
+                std::to_string(
+                    debridManagerSelectedTorrents.size()) +
+                " selected  |  A Files  |  X Toggle  |  ZR All  |  Y Remove  |  - Refresh  |  B Back",
                 32,112,1200,muted
             );
 
@@ -3954,11 +3956,21 @@ int main(int, char**) {
                             true
                         );
 
+                    const bool selected =
+                        debridManagerSelectedTorrents.count(
+                            torrent.remoteId) != 0;
+
                     label(
                         renderer,small,
-                        torrent.name,
+                        std::string(
+                            selected
+                                ? "[x] "
+                                : "[ ] ") +
+                            torrent.name,
                         48,y+6,1160,
-                        white
+                        selected
+                            ? green
+                            : white
                     );
 
                     const std::string downloadText =
