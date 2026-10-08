@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cctype>
 #include <condition_variable>
-#include <deque>
 #include <future>
 #include <set>
 #include <stdexcept>
@@ -425,7 +424,8 @@ LiveSearchResult runLiveSearch(
         // Four workers keeps RAM/socket pressure predictable.
         constexpr size_t maxWorkers = 4;
         constexpr size_t debridBatchSize = 10;
-        constexpr size_t torrentWorkers = 10;
+        constexpr size_t torrentDownloadWorkers = 10;
+        constexpr size_t torrentProcessingWorkers = 10;
 
         std::atomic<size_t> nextJob{0};
         std::mutex dedupeMutex;
@@ -512,400 +512,346 @@ LiveSearchResult runLiveSearch(
                             debridConfig);
 
                     if (backend) {
+                        for (
+                            size_t offset = 0;
+                            offset < fresh.size();
+                            offset += debridBatchSize
+                        ) {
+                            const size_t end =
+                                std::min(
+                                    offset +
+                                        debridBatchSize,
+                                    fresh.size());
 
-                        // =================================================
-                        // Ready candidates feed straight into this queue.
-                        //
-                        // MoviesAndSeries behaviour is preserved:
-                        // debrid checks are chunks of up to 10.
-                        //
-                        // Difference:
-                        // hash/magnet results do NOT wait for torrent-only
-                        // results to finish downloading.
-                        // =================================================
+                            std::vector<DebridCandidate>
+                                batch;
 
-                        std::deque<size_t> readyQueue;
+                            std::vector<size_t>
+                                resolvedIndexes;
 
-                        std::mutex readyMutex;
-                        std::condition_variable readyCv;
+                            batch.reserve(
+                                end - offset);
 
-                        bool resolvingDone = false;
+                            resolvedIndexes.reserve(
+                                end - offset);
 
+                            // Existing hashes/magnets use the normal
+                            // MoviesAndSeries-style path immediately.
+                            //
+                            // Torrent-only results take one extra
+                            // preprocessing path:
+                            //
+                            //   10 parallel downloads
+                            //       ->
+                            //   10 parallel hash calculations
+                            //       ->
+                            //   generated magnet
+                            //       ->
+                            //   normal debrid flow
 
-                        auto enqueueReady =
-                            [&](size_t index)
-                        {
-                            {
-                                std::lock_guard<std::mutex>
-                                    lock(readyMutex);
+                            const size_t candidateCount =
+                                end - offset;
 
-                                readyQueue.push_back(
-                                    index);
-                            }
+                            std::vector<unsigned char> resolved(
+                                candidateCount,
+                                0);
 
-                            readyCv.notify_one();
-                        };
+                            std::vector<std::string> torrentPayloads(
+                                candidateCount);
 
+                            std::vector<size_t> torrentIndexes;
 
-                        // =================================================
-                        // Debrid consumer
-                        //
-                        // Runs concurrently with .torrent downloading /
-                        // hashing.
-                        // =================================================
+                            torrentIndexes.reserve(
+                                candidateCount);
 
-                        auto debridWorker = [&]() {
-                            while (true) {
-
-                                std::vector<size_t>
-                                    indexes;
-
-                                {
-                                    std::unique_lock<std::mutex>
-                                        lock(readyMutex);
-
-                                    readyCv.wait(
-                                        lock,
-                                        [&]() {
-                                            return
-                                                readyQueue.size() >=
-                                                    debridBatchSize ||
-                                                resolvingDone;
-                                        });
-
-                                    if (
-                                        readyQueue.empty() &&
-                                        resolvingDone
-                                    ) {
-                                        break;
-                                    }
-
-                                    size_t take = 0;
-
-                                    if (
-                                        readyQueue.size() >=
-                                        debridBatchSize
-                                    ) {
-                                        take =
-                                            debridBatchSize;
-                                    }
-                                    else if (resolvingDone) {
-                                        take =
-                                            readyQueue.size();
-                                    }
-
-                                    if (take == 0)
-                                        continue;
-
-                                    indexes.reserve(take);
-
-                                    for (
-                                        size_t i = 0;
-                                        i < take;
-                                        ++i
-                                    ) {
-                                        indexes.push_back(
-                                            readyQueue.front());
-
-                                        readyQueue.pop_front();
-                                    }
-                                }
-
-
-                                std::vector<DebridCandidate>
-                                    batch;
-
-                                batch.reserve(
-                                    indexes.size());
-
-                                for (
-                                    size_t freshIndex :
-                                        indexes
+                            // First separate candidates that already
+                            // have usable hashes/magnets from candidates
+                            // that require downloading a .torrent.
+                            for (
+                                size_t i = offset;
+                                i < end;
+                                ++i
+                            ) {
+                                if (
+                                    resolveExistingHashOrMagnet(
+                                        fresh[i].provider)
                                 ) {
-                                    batch.push_back({
-                                        fresh[freshIndex]
-                                            .provider
-                                            .infoHash,
-
-                                        fresh[freshIndex]
-                                            .provider
-                                            .magnet
-                                    });
-                                }
-
-
-                                std::map<
-                                    std::string,
-                                    DebridTorrentStatus
-                                > checked;
-
-                                try {
-                                    checked =
-                                        backend->check(
-                                            batch);
-                                }
-                                catch (...) {
-                                    progress.debridChecked
-                                        .fetch_add(
-                                            indexes.size());
+                                    resolved[
+                                        i - offset
+                                    ] = 1;
 
                                     continue;
                                 }
 
+                                if (
+                                    !fresh[i]
+                                        .provider
+                                        .torrentUrl
+                                        .empty()
+                                ) {
+                                    torrentIndexes.push_back(i);
+                                }
+                            }
+
+
+                            // =========================================
+                            // Stage 1:
+                            // Download up to 10 .torrent files in
+                            // parallel.
+                            // =========================================
+
+                            if (!torrentIndexes.empty()) {
+                                std::atomic<size_t> nextDownload{
+                                    0
+                                };
+
+                                auto downloadWorker = [&]() {
+                                    while (true) {
+                                        const size_t position =
+                                            nextDownload.fetch_add(1);
+
+                                        if (
+                                            position >=
+                                            torrentIndexes.size()
+                                        ) {
+                                            break;
+                                        }
+
+                                        const size_t i =
+                                            torrentIndexes[
+                                                position
+                                            ];
+
+                                        downloadTorrentPayload(
+                                            fresh[i].provider,
+                                            torrentPayloads[
+                                                i - offset
+                                            ]);
+                                    }
+                                };
+
+                                const size_t downloadWorkerCount =
+                                    std::min(
+                                        torrentDownloadWorkers,
+                                        torrentIndexes.size());
+
+                                std::vector<std::thread>
+                                    downloadThreads;
+
+                                downloadThreads.reserve(
+                                    downloadWorkerCount);
 
                                 for (
-                                    size_t freshIndex :
-                                        indexes
+                                    size_t i = 0;
+                                    i < downloadWorkerCount;
+                                    ++i
                                 ) {
-                                    const std::string hash =
-                                        lowerAscii(
-                                            fresh[freshIndex]
-                                                .provider
-                                                .infoHash);
+                                    downloadThreads.emplace_back(
+                                        downloadWorker);
+                                }
 
-                                    auto state =
-                                        checked.find(hash);
-
-                                    if (
-                                        state ==
-                                            checked.end() ||
-                                        !state->second.cached ||
-                                        !hasSwitchExtension(
-                                            state->second.files)
-                                    ) {
-                                        continue;
-                                    }
-
-
-                                    bool firstResult = false;
-
-                                    {
-                                        std::lock_guard<std::mutex>
-                                            lock(dedupeMutex);
-
-                                        firstResult =
-                                            seen.insert(
-                                                "h:" + hash)
-                                                .second;
-                                    }
-
-                                    if (!firstResult)
-                                        continue;
-
-
-                                    Release release;
-
-                                    release.title =
-                                        fresh[freshIndex]
-                                            .provider
-                                            .title;
-
-                                    release.magnet =
-                                        fresh[freshIndex]
-                                            .provider
-                                            .magnet;
-
-                                    release.infoHash =
-                                        hash;
-
-                                    release.source =
-                                        fresh[freshIndex]
-                                            .source;
-
-
-                                    progress.publishResult(
-                                        release,
-                                        hash,
-                                        state->second);
-
-                                    progress.validFound
-                                        .fetch_add(1);
+                                for (
+                                    auto& thread :
+                                        downloadThreads
+                                ) {
+                                    thread.join();
                                 }
 
 
+                                // =====================================
+                                // Stage 2:
+                                // Process/hash up to 10 downloaded
+                                // torrents in parallel.
+                                // =====================================
+
+                                std::atomic<size_t> nextProcess{
+                                    0
+                                };
+
+                                auto processWorker = [&]() {
+                                    while (true) {
+                                        const size_t position =
+                                            nextProcess.fetch_add(1);
+
+                                        if (
+                                            position >=
+                                            torrentIndexes.size()
+                                        ) {
+                                            break;
+                                        }
+
+                                        const size_t i =
+                                            torrentIndexes[
+                                                position
+                                            ];
+
+                                        if (
+                                            processTorrentPayload(
+                                                fresh[i].provider,
+                                                torrentPayloads[
+                                                    i - offset
+                                                ])
+                                        ) {
+                                            resolved[
+                                                i - offset
+                                            ] = 1;
+                                        }
+                                    }
+                                };
+
+                                const size_t processWorkerCount =
+                                    std::min(
+                                        torrentProcessingWorkers,
+                                        torrentIndexes.size());
+
+                                std::vector<std::thread>
+                                    processThreads;
+
+                                processThreads.reserve(
+                                    processWorkerCount);
+
+                                for (
+                                    size_t i = 0;
+                                    i < processWorkerCount;
+                                    ++i
+                                ) {
+                                    processThreads.emplace_back(
+                                        processWorker);
+                                }
+
+                                for (
+                                    auto& thread :
+                                        processThreads
+                                ) {
+                                    thread.join();
+                                }
+                            }
+
+                            // Preserve original candidate order when
+                            // constructing the debrid batch.
+                            for (
+                                size_t i = offset;
+                                i < end;
+                                ++i
+                            ) {
+                                if (
+                                    !resolved[
+                                        i - offset
+                                    ]
+                                ) {
+                                    continue;
+                                }
+
+                                batch.push_back({
+                                    fresh[i]
+                                        .provider
+                                        .infoHash,
+                                    fresh[i]
+                                        .provider
+                                        .magnet
+                                });
+
+                                resolvedIndexes.push_back(i);
+                            }
+
+                            if (batch.empty()) {
                                 progress.debridChecked
                                     .fetch_add(
-                                        indexes.size());
-                            }
-                        };
-
-
-                        std::thread debridThread(
-                            debridWorker);
-
-
-                        // =================================================
-                        // First send existing hashes/magnets straight
-                        // into the debrid queue.
-                        //
-                        // Torrent-only candidates are separated out.
-                        // =================================================
-
-                        std::vector<size_t>
-                            torrentIndexes;
-
-                        torrentIndexes.reserve(
-                            fresh.size());
-
-
-                        for (
-                            size_t i = 0;
-                            i < fresh.size();
-                            ++i
-                        ) {
-                            if (
-                                resolveExistingHashOrMagnet(
-                                    fresh[i].provider)
-                            ) {
-                                enqueueReady(i);
+                                        end - offset);
                                 continue;
                             }
 
+                            std::map<
+                                std::string,
+                                DebridTorrentStatus
+                            > checked;
 
-                            if (
-                                !fresh[i]
-                                    .provider
-                                    .torrentUrl
-                                    .empty()
-                            ) {
-                                torrentIndexes.push_back(i);
+                            try {
+                                checked =
+                                    backend->check(
+                                        batch);
+                            }
+                            catch (...) {
+                                progress.debridChecked
+                                    .fetch_add(
+                                        end - offset);
                                 continue;
                             }
 
+                            for (
+                                size_t freshIndex :
+                                    resolvedIndexes
+                            ) {
+                                const std::string hash =
+                                    lowerAscii(
+                                        fresh[freshIndex]
+                                            .provider
+                                            .infoHash);
 
-                            // Candidate could not be resolved.
+                                auto state =
+                                    checked.find(hash);
+
+                                if (
+                                    state ==
+                                        checked.end() ||
+                                    !state->second.cached ||
+                                    !hasSwitchExtension(
+                                        state->second.files)
+                                ) {
+                                    continue;
+                                }
+
+                                // Deduplicate only AFTER the
+                                // candidate has reached the debrid
+                                // stage. Raw candidate count remains
+                                // untouched.
+                                bool firstResult = false;
+
+                                {
+                                    std::lock_guard<std::mutex>
+                                        lock(dedupeMutex);
+
+                                    firstResult =
+                                        seen.insert(
+                                            "h:" + hash)
+                                            .second;
+                                }
+
+                                if (!firstResult)
+                                    continue;
+
+                                Release release;
+
+                                release.title =
+                                    fresh[freshIndex]
+                                        .provider
+                                        .title;
+
+                                release.magnet =
+                                    fresh[freshIndex]
+                                        .provider
+                                        .magnet;
+
+                                release.infoHash =
+                                    hash;
+
+                                release.source =
+                                    fresh[freshIndex]
+                                        .source;
+
+                                progress.publishResult(
+                                    release,
+                                    hash,
+                                    state->second);
+
+                                progress.validFound
+                                    .fetch_add(1);
+                            }
+
                             progress.debridChecked
-                                .fetch_add(1);
+                                .fetch_add(
+                                    end - offset);
                         }
-
-
-                        // =================================================
-                        // Torrent-only workers
-                        //
-                        // Each worker does:
-                        //
-                        // download ONE torrent
-                        //       ↓
-                        // immediately hash THAT torrent
-                        //       ↓
-                        // generate magnet
-                        //       ↓
-                        // immediately feed debrid queue
-                        //
-                        // There is NO download-all -> wait -> hash-all
-                        // barrier anymore.
-                        // =================================================
-
-                        std::atomic<size_t>
-                            nextTorrent{0};
-
-
-                        auto torrentWorker = [&]() {
-                            while (true) {
-
-                                const size_t position =
-                                    nextTorrent.fetch_add(1);
-
-                                if (
-                                    position >=
-                                    torrentIndexes.size()
-                                ) {
-                                    break;
-                                }
-
-
-                                const size_t i =
-                                    torrentIndexes[
-                                        position
-                                    ];
-
-
-                                std::string torrent;
-
-
-                                if (
-                                    !downloadTorrentPayload(
-                                        fresh[i].provider,
-                                        torrent)
-                                ) {
-                                    progress.debridChecked
-                                        .fetch_add(1);
-
-                                    continue;
-                                }
-
-
-                                // Hash this torrent immediately after
-                                // this individual download finishes.
-                                if (
-                                    !processTorrentPayload(
-                                        fresh[i].provider,
-                                        torrent)
-                                ) {
-                                    progress.debridChecked
-                                        .fetch_add(1);
-
-                                    continue;
-                                }
-
-
-                                // It can now enter the exact same
-                                // debrid path as native hash/magnet
-                                // results.
-                                enqueueReady(i);
-                            }
-                        };
-
-
-                        const size_t torrentWorkerCount =
-                            std::min(
-                                torrentWorkers,
-                                torrentIndexes.size());
-
-
-                        std::vector<std::thread>
-                            torrentThreads;
-
-                        torrentThreads.reserve(
-                            torrentWorkerCount);
-
-
-                        for (
-                            size_t i = 0;
-                            i < torrentWorkerCount;
-                            ++i
-                        ) {
-                            torrentThreads.emplace_back(
-                                torrentWorker);
-                        }
-
-
-                        for (
-                            auto& thread :
-                                torrentThreads
-                        ) {
-                            thread.join();
-                        }
-
-
-                        // All candidates have now either:
-                        //
-                        // - entered the ready queue, or
-                        // - failed torrent resolution.
-                        //
-                        // Allow the final partial MoviesAndSeries
-                        // batch (<10) to flush.
-
-                        {
-                            std::lock_guard<std::mutex>
-                                lock(readyMutex);
-
-                            resolvingDone = true;
-                        }
-
-                        readyCv.notify_all();
-
-                        debridThread.join();
                     }
                     else {
                         progress.debridChecked
@@ -913,6 +859,7 @@ LiveSearchResult runLiveSearch(
                                 fresh.size());
                     }
                 }
+
                 progress.providersDone.fetch_add(1);
             }
         };
@@ -957,7 +904,6 @@ LiveSearchResult runLiveSearch(
     return output;
 }
 } // namespace sgb
-
 
 
 
