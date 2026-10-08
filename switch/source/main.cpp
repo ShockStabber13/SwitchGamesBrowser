@@ -733,6 +733,187 @@ static void label(SDL_Renderer* renderer, TTF_Font* font, std::string text, int 
     SDL_Rect target{x,y,surface->w,surface->h}; SDL_FreeSurface(surface);
     if (texture) { SDL_RenderCopy(renderer, texture, nullptr, &target); SDL_DestroyTexture(texture); }
 }
+
+static void marqueeLabel(
+    SDL_Renderer* renderer,
+    TTF_Font* font,
+    const std::string& text,
+    int x,
+    int y,
+    int width,
+    bool focused,
+    SDL_Color colour = white)
+{
+    if (text.empty())
+        return;
+
+    int textWidth = 0;
+    int textHeight = 0;
+
+    if (
+        TTF_SizeUTF8(
+            font,
+            text.c_str(),
+            &textWidth,
+            &textHeight) != 0
+    ) {
+        return;
+    }
+
+    if (
+        !focused ||
+        textWidth <= width
+    ) {
+        label(
+            renderer,
+            font,
+            text,
+            x,
+            y,
+            width,
+            colour);
+
+        return;
+    }
+
+    SDL_Surface* surface =
+        TTF_RenderUTF8_Blended(
+            font,
+            text.c_str(),
+            colour);
+
+    if (!surface)
+        return;
+
+    SDL_Texture* texture =
+        SDL_CreateTextureFromSurface(
+            renderer,
+            surface);
+
+    if (!texture) {
+        SDL_FreeSurface(surface);
+        return;
+    }
+
+    const int overflow =
+        std::max(
+            0,
+            surface->w - width);
+
+    constexpr Uint32 pauseMs = 800;
+    constexpr float pixelsPerSecond = 55.0f;
+
+    const Uint32 travelMs =
+        overflow > 0
+            ? static_cast<Uint32>(
+                (static_cast<float>(overflow) /
+                    pixelsPerSecond) *
+                1000.0f)
+            : 0;
+
+    const Uint32 cycleMs =
+        pauseMs * 2 +
+        travelMs * 2;
+
+    static std::string lastFocusedKey;
+    static Uint32 focusStarted = 0;
+
+    const std::string focusKey =
+        text + "|" +
+        std::to_string(x) + "|" +
+        std::to_string(y) + "|" +
+        std::to_string(width);
+
+    const Uint32 now =
+        SDL_GetTicks();
+
+    if (lastFocusedKey != focusKey) {
+        lastFocusedKey = focusKey;
+        focusStarted = now;
+    }
+
+    const Uint32 elapsed =
+        now - focusStarted;
+
+    const Uint32 phase =
+        cycleMs > 0
+            ? elapsed % cycleMs
+            : 0;
+
+    int offset = 0;
+
+    if (phase < pauseMs) {
+        offset = 0;
+    }
+    else if (phase < pauseMs + travelMs) {
+        const float progress =
+            static_cast<float>(
+                phase - pauseMs) /
+            static_cast<float>(
+                std::max<Uint32>(
+                    1,
+                    travelMs));
+
+        offset =
+            static_cast<int>(
+                progress *
+                static_cast<float>(
+                    overflow));
+    }
+    else if (
+        phase <
+            pauseMs +
+            travelMs +
+            pauseMs
+    ) {
+        offset = overflow;
+    }
+    else {
+        const float progress =
+            static_cast<float>(
+                phase -
+                (
+                    pauseMs +
+                    travelMs +
+                    pauseMs
+                )) /
+            static_cast<float>(
+                std::max<Uint32>(
+                    1,
+                    travelMs));
+
+        offset =
+            overflow -
+            static_cast<int>(
+                progress *
+                static_cast<float>(
+                    overflow));
+    }
+
+    SDL_Rect source{
+        offset,
+        0,
+        width,
+        surface->h
+    };
+
+    SDL_Rect target{
+        x,
+        y,
+        width,
+        surface->h
+    };
+
+    SDL_FreeSurface(surface);
+
+    SDL_RenderCopy(
+        renderer,
+        texture,
+        &source,
+        &target);
+
+    SDL_DestroyTexture(texture);
+}
 static std::string score(const sgb::Game& g) {
     if (g.rating < 0) return "Unrated";
     return std::to_string(static_cast<int>(g.rating + .5)) + "/100  (" + std::to_string(g.ratingCount) + " votes)";
@@ -3879,13 +4060,14 @@ int main(int, char**) {
                         ) +
                         provider.id;
 
-                    label(
+                    marqueeLabel(
                         renderer,
                         small,
                         text,
                         52,
                         y + 15,
                         1100,
+                        index == providerCursor,
                         enabled
                             ? green
                             : white
@@ -3960,7 +4142,7 @@ int main(int, char**) {
                         debridManagerSelectedTorrents.count(
                             torrent.remoteId) != 0;
 
-                    label(
+                    marqueeLabel(
                         renderer,small,
                         std::string(
                             selected
@@ -3968,6 +4150,7 @@ int main(int, char**) {
                                 : "[ ] ") +
                             torrent.name,
                         48,y+6,1160,
+                        index == debridManagerCursor,
                         selected
                             ? green
                             : white
@@ -4066,7 +4249,7 @@ int main(int, char**) {
                         debridManagerSelectedFiles.count(
                             index) != 0;
 
-                    label(
+                    marqueeLabel(
                         renderer,small,
                         std::string(
                             selected
@@ -4074,6 +4257,8 @@ int main(int, char**) {
                                 : "[ ] ") +
                             files[index].name,
                         48,y+10,1150,
+                        index ==
+                            debridManagerFileCursor,
                         selected
                             ? green
                             : white
@@ -4160,11 +4345,13 @@ int main(int, char**) {
                                 " - " +
                                 row.job.file.name;
 
-                    label(
+                    marqueeLabel(
                         renderer,
                         small,
                         title,
                         48,y+6,1160,
+                        index ==
+                            installManagerCursor,
                         white
                     );
 
@@ -4321,11 +4508,12 @@ int main(int, char**) {
                         " total";
                 }
 
-                label(
+                marqueeLabel(
                     renderer,
                     small,
                     labels[i],
                     52,y+14,780,
+                    i == settingsCursor,
                     i == settingsCursor
                         ? green
                         : white
@@ -4625,10 +4813,11 @@ int main(int, char**) {
                         );
                     }
 
-                    label(
+                    marqueeLabel(
                         renderer,small,
                         rel.title,
-                        48,y+7,1150
+                        48,y+7,1150,
+                        index == torrentCursor
                     );
 
                     auto st =
@@ -4737,7 +4926,17 @@ int main(int, char**) {
                 rect(renderer,box,SDL_Color{18,18,18,255});
                 if (index == fileCursor) { rect(renderer,box,green,true); rect(renderer,{33,y+1,1214,44},green,true); }
                 std::string mark = selectedFiles.count(index) ? "[x] " : "[ ] ";
-                label(renderer,small,mark + files[index],48,y+11,1150,selectedFiles.count(index) ? green : white);
+                marqueeLabel(
+                    renderer,
+                    small,
+                    mark + files[index],
+                    48,
+                    y + 11,
+                    1150,
+                    index == fileCursor,
+                    selectedFiles.count(index)
+                        ? green
+                        : white);
             }
             if (files.empty()) label(renderer,big,"No file list available for this torrent",32,300,1200,muted);
         } else {
@@ -4836,12 +5035,13 @@ int main(int, char**) {
                 }
 
 
-                label(
+                marqueeLabel(
                     renderer,small,
                     g.title,
                     x + 10,
                     y + 220,
-                    212
+                    212,
+                    start + slot == cursor
                 );
 
                 label(
