@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -135,172 +137,367 @@ struct PackageEntry {
     u64 size = 0;
 };
 
-struct Package {
-    FILE* file = nullptr;
-    std::vector<PackageEntry> entries;
+struct HttpRangeContext {
+    std::function<void(
+        const u8*,
+        std::size_t)> consume;
 
-    ~Package() {
-        if (file)
-            std::fclose(file);
-    }
+    std::shared_ptr<std::atomic<bool>>
+        cancel;
 
-    Package(const Package&) = delete;
-    Package& operator=(const Package&) = delete;
+    std::exception_ptr error;
 
-    Package(Package&& other) noexcept
-        : file(other.file),
-          entries(std::move(other.entries))
-    {
-        other.file = nullptr;
-    }
-
-    Package& operator=(Package&& other) noexcept
-    {
-        if (this == &other)
-            return *this;
-
-        if (file)
-            std::fclose(file);
-
-        file = other.file;
-        entries = std::move(other.entries);
-        other.file = nullptr;
-        return *this;
-    }
-
-    Package() = default;
+    u64 expected = 0;
+    u64 received = 0;
 };
 
-struct ContentStorageRecord {
-    NcmContentMetaKey metaRecord;
-    u64 storageId;
-} __attribute__((packed));
-
-static std::atomic<bool>* gInstallCancel = nullptr;
-static InstallProgress* gInstallProgress = nullptr;
-static int gInstallBasePercent = 0;
-static int gInstallSpanPercent = 100;
-
-bool cancelled()
+size_t httpRangeWrite(
+    char* data,
+    size_t size,
+    size_t count,
+    void* opaque)
 {
-    return gInstallCancel &&
-        gInstallCancel->load();
-}
+    auto* context =
+        static_cast<HttpRangeContext*>(
+            opaque);
 
-void checkCancelled()
-{
-    if (cancelled())
-        throw std::runtime_error("Install cancelled");
-}
-
-std::string lowerAscii(std::string value)
-{
-    for (char& c : value) {
-        const auto uc =
-            static_cast<unsigned char>(c);
-
-        if (uc < 128)
-            c = static_cast<char>(
-                std::tolower(uc));
-    }
-
-    return value;
-}
-
-bool endsWithInsensitive(
-    const std::string& value,
-    const std::string& suffix)
-{
-    if (value.size() < suffix.size())
-        return false;
-
-    return lowerAscii(
-        value.substr(
-            value.size() -
-            suffix.size())) ==
-        lowerAscii(suffix);
-}
-
-std::string basenameOf(
-    const std::string& value)
-{
-    const auto pos =
-        value.find_last_of("/\\");
-
-    return pos == std::string::npos
-        ? value
-        : value.substr(pos + 1);
-}
-
-std::string safeFilename(
-    std::string value)
-{
-    value = basenameOf(value);
-
-    if (value.empty())
-        value = "install-package.nsp";
-
-    for (char& c : value) {
-        const unsigned char uc =
-            static_cast<unsigned char>(c);
-
-        if (
-            uc < 32 ||
-            c == '<' ||
-            c == '>' ||
-            c == ':' ||
-            c == '"' ||
-            c == '/' ||
-            c == '\\' ||
-            c == '|' ||
-            c == '?' ||
-            c == '*'
-        ) {
-            c = '_';
-        }
-    }
-
-    return value;
-}
-
-void readExact(
-    FILE* file,
-    u64 offset,
-    void* output,
-    std::size_t size)
-{
     if (
-        fseeko(
-            file,
-            static_cast<off_t>(offset),
-            SEEK_SET) != 0
+        context->cancel &&
+        context->cancel->load()
     ) {
-        throw std::runtime_error(
-            "Package seek failed");
+        return 0;
     }
 
     if (
         size &&
-        std::fread(
-            output,
-            1,
-            size,
-            file) != size
+        count >
+            SIZE_MAX / size
     ) {
-        throw std::runtime_error(
-            "Package read failed");
+        return 0;
     }
+
+    const std::size_t bytes =
+        size * count;
+
+    if (
+        context->received >
+            context->expected ||
+        bytes >
+            context->expected -
+                context->received
+    ) {
+        // Never accept data outside the requested byte range.
+        // This also prevents a server which ignored Range from
+        // making us download the complete package.
+        return 0;
+    }
+
+    try {
+        if (context->consume) {
+            context->consume(
+                reinterpret_cast<
+                    const u8*>(data),
+                bytes);
+        }
+    }
+    catch (...) {
+        context->error =
+            std::current_exception();
+
+        return 0;
+    }
+
+    context->received +=
+        bytes;
+
+    return bytes;
+}
+
+int httpRangeProgress(
+    void* opaque,
+    curl_off_t,
+    curl_off_t,
+    curl_off_t,
+    curl_off_t)
+{
+    auto* context =
+        static_cast<HttpRangeContext*>(
+            opaque);
+
+    return
+        context->cancel &&
+        context->cancel->load()
+            ? 1
+            : 0;
+}
+
+class HttpPackageSource {
+public:
+    HttpPackageSource(
+        std::string url,
+        std::shared_ptr<std::atomic<bool>>
+            cancel,
+        u64 knownSize)
+        : url_(std::move(url)),
+          cancel_(std::move(cancel)),
+          knownSize_(knownSize)
+    {
+        curl_ =
+            curl_easy_init();
+
+        if (!curl_)
+            throw std::runtime_error(
+                "Cloud install initialization failed");
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_URL,
+            url_.c_str());
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_USERAGENT,
+            "SwitchGamesBrowser/0.4");
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_FOLLOWLOCATION,
+            1L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_MAXREDIRS,
+            8L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_CONNECTTIMEOUT,
+            20L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_TIMEOUT,
+            0L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_NOSIGNAL,
+            1L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_LOW_SPEED_LIMIT,
+            1L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_LOW_SPEED_TIME,
+            30L);
+
+        // Keep the network side buffered while the NCA writer consumes
+        // the stream. libcurl may clamp this to its supported maximum.
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_BUFFERSIZE,
+            512L * 1024L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_ACCEPT_ENCODING,
+            "identity");
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_PROTOCOLS,
+            CURLPROTO_HTTP |
+                CURLPROTO_HTTPS);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_REDIR_PROTOCOLS,
+            CURLPROTO_HTTP |
+                CURLPROTO_HTTPS);
+
+#ifdef __SWITCH__
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_CAINFO,
+            "romfs:/cacert.pem");
+#endif
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_SSL_VERIFYPEER,
+            1L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_SSL_VERIFYHOST,
+            2L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_WRITEFUNCTION,
+            httpRangeWrite);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_NOPROGRESS,
+            0L);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_XFERINFOFUNCTION,
+            httpRangeProgress);
+    }
+
+    ~HttpPackageSource()
+    {
+        if (curl_) {
+            curl_easy_cleanup(
+                curl_);
+        }
+    }
+
+    HttpPackageSource(
+        const HttpPackageSource&) = delete;
+
+    HttpPackageSource& operator=(
+        const HttpPackageSource&) = delete;
+
+    void streamExact(
+        u64 offset,
+        u64 size,
+        const std::function<void(
+            const u8*,
+            std::size_t)>& consume)
+    {
+        if (!size)
+            return;
+
+        if (
+            offset >
+                UINT64_MAX - size ||
+            (
+                knownSize_ &&
+                (
+                    offset > knownSize_ ||
+                    size > knownSize_ - offset
+                )
+            )
+        ) {
+            throw std::runtime_error(
+                "Package range is outside the cloud file");
+        }
+
+        if (
+            cancel_ &&
+            cancel_->load()
+        ) {
+            throw std::runtime_error(
+                "Install cancelled");
+        }
+
+        const std::string range =
+            std::to_string(offset) +
+            "-" +
+            std::to_string(
+                offset + size - 1);
+
+        HttpRangeContext context;
+        context.consume = consume;
+        context.cancel = cancel_;
+        context.expected = size;
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_RANGE,
+            range.c_str());
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_WRITEDATA,
+            &context);
+
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_XFERINFODATA,
+            &context);
+
+        const CURLcode result =
+            curl_easy_perform(
+                curl_);
+
+        long httpStatus = 0;
+
+        curl_easy_getinfo(
+            curl_,
+            CURLINFO_RESPONSE_CODE,
+            &httpStatus);
+
+        if (
+            cancel_ &&
+            cancel_->load()
+        ) {
+            throw std::runtime_error(
+                "Install cancelled");
+        }
+
+        if (context.error) {
+            std::rethrow_exception(
+                context.error);
+        }
+
+        if (httpStatus == 200) {
+            throw std::runtime_error(
+                "Cloud source does not support ranged reads");
+        }
+
+        if (httpStatus != 206) {
+            throw std::runtime_error(
+                "Cloud read HTTP " +
+                std::to_string(
+                    httpStatus));
+        }
+
+        if (result != CURLE_OK) {
+            throw std::runtime_error(
+                std::string(
+                    "Cloud read failed: ") +
+                curl_easy_strerror(
+                    result));
+        }
+
+        if (
+            context.received !=
+                context.expected
+        ) {
+            throw std::runtime_error(
+                "Cloud package read was incomplete");
+        }
+    }
+
+    void readExact(
+    HttpPackageSource& source,
+    u64 offset,
+    void* output,
+    std::size_t size)
+{
+    source.readExact(
+        offset,
+        output,
+        size);
 }
 
 std::vector<u8> readBytes(
-    FILE* file,
+    HttpPackageSource& source,
     u64 offset,
     std::size_t size)
 {
     std::vector<u8> out(size);
 
     readExact(
-        file,
+        source,
         offset,
         out.data(),
         out.size());
@@ -337,23 +534,16 @@ std::string entryString(
 }
 
 Package openPfs0(
-    const std::string& path)
+    const std::shared_ptr<
+        HttpPackageSource>& source)
 {
     Package package;
-
-    package.file =
-        std::fopen(
-            path.c_str(),
-            "rb");
-
-    if (!package.file)
-        throw std::runtime_error(
-            "Unable to open downloaded package");
+    package.source = source;
 
     Pfs0Header header{};
 
     readExact(
-        package.file,
+        *package.source,
         0,
         &header,
         sizeof(header));
@@ -376,7 +566,7 @@ Package openPfs0(
         header.numFiles);
 
     readExact(
-        package.file,
+        *package.source,
         sizeof(header),
         rows.data(),
         rows.size() *
@@ -389,7 +579,7 @@ Package openPfs0(
 
     auto strings =
         readBytes(
-            package.file,
+            *package.source,
             stringOffset,
             header.stringTableSize);
 
@@ -415,18 +605,11 @@ Package openPfs0(
 }
 
 Package openXci(
-    const std::string& path)
+    const std::shared_ptr<
+        HttpPackageSource>& source)
 {
     Package package;
-
-    package.file =
-        std::fopen(
-            path.c_str(),
-            "rb");
-
-    if (!package.file)
-        throw std::runtime_error(
-            "Unable to open downloaded package");
+    package.source = source;
 
     constexpr u64 rootOffset =
         0xf000;
@@ -434,7 +617,7 @@ Package openXci(
     Hfs0Header root{};
 
     readExact(
-        package.file,
+        *package.source,
         rootOffset,
         &root,
         sizeof(root));
@@ -457,7 +640,7 @@ Package openXci(
         root.numFiles);
 
     readExact(
-        package.file,
+        *package.source,
         rootOffset +
             sizeof(root),
         rootRows.data(),
@@ -472,7 +655,7 @@ Package openXci(
 
     auto rootStrings =
         readBytes(
-            package.file,
+            *package.source,
             rootStringsOffset,
             root.stringTableSize);
 
@@ -506,7 +689,7 @@ Package openXci(
     Hfs0Header secure{};
 
     readExact(
-        package.file,
+        *package.source,
         secureOffset,
         &secure,
         sizeof(secure));
@@ -529,7 +712,7 @@ Package openXci(
         secure.numFiles);
 
     readExact(
-        package.file,
+        *package.source,
         secureOffset +
             sizeof(secure),
         rows.data(),
@@ -544,7 +727,7 @@ Package openXci(
 
     auto strings =
         readBytes(
-            package.file,
+            *package.source,
             stringsOffset,
             secure.stringTableSize);
 
@@ -570,20 +753,33 @@ Package openXci(
 }
 
 Package openPackage(
-    const std::string& path)
+    const std::string& url,
+    const std::string& name,
+    const std::shared_ptr<
+        std::atomic<bool>>& cancel,
+    u64 knownSize)
 {
+    auto source =
+        std::make_shared<
+            HttpPackageSource>(
+                url,
+                cancel,
+                knownSize);
+
     if (
-        endsWithInsensitive(path, ".nsp") ||
-        endsWithInsensitive(path, ".nsz")
+        endsWithInsensitive(name, ".nsp") ||
+        endsWithInsensitive(name, ".nsz")
     ) {
-        return openPfs0(path);
+        return openPfs0(
+            source);
     }
 
     if (
-        endsWithInsensitive(path, ".xci") ||
-        endsWithInsensitive(path, ".xcz")
+        endsWithInsensitive(name, ".xci") ||
+        endsWithInsensitive(name, ".xcz")
     ) {
-        return openXci(path);
+        return openXci(
+            source);
     }
 
     throw std::runtime_error(
@@ -2119,11 +2315,8 @@ void installEntry(
     int basePercent,
     int spanPercent)
 {
-    std::unique_ptr<u8[]> buffer(
-        new u8[4 * 1024 * 1024]);
-
-    const std::size_t chunkSize =
-        4 * 1024 * 1024;
+    constexpr std::size_t streamBufferSize =
+        1024 * 1024;
 
     NcaOutput output(
         storage,
@@ -2133,50 +2326,88 @@ void installEntry(
         basePercent,
         spanPercent);
 
-    u64 offset = 0;
+    std::vector<u8> buffer;
+    buffer.reserve(
+        streamBufferSize);
 
-    while (offset < entry.size) {
-        if (
-            cancel &&
-            cancel->load()
-        ) {
-            throw std::runtime_error(
-                "Install cancelled");
-        }
-
-        const std::size_t chunk =
-            static_cast<std::size_t>(
-                std::min<u64>(
-                    chunkSize,
-                    entry.size -
-                        offset));
-
-        readExact(
-            package.file,
-            entry.offset +
-                offset,
-            buffer.get(),
-            chunk);
+    auto flush =
+        [&]()
+    {
+        if (buffer.empty())
+            return;
 
         output.write(
-            buffer.get(),
-            chunk);
+            buffer.data(),
+            buffer.size());
 
-        offset += chunk;
-    }
+        buffer.clear();
+    };
 
+    package.source->streamExact(
+        entry.offset,
+        entry.size,
+        [&](const u8* data,
+            std::size_t bytes)
+        {
+            while (bytes) {
+                if (
+                    cancel &&
+                    cancel->load()
+                ) {
+                    throw std::runtime_error(
+                        "Install cancelled");
+                }
+
+                const std::size_t available =
+                    streamBufferSize -
+                    buffer.size();
+
+                const std::size_t take =
+                    std::min(
+                        available,
+                        bytes);
+
+                buffer.insert(
+                    buffer.end(),
+                    data,
+                    data + take);
+
+                data += take;
+                bytes -= take;
+
+                if (
+                    buffer.size() ==
+                        streamBufferSize
+                ) {
+                    flush();
+                }
+            }
+        });
+
+    flush();
     output.finish();
 }
 
-void installPackageFile(
-    const std::string& path,
+void installPackageCloud(
+    const std::string& url,
+    const std::string& name,
+    u64 knownSize,
     InstallProgress& progress,
     const std::shared_ptr<std::atomic<bool>>& cancel)
 {
     InstallServices services;
 
+    progress.set(
+        "Installing",
+        0,
+        "Opening cloud package");
+
     Package package =
-        openPackage(path);
+        openPackage(
+            url,
+            name,
+            cancel,
+            knownSize);
 
     if (package.entries.empty())
         throw std::runtime_error(
@@ -2424,14 +2655,14 @@ void installPackageFile(
 
         auto ticket =
             readBytes(
-                package.file,
+                *package.source,
                 tickets[i]->offset,
                 static_cast<std::size_t>(
                     tickets[i]->size));
 
         auto cert =
             readBytes(
-                package.file,
+                *package.source,
                 certs[i]->offset,
                 static_cast<std::size_t>(
                     certs[i]->size));
@@ -2457,236 +2688,6 @@ void installPackageFile(
         "Finalizing");
 }
 
-struct DownloadContext {
-    FILE* file = nullptr;
-    InstallProgress* progress = nullptr;
-    std::shared_ptr<std::atomic<bool>>
-        cancel;
-
-    curl_off_t total = 0;
-    curl_off_t current = 0;
-};
-
-size_t downloadWrite(
-    char* data,
-    size_t size,
-    size_t count,
-    void* opaque)
-{
-    auto* context =
-        static_cast<DownloadContext*>(
-            opaque);
-
-    if (
-        context->cancel &&
-        context->cancel->load()
-    ) {
-        return 0;
-    }
-
-    if (
-        size &&
-        count >
-            SIZE_MAX / size
-    ) {
-        return 0;
-    }
-
-    const size_t bytes =
-        size * count;
-
-    return std::fwrite(
-        data,
-        1,
-        bytes,
-        context->file);
-}
-
-int downloadProgress(
-    void* opaque,
-    curl_off_t total,
-    curl_off_t current,
-    curl_off_t,
-    curl_off_t)
-{
-    auto* context =
-        static_cast<DownloadContext*>(
-            opaque);
-
-    if (
-        context->cancel &&
-        context->cancel->load()
-    ) {
-        return 1;
-    }
-
-    context->total = total;
-    context->current = current;
-
-    int percent = 0;
-
-    if (total > 0) {
-        percent =
-            static_cast<int>(
-                current * 100 /
-                total);
-    }
-
-    if (context->progress) {
-        context->progress->set(
-            "Downloading",
-            std::clamp(
-                percent,
-                0,
-                100));
-    }
-
-    return 0;
-}
-
-void downloadFile(
-    const std::string& url,
-    const std::string& path,
-    InstallProgress& progress,
-    const std::shared_ptr<std::atomic<bool>>& cancel)
-{
-    FILE* file =
-        std::fopen(
-            path.c_str(),
-            "wb");
-
-    if (!file)
-        throw std::runtime_error(
-            "Unable to create install cache file");
-
-    DownloadContext context;
-    context.file = file;
-    context.progress = &progress;
-    context.cancel = cancel;
-
-    CURL* curl =
-        curl_easy_init();
-
-    if (!curl) {
-        std::fclose(file);
-        std::remove(path.c_str());
-
-        throw std::runtime_error(
-            "Download initialization failed");
-    }
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_URL,
-        url.c_str());
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_USERAGENT,
-        "SwitchGamesBrowser/0.4");
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_FOLLOWLOCATION,
-        1L);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_MAXREDIRS,
-        8L);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_CONNECTTIMEOUT,
-        20L);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_TIMEOUT,
-        0L);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_NOSIGNAL,
-        1L);
-
-#ifdef __SWITCH__
-    curl_easy_setopt(
-        curl,
-        CURLOPT_CAINFO,
-        "romfs:/cacert.pem");
-#endif
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_SSL_VERIFYPEER,
-        1L);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_SSL_VERIFYHOST,
-        2L);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_WRITEFUNCTION,
-        downloadWrite);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_WRITEDATA,
-        &context);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_NOPROGRESS,
-        0L);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_XFERINFOFUNCTION,
-        downloadProgress);
-
-    curl_easy_setopt(
-        curl,
-        CURLOPT_XFERINFODATA,
-        &context);
-
-    const CURLcode result =
-        curl_easy_perform(curl);
-
-    long httpStatus = 0;
-
-    curl_easy_getinfo(
-        curl,
-        CURLINFO_RESPONSE_CODE,
-        &httpStatus);
-
-    curl_easy_cleanup(curl);
-
-    std::fflush(file);
-    std::fclose(file);
-
-    if (
-        result != CURLE_OK ||
-        httpStatus < 200 ||
-        httpStatus >= 300
-    ) {
-        std::remove(
-            path.c_str());
-
-        if (
-            cancel &&
-            cancel->load()
-        ) {
-            throw std::runtime_error(
-                "Install cancelled");
-        }
-
-        throw std::runtime_error(
-            "Package download failed");
-    }
-}
 
 } // namespace
 
@@ -2738,9 +2739,11 @@ InstallResult runInstallJob(
 
     progress.running.store(true);
     progress.set(
-        "Downloading",
+        "Installing",
         0,
         job.file.name);
+
+    (void)cacheDirectory;
 
     try {
         if (
@@ -2772,29 +2775,10 @@ InstallResult runInstallJob(
             throw std::runtime_error(
                 "Debrid did not return a download URL");
 
-        mkdir(
-            cacheDirectory.c_str(),
-            0777);
-
-        const std::string localPath =
-            cacheDirectory +
-            "/" +
-            safeFilename(
-                job.file.name);
-
-        downloadFile(
-            url,
-            localPath,
-            progress,
-            cancelRequested);
-
         if (
             cancelRequested &&
             cancelRequested->load()
         ) {
-            std::remove(
-                localPath.c_str());
-
             throw std::runtime_error(
                 "Install cancelled");
         }
@@ -2807,19 +2791,14 @@ InstallResult runInstallJob(
         gInstallCancel =
             cancelRequested.get();
 
-        gInstallProgress =
-            &progress;
-
-        installPackageFile(
-            localPath,
+        installPackageCloud(
+            url,
+            job.file.name,
+            job.file.size,
             progress,
             cancelRequested);
 
         gInstallCancel = nullptr;
-        gInstallProgress = nullptr;
-
-        std::remove(
-            localPath.c_str());
 
         progress.set(
             "Completed",
@@ -2832,7 +2811,6 @@ InstallResult runInstallJob(
     }
     catch (const std::exception& e) {
         gInstallCancel = nullptr;
-        gInstallProgress = nullptr;
 
         result.cancelled =
             cancelRequested &&
