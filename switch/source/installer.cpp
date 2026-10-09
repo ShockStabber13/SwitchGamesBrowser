@@ -1327,7 +1327,9 @@ public:
         const std::shared_ptr<std::atomic<bool>>& cancel,
         InstallProgress& progress,
         int basePercent,
-        int spanPercent)
+        int spanPercent,
+        std::function<void(u64, const u8*, std::size_t)> enqueueWrite = {},
+        std::function<void()> finishWrites = {})
         : storage_(storage),
           contentId_(contentId),
           placeholderId_(
@@ -1336,7 +1338,9 @@ public:
           cancel_(cancel),
           progress_(progress),
           basePercent_(basePercent),
-          spanPercent_(spanPercent)
+          spanPercent_(spanPercent),
+          enqueueWrite_(std::move(enqueueWrite)),
+          finishWrites_(std::move(finishWrites))
     {
         deriveHeaderKey(
             headerKey_.data());
@@ -1428,6 +1432,11 @@ public:
                 "NCA size mismatch after install");
         }
 
+        // The processing thread must wait for the storage thread to finish
+        // before publishing the NCA or deleting its placeholder.
+        if (finishWrites_)
+            finishWrites_();
+
         Result rc =
             ncmContentStorageRegister(
                 storage_,
@@ -1473,6 +1482,19 @@ private:
     InstallProgress& progress_;
     int basePercent_ = 0;
     int spanPercent_ = 100;
+    std::function<void(u64, const u8*, std::size_t)> enqueueWrite_;
+    std::function<void()> finishWrites_;
+
+    void submitWrite(u64 offset, const u8* data, std::size_t size) {
+        if (enqueueWrite_) {
+            enqueueWrite_(offset, data, size);
+            return;
+        }
+        const Result rc = ncmContentStorageWritePlaceHolder(
+            storage_, &placeholderId_, offset, data, size);
+        if (R_FAILED(rc))
+            throw std::runtime_error("Failed writing NCA content");
+    }
 
     std::array<u8,0x20> headerKey_{};
     std::vector<u8> header_;
@@ -1617,17 +1639,7 @@ private:
 
         created_ = true;
 
-        rc =
-            ncmContentStorageWritePlaceHolder(
-                storage_,
-                &placeholderId_,
-                0,
-                header_.data(),
-                header_.size());
-
-        if (R_FAILED(rc))
-            throw std::runtime_error(
-                "Failed to write NCA header");
+        submitWrite(0, header_.data(), header_.size());
 
         written_ =
             header_.size();
@@ -1639,17 +1651,7 @@ private:
     {
         check();
 
-        const Result rc =
-            ncmContentStorageWritePlaceHolder(
-                storage_,
-                &placeholderId_,
-                written_,
-                data,
-                size);
-
-        if (R_FAILED(rc))
-            throw std::runtime_error(
-                "Failed writing NCA content");
+        submitWrite(written_, data, size);
 
         written_ += size;
 
