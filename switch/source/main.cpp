@@ -1324,6 +1324,7 @@ struct InstallQueueRow {
     std::uint64_t bytesDone = 0;
     std::uint64_t bytesTotal = 0;
     std::uint64_t bytesPerSecond = 0;
+    std::uint64_t networkBytesPerSecond = 0;
     std::string error;
 };
 
@@ -2553,6 +2554,7 @@ int main(int, char**) {
             std::uint64_t bytesDone = 0;
             std::uint64_t bytesTotal = 0;
             std::uint64_t bytesPerSecond = 0;
+            std::uint64_t networkBytesPerSecond = 0;
 
             activeInstallProgress->snapshot(
                 stage,
@@ -2562,7 +2564,8 @@ int main(int, char**) {
             activeInstallProgress->snapshotTransfer(
                 bytesDone,
                 bytesTotal,
-                bytesPerSecond);
+                bytesPerSecond,
+                networkBytesPerSecond);
 
             const bool activeRowValid =
                 activeInstallIndex &&
@@ -2580,6 +2583,7 @@ int main(int, char**) {
                 row.bytesTotal = bytesTotal;
                 row.bytesPerSecond =
                     bytesPerSecond;
+                row.networkBytesPerSecond = networkBytesPerSecond;
             }
 
             if (
@@ -4527,12 +4531,10 @@ int main(int, char**) {
                                     row.bytesTotal);
                         }
 
-                        if (row.bytesPerSecond > 0) {
-                            stateText +=
-                                "  " +
-                                formatTransferBytes(
-                                    row.bytesPerSecond) +
-                                "/s";
+                        if (row.bytesPerSecond > 0 || row.networkBytesPerSecond > 0) {
+                            stateText += "  NET " +
+                                formatTransferBytes(row.networkBytesPerSecond) + "/s" +
+                                "  SD " + formatTransferBytes(row.bytesPerSecond) + "/s";
                         }
                     }
 
