@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - performance/parallel-http-install-pipeline
+      - experiment/sphaira-streaming-http1
 permissions:
   contents: read
 jobs:
