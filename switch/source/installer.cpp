@@ -3594,14 +3594,12 @@ NetworkBenchmarkResult runNetworkBenchmark(
         if (!singleChunks || parallelChunks < kConnections)
             throw std::runtime_error("Not enough file data for benchmark");
 
+        // Sphaira-style measurement: one persistent HTTP Range request
+        // for the entire 1x sample, not a series of 4 MiB requests.
         const auto singleStart = std::chrono::steady_clock::now();
-        for (u64 index = 0; index < singleChunks; ++index) {
-            if (cancelRequested && cancelRequested->load())
-                throw std::runtime_error("Benchmark cancelled");
-            source.streamExact(
-                (1 + index) * kChunk, kChunk,
-                [](const u8*, std::size_t) {});
-        }
+        source.streamExact(
+            kChunk, singleChunks * kChunk,
+            [](const u8*, std::size_t) {});
         const auto singleEnd = std::chrono::steady_clock::now();
 
         // Four independent curl handles, using the same IPv4/HTTP1.1
@@ -3665,7 +3663,7 @@ NetworkBenchmarkResult runNetworkBenchmark(
         // Each chunk is exactly 4 MiB; units are MiB/s, not decimal MB/s.
         char report[256]{};
         std::snprintf(report, sizeof(report),
-            "HTTP only: 1x %.1f MiB/s (%llu MiB) | 4x %.1f MiB/s (%llu MiB)",
+            "HTTP only: 1x continuous %.1f MiB/s (%llu MiB) | 4x ranges %.1f MiB/s (%llu MiB)",
             4.0 * static_cast<double>(singleChunks) / singleSeconds,
             static_cast<unsigned long long>(4 * singleChunks),
             4.0 * static_cast<double>(parallelChunks) / parallelSeconds,
