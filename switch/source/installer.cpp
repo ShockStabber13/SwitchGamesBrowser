@@ -1131,6 +1131,194 @@ void resetCtr(
         context.counter.data());
 }
 
+// Sphaira-style third pipeline stage: async, ordered, bounded NCM writes.
+// NCA decoding remains on the installer consumer thread, independent of SD I/O.
+// All NCM data writes finish before the caller registers the NCA content.
+class AsyncContentWriter {
+public:
+    AsyncContentWriter(
+        NcmContentStorage* storage,
+        const NcmContentId& contentId,
+        const std::shared_ptr<std::atomic<bool>>& cancel,
+        InstallProgress& progress)
+        : storage_(storage),
+          placeholderId_(*reinterpret_cast<const NcmPlaceHolderId*>(&contentId)),
+          cancel_(cancel),
+          progress_(progress)
+    {
+        pending_.reserve(blockSize);
+        worker_ = std::thread([this]() { run(); });
+    }
+
+    AsyncContentWriter(const AsyncContentWriter&) = delete;
+    AsyncContentWriter& operator=(const AsyncContentWriter&) = delete;
+
+    ~AsyncContentWriter() {
+        abort();
+    }
+
+    // Called ONLY by the processing thread. Copies and coalesces raw or
+    // decompressed NCA data into consecutive 4 MiB storage-write blocks.
+    void append(u64 offset, const u8* data, std::size_t size) {
+        if (offset != nextOffset_)
+            throw std::runtime_error("Non-sequential NCA writer offset");
+
+        while (size) {
+            check();
+            if (pending_.empty())
+                pendingOffset_ = nextOffset_;
+
+            const auto take = std::min(
+                size, blockSize - pending_.size());
+            pending_.insert(pending_.end(), data, data + take);
+            data += take;
+            size -= take;
+            nextOffset_ += take;
+            if (pending_.size() == blockSize)
+                enqueuePending();
+        }
+    }
+
+    void finish() {
+        if (!finished_) {
+            enqueuePending();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                done_ = true;
+            }
+            changed_.notify_all();
+            finished_ = true;
+        }
+        if (worker_.joinable())
+            worker_.join();
+        check();
+    }
+
+    void abort() {
+        stopped_.store(true);
+        changed_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
+    }
+
+private:
+    static constexpr std::size_t blockSize = 4 * 1024 * 1024;
+    static constexpr std::size_t maxQueueBlocks = 3;
+
+    struct Block {
+        u64 offset = 0;
+        std::vector<u8> data;
+    };
+
+    NcmContentStorage* storage_;
+    NcmPlaceHolderId placeholderId_{};
+    std::shared_ptr<std::atomic<bool>> cancel_;
+    InstallProgress& progress_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::deque<Block> queue_;
+    std::thread worker_;
+    std::exception_ptr error_;
+    std::atomic<bool> stopped_{false};
+    bool done_ = false;
+    bool finished_ = false;
+    u64 nextOffset_ = 0;
+    u64 pendingOffset_ = 0;
+    std::vector<u8> pending_;
+
+    void check() {
+        if (cancel_ && cancel_->load())
+            throw std::runtime_error("Install cancelled");
+        std::exception_ptr error;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            error = error_;
+        }
+        if (error)
+            std::rethrow_exception(error);
+        if (stopped_.load())
+            throw std::runtime_error("Storage writer stopped");
+    }
+
+    void enqueuePending() {
+        if (pending_.empty())
+            return;
+        check();
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        // Timed wait permits prompt cancellation even without an external
+        // condition-variable notification.
+        while (!stopped_.load() &&
+               !(cancel_ && cancel_->load()) &&
+               !error_ &&
+               queue_.size() >= maxQueueBlocks) {
+            changed_.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        if (error_) {
+            auto error = error_;
+            lock.unlock();
+            std::rethrow_exception(error);
+        }
+        if (stopped_.load() || (cancel_ && cancel_->load()))
+            throw std::runtime_error("Install cancelled");
+
+        Block block;
+        block.offset = pendingOffset_;
+        block.data = std::move(pending_);
+        queue_.emplace_back(std::move(block));
+        lock.unlock();
+        changed_.notify_all();
+
+        pending_ = std::vector<u8>{};
+        pending_.reserve(blockSize);
+    }
+
+    void run() {
+        try {
+            for (;;) {
+                Block block;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    changed_.wait(lock, [&]() {
+                        return stopped_.load() || !queue_.empty() ||
+                            done_ || (cancel_ && cancel_->load());
+                    });
+                    if (stopped_.load() || (cancel_ && cancel_->load()))
+                        return;
+                    if (queue_.empty()) {
+                        if (done_)
+                            return;
+                        continue;
+                    }
+                    block = std::move(queue_.front());
+                    queue_.pop_front();
+                }
+                changed_.notify_all();
+
+                const auto started = std::chrono::steady_clock::now();
+                const Result rc = ncmContentStorageWritePlaceHolder(
+                    storage_, &placeholderId_, block.offset,
+                    block.data.data(), block.data.size());
+                progress_.writerActiveNanoseconds.fetch_add(
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - started).count()),
+                    std::memory_order_relaxed);
+
+                if (R_FAILED(rc))
+                    throw std::runtime_error("Failed writing NCA content");
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                error_ = std::current_exception();
+            }
+            stopped_.store(true);
+            changed_.notify_all();
+        }
+    }
+};
+
 class NcaOutput {
 public:
     NcaOutput(
