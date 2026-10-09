@@ -4531,11 +4531,8 @@ int main(int, char**) {
                                     row.bytesTotal);
                         }
 
-                        if (row.bytesPerSecond > 0 || row.networkBytesPerSecond > 0) {
-                            stateText += "  NET " +
-                                formatTransferBytes(row.networkBytesPerSecond) + "/s" +
-                                "  SD " + formatTransferBytes(row.bytesPerSecond) + "/s";
-                        }
+                        stateText += "  " +
+                            formatTransferBytes(row.networkBytesPerSecond) + "/s";
                     }
 
                     if (
