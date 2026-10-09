@@ -2708,44 +2708,6 @@ void installPackageCloud(
                 cnmtBytes,
                 cnmtInfo));
 
-        NcmContentMetaDatabase database{};
-
-        rc =
-            ncmOpenContentMetaDatabase(
-                &database,
-                NcmStorageId_SdCard);
-
-        if (R_FAILED(rc))
-            throw std::runtime_error(
-                "Failed to open content metadata database");
-
-        rc =
-            ncmContentMetaDatabaseSet(
-                &database,
-                &parsed.back().key,
-                reinterpret_cast<
-                    NcmContentMetaHeader*>(
-                        parsed.back()
-                            .installMeta.data()),
-                parsed.back()
-                    .installMeta.size());
-
-        if (R_SUCCEEDED(rc))
-            rc =
-                ncmContentMetaDatabaseCommit(
-                    &database);
-
-        ncmContentMetaDatabaseClose(
-            &database);
-
-        if (R_FAILED(rc))
-            throw std::runtime_error(
-                "Failed to register content metadata");
-
-        installApplicationRecord(
-            services.nsAppManager(),
-            parsed.back(),
-            NcmStorageId_SdCard);
     }
 
     std::vector<
@@ -2873,6 +2835,41 @@ void installPackageCloud(
             // ticketless content. Do not roll back an otherwise
             // complete content installation.
         }
+    }
+
+    // Only expose the application to HOME after every required NCA has
+    // completed and ticket processing has finished. A failed or cancelled
+    // transfer must never publish an incomplete application record.
+    checkCancelled();
+    progress.set("Installing", 98, "Registering content metadata");
+
+    for (const auto& cnmt : parsed) {
+        checkCancelled();
+
+        NcmContentMetaDatabase database{};
+        rc = ncmOpenContentMetaDatabase(
+            &database, NcmStorageId_SdCard);
+        if (R_FAILED(rc))
+            throw std::runtime_error("Failed to open content metadata database");
+
+        rc = ncmContentMetaDatabaseSet(
+            &database,
+            &cnmt.key,
+            reinterpret_cast<const NcmContentMetaHeader*>(cnmt.installMeta.data()),
+            cnmt.installMeta.size());
+        if (R_SUCCEEDED(rc))
+            rc = ncmContentMetaDatabaseCommit(&database);
+        ncmContentMetaDatabaseClose(&database);
+        if (R_FAILED(rc))
+            throw std::runtime_error("Failed to register content metadata");
+    }
+
+    checkCancelled();
+    progress.set("Installing", 99, "Registering application");
+    for (const auto& cnmt : parsed) {
+        checkCancelled();
+        installApplicationRecord(
+            services.nsAppManager(), cnmt, NcmStorageId_SdCard);
     }
 
     progress.set(
