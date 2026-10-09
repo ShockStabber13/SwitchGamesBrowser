@@ -259,11 +259,13 @@ public:
         std::string url,
         std::shared_ptr<std::atomic<bool>>
             cancel,
-        u64 knownSize)
+        u64 knownSize,
+        bool sphairaStyleStream = false)
         : url_(std::move(url)),
           initialUrl_(url_),
           cancel_(std::move(cancel)),
-          knownSize_(knownSize)
+          knownSize_(knownSize),
+          sphairaStyleStream_(sphairaStyleStream)
     {
         curl_ =
             curl_easy_init();
@@ -423,6 +425,11 @@ public:
         if (!size)
             return;
 
+        if (sphairaStyleStream_) {
+            streamExactWithRecovery(offset, size, consume, stop);
+            return;
+        }
+
         if (
             offset >
                 UINT64_MAX - size ||
@@ -541,9 +548,104 @@ public:
         }
     }
 
+    // Experimental network backend inspired by Sphaira's yati::source::Http:
+    // one HTTP/1.1 range per contiguous section, resume exactly at the
+    // first missing byte after a transient network interruption.
+    // Keep the existing parser, NCA/NCZ validation, storage, and UI.
+    void streamExactWithRecovery(
+        u64 offset,
+        u64 size,
+        const std::function<void(const u8*, std::size_t)>& consume,
+        const std::atomic<bool>* stop)
+    {
+        if (offset > UINT64_MAX - size ||
+            (knownSize_ && (offset > knownSize_ ||
+                            size > knownSize_ - offset)))
+            throw std::runtime_error("Package range is outside the cloud file");
+
+        const auto cancelledNow = [&]() {
+            return (cancel_ && cancel_->load()) ||
+                   (stop && stop->load());
+        };
+        constexpr unsigned maxRestarts = 10;
+        constexpr auto resumeWindow = std::chrono::seconds(60);
+        constexpr auto retryDelay = std::chrono::seconds(2);
+        auto lastData = std::chrono::steady_clock::now();
+        u64 received = 0;
+        unsigned restarts = 0;
+
+        while (received < size) {
+            if (cancelledNow())
+                throw std::runtime_error("Install cancelled");
+
+            const u64 remaining = size - received;
+            const std::string range = std::to_string(offset + received) +
+                "-" + std::to_string(offset + size - 1);
+            HttpRangeContext context;
+            context.cancel = cancel_;
+            context.stop = stop;
+            context.expected = remaining;
+            context.consume = [&](const u8* data, std::size_t bytes) {
+                if (consume) consume(data, bytes);
+                if (bytes) lastData = std::chrono::steady_clock::now();
+            };
+
+            curl_easy_setopt(curl_, CURLOPT_RANGE, range.c_str());
+            curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &context);
+            curl_easy_setopt(curl_, CURLOPT_XFERINFODATA, &context);
+            const CURLcode code = curl_easy_perform(curl_);
+            long status = 0;
+            curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &status);
+
+            if (cancelledNow())
+                throw std::runtime_error("Install cancelled");
+            if (context.error)
+                std::rethrow_exception(context.error);
+            if (status == 200)
+                throw std::runtime_error("Cloud source ignored HTTP Range");
+            if (status != 206)
+                throw std::runtime_error("Cloud read HTTP " + std::to_string(status));
+
+            received += context.received;
+            if (code == CURLE_OK && context.received == remaining) {
+                // Keep TorBox's final CDN redirect for later ranged reads.
+                if (initialUrl_.rfind(
+                        "https://api.torbox.app/v1/api/torrents/requestdl", 0) == 0) {
+                    char* effective = nullptr;
+                    if (curl_easy_getinfo(curl_, CURLINFO_EFFECTIVE_URL, &effective) == CURLE_OK &&
+                        effective && std::strncmp(effective, "https://", 8) == 0 &&
+                        url_ != effective) {
+                        url_ = effective;
+                        curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
+                    }
+                }
+                return;
+            }
+
+            const bool temporary = code == CURLE_OK ||
+                code == CURLE_PARTIAL_FILE ||
+                code == CURLE_RECV_ERROR ||
+                code == CURLE_OPERATION_TIMEDOUT ||
+                code == CURLE_COULDNT_CONNECT ||
+                code == CURLE_SEND_ERROR ||
+                code == CURLE_GOT_NOTHING;
+            if (!temporary || ++restarts > maxRestarts ||
+                std::chrono::steady_clock::now() - lastData >= resumeWindow) {
+                throw std::runtime_error(
+                    std::string("Streaming read failed: ") +
+                    curl_easy_strerror(code));
+            }
+            if (received == size) return;
+            std::this_thread::sleep_for(retryDelay);
+        }
+    }
+
+    bool sphairaStyleStream() const { return sphairaStyleStream_; }
+
     // Separate easy handles are required for concurrent HTTP ranges.
     std::unique_ptr<HttpPackageSource> clone() const {
-        return std::make_unique<HttpPackageSource>(url_, cancel_, knownSize_);
+        return std::make_unique<HttpPackageSource>(
+            url_, cancel_, knownSize_, sphairaStyleStream_);
     }
 
     void readExact(
@@ -585,6 +687,7 @@ private:
         cancel_;
 
     u64 knownSize_ = 0;
+    bool sphairaStyleStream_ = false;
 
     CURL* curl_ = nullptr;
 };
@@ -937,14 +1040,16 @@ Package openPackage(
     const std::string& name,
     const std::shared_ptr<
         std::atomic<bool>>& cancel,
-    u64 knownSize)
+    u64 knownSize,
+    bool sphairaStyleStream)
 {
     auto source =
         std::make_shared<
             HttpPackageSource>(
                 url,
                 cancel,
-                knownSize);
+                knownSize,
+                sphairaStyleStream);
 
     if (
         endsWithInsensitive(name, ".nsp") ||
@@ -2930,7 +3035,10 @@ void installEntry(
     // Stage 2: ordered NCA/NCZ decoding on the installer thread.
     // Stage 3 (large entries): async content-storage writing, as before.
     // Small entries retain the existing synchronous storage path.
-    constexpr std::size_t streamBufferSize = 4 * 1024 * 1024;
+    // Sphaira-style mode tests a smaller bounded read queue, while
+    // the original path retains its existing 4 MiB downloads.
+    const std::size_t streamBufferSize = package.source->sphairaStyleStream()
+        ? 1024 * 1024 : 4 * 1024 * 1024;
     constexpr std::size_t maxQueuedBlocks = 4;
 
     if (largeEntry)
@@ -3087,7 +3195,8 @@ void installPackageCloud(
     const std::string& name,
     u64 knownSize,
     InstallProgress& progress,
-    const std::shared_ptr<std::atomic<bool>>& cancel)
+    const std::shared_ptr<std::atomic<bool>>& cancel,
+    bool sphairaStyleStream)
 {
     InstallServices services;
 
@@ -3101,7 +3210,8 @@ void installPackageCloud(
             url,
             name,
             cancel,
-            knownSize);
+            knownSize,
+            sphairaStyleStream);
 
     if (package.entries.empty())
         throw std::runtime_error(
@@ -3686,7 +3796,8 @@ InstallResult runInstallJob(
     const InstallJob& job,
     const std::string& cacheDirectory,
     InstallProgress& progress,
-    const std::shared_ptr<std::atomic<bool>>& cancelRequested)
+    const std::shared_ptr<std::atomic<bool>>& cancelRequested,
+    bool sphairaStyleStream)
 {
     InstallResult result;
 
@@ -3758,7 +3869,8 @@ InstallResult runInstallJob(
             job.file.name,
             job.file.size,
             progress,
-            cancelRequested);
+            cancelRequested,
+            sphairaStyleStream);
 
         gInstallCancel = nullptr;
 
