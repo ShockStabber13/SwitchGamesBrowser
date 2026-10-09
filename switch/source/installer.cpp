@@ -2645,9 +2645,10 @@ void installApplicationRecord(
             "Failed to register application");
 }
 
-// Download four HTTP ranges concurrently while forwarding 1 MiB pieces
-// straight to the content-storage writer in file order. This avoids holding
-// each entire range in RAM and lets SD writes overlap ongoing downloads.
+// Stage 1: four HTTP range readers with bounded per-range buffers.
+// Stage 2: ordered NCA/NCZ processing on the consuming installer thread.
+// Stage 3: independent bounded SD write worker (see AsyncContentWriter).
+// The stages overlap while preserving exact NCA byte order.
 void installEntryParallel(
     Package& package,
     const PackageEntry& entry,
