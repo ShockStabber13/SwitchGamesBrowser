@@ -40,6 +40,12 @@ struct InstallProgress {
     std::atomic<std::uint64_t> networkBytesPerSecond{0};
     std::atomic<std::uint64_t> networkBytesDone{0};
 
+    // Diagnostic counters; not shown as separate speeds in the UI.
+    std::atomic<std::uint64_t> writerActiveNanoseconds{0};
+    std::atomic<std::uint64_t> writerIdleNanoseconds{0};
+    std::atomic<std::uint64_t> producerBackpressureNanoseconds{0};
+    std::atomic<std::uint64_t> parallelEntryCount{0};
+
     mutable std::mutex mutex;
     std::string stage = "Queued";
     std::string detail;
