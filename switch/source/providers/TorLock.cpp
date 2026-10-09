@@ -1,5 +1,6 @@
 #include "provider.hpp"
 #include "provider_api_utils.hpp"
+#include "provider_stats.hpp"
 
 #include <regex>
 #include <string>
@@ -69,6 +70,8 @@ TorznabPage parseTorznab(
         result.title = title;
         result.magnet = magnet;
         result.infoHash = hash;
+        result.seeders = sgb_stats::seeders(item);
+        result.leechers = sgb_stats::leechers(item);
         page.results.push_back(std::move(result));
     }
 
