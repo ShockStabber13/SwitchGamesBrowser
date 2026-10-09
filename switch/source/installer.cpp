@@ -3076,6 +3076,8 @@ void InstallProgress::beginTransfer(
     transferSampleBytes_ = 0;
     networkSampleStarted_ = transferSampleStarted_;
     networkSampleBytes_ = 0;
+    liveSpeedSamples_.clear();
+    liveSpeedSamples_.emplace_back(transferSampleStarted_, 0);
 }
 
 void InstallProgress::addTransferBytes(
@@ -3179,7 +3181,24 @@ void InstallProgress::snapshotTransfer(
 
     outBytesPerSecond =
         bytesPerSecond.load();
-    outNetworkBytesPerSecond = networkBytesPerSecond.load();
+    // A rolling rate recalculated on each UI frame, including idle periods.
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto now = std::chrono::steady_clock::now();
+        constexpr auto window = std::chrono::milliseconds(1500);
+        const auto total = networkBytesDone.load();
+        liveSpeedSamples_.emplace_back(now, total);
+        while (liveSpeedSamples_.size() > 2 &&
+               now - liveSpeedSamples_[1].first >= window) {
+            liveSpeedSamples_.pop_front();
+        }
+        const auto& oldest = liveSpeedSamples_.front();
+        const auto elapsed = std::chrono::duration_cast<
+            std::chrono::milliseconds>(now - oldest.first).count();
+        outNetworkBytesPerSecond = elapsed > 0
+            ? (total - oldest.second) * 1000 / static_cast<std::uint64_t>(elapsed)
+            : 0;
+    }
 }
 
 InstallResult runInstallJob(
