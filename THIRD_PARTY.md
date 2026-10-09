@@ -10,3 +10,5 @@
 - CA trust bundle — certificate data from the environment's trusted OS certificate store. These are public CA certificates, not credentials; maintain according to the source distribution's certificate policy.
 
 Metadata/catalog providers retain their rights and terms. Fetching an index does not grant redistribution rights to provider data or game content. This source package includes only fictional example catalog entries; no game packages, Nintendo keys or firmware are included.
+
+- Sphaira YATI source and runtime interfaces — GPLv3, copied unmodified under `third_party/sphaira/`; not yet linked into the application. See `third_party/sphaira/LICENSE` and `third_party/sphaira/README.md`. https://github.com/NaGaa95/sphaira
