@@ -1662,6 +1662,8 @@ int main(int, char**) {
     sgb::Filter filter;
     std::string url, langegenUrl, status = "Press X for Filters";
     sgb::DebridConfig debridConfig;
+    // Default remains the proven original backend; Sphaira-style is opt-in.
+    bool sphairaStyleStream = false;
     std::map<std::string, sgb::DebridTorrentStatus> debridStatuses;
 
     std::set<std::string> enabledProviders;
@@ -1711,6 +1713,7 @@ int main(int, char**) {
 
         debridConfig.apiKey =
             config.value("debridApiKey", "");
+        sphairaStyleStream = config.value("sphairaStyleStream", false);
 
         if (
             config.contains("enabledProviders") &&
@@ -1759,6 +1762,7 @@ int main(int, char**) {
                     {"indexUrl", url},
                     {"debridService", service},
                     {"debridApiKey", debridConfig.apiKey},
+                    {"sphairaStyleStream", sphairaStyleStream},
                     {"enabledProviders", providerArray}
                 }.dump(2)
             );
@@ -2776,6 +2780,7 @@ int main(int, char**) {
 
                 auto cancelCopy =
                     installCancel;
+                const bool streamMode = sphairaStyleStream;
 
                 installRows[i].state =
                     "Installing";
@@ -2809,14 +2814,16 @@ int main(int, char**) {
                             configCopy,
                             job,
                             progressCopy,
-                            cancelCopy
+                            cancelCopy,
+                            streamMode
                         ]() {
                             return sgb::runInstallJob(
                                 configCopy,
                                 job,
                                 root + "install-cache",
                                 *progressCopy,
-                                cancelCopy);
+                                cancelCopy,
+                                streamMode);
                         }
                     );
 
@@ -3265,7 +3272,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 6)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 7)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -3466,7 +3473,7 @@ int main(int, char**) {
                     status = "Loading debrid manager...";
                     startDebridManagerRefresh();
                 }
-                else {
+                else if (settingsCursor == 6) {
                     if (
                         installManagerCursor >=
                             installRows.size()
@@ -3484,6 +3491,17 @@ int main(int, char**) {
                         installRows.empty()
                             ? "Install queue is empty"
                             : "Install Manager";
+                }
+                else if (settingsCursor == 7) {
+                    if (pendingInstall.valid()) {
+                        status = "Finish the current install before switching backend";
+                    } else {
+                        sphairaStyleStream = !sphairaStyleStream;
+                        saveConfig();
+                        status = sphairaStyleStream
+                            ? "Experimental Sphaira-style HTTP stream enabled"
+                            : "Original installer stream enabled";
+                    }
                 }
             }
 
@@ -4812,7 +4830,8 @@ int main(int, char**) {
                 "Scrape Providers",
                 "Download / Update Langegen Catalog",
                 "Debrid Manager",
-                "Install Manager"
+                "Install Manager",
+                "Installer HTTP Stream"
             };
 
             for (
@@ -4885,6 +4904,11 @@ int main(int, char**) {
                         catalogFile.good()
                             ? "Installed"
                             : "Not downloaded";
+                }
+                else if (i == 7) {
+                    value = sphairaStyleStream
+                        ? "Sphaira-style (experimental)"
+                        : "Original";
                 }
                 else if (i == 6) {
                     size_t active = 0;
