@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
+#include <utility>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -76,6 +78,11 @@ private:
 
     std::chrono::steady_clock::time_point networkSampleStarted_{};
     std::uint64_t networkSampleBytes_ = 0;
+
+    // Time-stamped totals for a real-time, sliding-window speed display.
+    mutable std::deque<std::pair<
+        std::chrono::steady_clock::time_point,
+        std::uint64_t>> liveSpeedSamples_;
 };
 
 struct InstallResult {
