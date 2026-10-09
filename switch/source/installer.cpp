@@ -3212,8 +3212,10 @@ void InstallProgress::snapshotTransfer(
     std::uint64_t& outBytesPerSecond,
     std::uint64_t& outNetworkBytesPerSecond) const
 {
+    // Display received HTTP bytes immediately, not bytes only after
+    // a complete SD write. This counter advances from libcurl callbacks.
     outDone =
-        bytesDone.load();
+        networkBytesDone.load();
 
     outTotal =
         bytesTotal.load();
