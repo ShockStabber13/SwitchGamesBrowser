@@ -11,6 +11,7 @@
 #include "shops.hpp"
 #include "scrape_cache.hpp"
 #include "provider_diagnostics.hpp"
+#include "cpu_clock_diag.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -1570,7 +1571,8 @@ static void saveInstallQueue(
 enum class Page {
     Browse, Detail, Torrents, Files, Settings, Providers,
     SearchProgress, Options, ScrapeChoice, DebridManager,
-    DebridManagerFiles, InstallManager, ShopResults
+    DebridManagerFiles, InstallManager, ShopResults,
+    CpuClockDiagnostics
 };
 
 static DebridCheckResult liveDebridCheck(
@@ -1777,6 +1779,7 @@ int main(int, char**) {
     loadCoverPackManifest();
 
     Page page = Page::Browse; bool dirty = false;
+    std::vector<std::string> cpuClockDiagnosticLines;
     std::set<size_t> selectedFiles;
     std::future<Refresh> pending;
     std::future<std::string> pendingLangegen; 
@@ -3265,7 +3268,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 6)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 7)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -3466,7 +3469,7 @@ int main(int, char**) {
                     status = "Loading debrid manager...";
                     startDebridManagerRefresh();
                 }
-                else {
+                else if (settingsCursor == 6) {
                     if (
                         installManagerCursor >=
                             installRows.size()
@@ -3485,6 +3488,20 @@ int main(int, char**) {
                             ? "Install queue is empty"
                             : "Install Manager";
                 }
+                else if (settingsCursor == 7) {
+                    cpuClockDiagnosticLines = sgb::probeCpuClockReadOnly();
+                    status = "Read-only CPU clock probe completed";
+                    page = Page::CpuClockDiagnostics;
+                }
+            }
+
+        } else if (page == Page::CpuClockDiagnostics) {
+            if (keys & HidNpadButton_B) {
+                settingsCursor = 7;
+                page = Page::Settings;
+            } else if (keys & HidNpadButton_A) {
+                cpuClockDiagnosticLines = sgb::probeCpuClockReadOnly();
+                status = "CPU clock probe refreshed";
             }
 
         } else if (page == Page::DebridManager) {
@@ -4812,7 +4829,8 @@ int main(int, char**) {
                 "Scrape Providers",
                 "Download / Update Langegen Catalog",
                 "Debrid Manager",
-                "Install Manager"
+                "Install Manager",
+                "CPU Clock Diagnostic (read-only)"
             };
 
             for (
@@ -4946,7 +4964,7 @@ int main(int, char**) {
                     " | " +
                     torBoxDeviceAuth
                         ->friendlyVerificationUrl,
-                    32,570,1216,green
+                    32,620,1216,green
                 );
             }
             else if (allDebridPin.has_value()) {
@@ -4955,8 +4973,22 @@ int main(int, char**) {
                     small,
                     "AllDebrid PIN: " +
                         allDebridPin->pin,
-                    32,570,1216,green
+                    32,620,1216,green
                 );
+            }
+
+        } else if (page == Page::CpuClockDiagnostics) {
+            label(renderer, big, "CPU CLOCK DIAGNOSTIC",
+                  32, 70, 1216, green);
+            label(renderer, small,
+                  "A Re-test  |  B Back  |  No clocks or voltages are changed",
+                  32, 112, 1216, muted);
+            for (size_t i = 0;
+                 i < cpuClockDiagnosticLines.size() && i < 12;
+                 ++i) {
+                label(renderer, small, cpuClockDiagnosticLines[i],
+                      48, 164 + static_cast<int>(i) * 39,
+                      1160, i == 0 ? green : white);
             }
 
         } else if (page == Page::ScrapeChoice) {
