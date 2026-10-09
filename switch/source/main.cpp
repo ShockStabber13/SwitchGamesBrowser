@@ -5195,9 +5195,9 @@ int main(int, char**) {
 
                     // Show provider snapshots; unknown is not zero.
                     const std::string seeds = rel.seeders >= 0
-                        ? std::to_string(rel.seeders) : "-";
+                        ? std::to_string(rel.seeders) : "—";
                     const std::string leeches = rel.leechers >= 0
-                        ? std::to_string(rel.leechers) : "-";
+                        ? std::to_string(rel.leechers) : "—";
                     label(
                         renderer,small,
                         rel.source +
