@@ -2742,6 +2742,7 @@ int main(int, char**) {
                 installRows[i].httpWaitMs = 0;
                 installRows[i].bufferWaitMs = 0;
                 installRows[i].hasTimings = false;
+                installRows[i].benchmarkResult.clear();
                 installRows[i].error.clear();
 
                 persistInstallQueue();
@@ -3713,6 +3714,7 @@ int main(int, char**) {
                         row.error.clear();
                         row.sdWriteMs = row.httpWaitMs = row.bufferWaitMs = 0;
                         row.hasTimings = false;
+                        row.benchmarkResult.clear();
 
                         persistInstallQueue();
 
@@ -4669,10 +4671,7 @@ int main(int, char**) {
                 // global status field to display timings.
                 const auto& selected = installRows[
                     std::min(installManagerCursor, installRows.size() - 1)];
-                if (!selected.benchmarkResult.empty()) {
-                    label(renderer, small, selected.benchmarkResult,
-                          32, 645, 1216, green);
-                } else if (selected.hasTimings) {
+                if (selected.hasTimings) {
                     char timingText[256]{};
                     std::snprintf(timingText, sizeof(timingText),
                         "Timing: SD write %.1fs  |  HTTP wait %.1fs  |  Buffer wait %.1fs",
@@ -4680,6 +4679,10 @@ int main(int, char**) {
                         selected.httpWaitMs / 1000.0,
                         selected.bufferWaitMs / 1000.0);
                     label(renderer, small, timingText, 32, 645, 1216, green);
+                }
+                if (!selected.benchmarkResult.empty()) {
+                    label(renderer, small, selected.benchmarkResult,
+                          32, 667, 1216, green);
                 }
             }
 
@@ -5374,7 +5377,8 @@ int main(int, char**) {
             label(renderer,small,"X Filters  |  A Details  |  Y Settings  |  + Exit",32,648,1216,muted);
 
         }
-        label(renderer,small,status,32,675,1216,green);
+        label(renderer,small,status,32,
+              page == Page::InstallManager ? 695 : 675,1216,green);
         SDL_RenderPresent(renderer);
     }
     stopping = true;
