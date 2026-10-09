@@ -12,6 +12,9 @@
 #include <switch.h>
 #include <curl/curl.h>
 #include <zstd.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <array>
@@ -232,6 +235,24 @@ int httpRangeProgress(
             (context->stop && context->stop->load())) ? 1 : 0;
 }
 
+// Tune the TCP receive window on every newly connected CDN socket.
+// pipensx uses this for its TorBox HTTP transfers; CURLOPT_BUFFERSIZE
+// alone configures libcurl's user-space buffer, not SO_RCVBUF.
+int tuneCloudDownloadSocket(void*, curl_socket_t socket,
+                            curlsocktype purpose)
+{
+    if (purpose == CURLSOCKTYPE_IPCXN) {
+        int receiveBytes = 256 * 1024;
+        setsockopt(socket, SOL_SOCKET, SO_RCVBUF,
+                   &receiveBytes, sizeof(receiveBytes));
+        int noDelay = 1;
+        setsockopt(socket, IPPROTO_TCP, TCP_NODELAY,
+                   &noDelay, sizeof(noDelay));
+    }
+    // Keep the connection even if the OS silently clamps the requested size.
+    return CURL_SOCKOPT_OK;
+}
+
 class HttpPackageSource {
 public:
     HttpPackageSource(
@@ -302,6 +323,13 @@ public:
             curl_,
             CURLOPT_BUFFERSIZE,
             512L * 1024L);
+
+        // Set the actual BSD socket receive window; this callback also
+        // applies to each independent range-worker curl handle.
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_SOCKOPTFUNCTION,
+            tuneCloudDownloadSocket);
 
         curl_easy_setopt(
             curl_,
