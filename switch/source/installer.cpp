@@ -2438,9 +2438,9 @@ void installApplicationRecord(
             "Failed to register application");
 }
 
-// Fetch a large NCA using four independent HTTP range connections.  Only
-// four 8 MiB chunks can be outstanding at once, and the consumer writes each
-// completed chunk in ascending file order. This preserves NCZ stream ordering.
+// Download four HTTP ranges concurrently while forwarding 1 MiB pieces
+// straight to the content-storage writer in file order. This avoids holding
+// each entire range in RAM and lets SD writes overlap ongoing downloads.
 void installEntryParallel(
     Package& package,
     const PackageEntry& entry,
@@ -2452,15 +2452,17 @@ void installEntryParallel(
     int spanPercent)
 {
     constexpr std::size_t connections = 4;
-    constexpr u64 chunkSize = 8ULL * 1024 * 1024;
-    const u64 count = 1 + (entry.size - 1) / chunkSize;
+    constexpr u64 rangeSize = 16ULL * 1024 * 1024;
+    constexpr std::size_t blockSize = 1024 * 1024;
+    constexpr std::size_t maxBufferedBlocks = 2;
+    const u64 rangeCount = 1 + (entry.size - 1) / rangeSize;
 
     NcaOutput output(
         storage, contentId, cancel, progress, basePercent, spanPercent);
 
     struct Slot {
-        std::vector<u8> data;
-        bool ready = false;
+        std::deque<std::vector<u8>> blocks;
+        bool finished = false;
     };
     std::array<Slot, connections> slots;
     std::mutex mutex;
@@ -2475,7 +2477,7 @@ void installEntryParallel(
 
     const auto worker = [&]() {
         try {
-            // A libcurl easy handle must never be shared between threads.
+            // libcurl handles are private to each worker; never share one.
             auto source = package.source->clone();
             while (!stop.load()) {
                 u64 index;
@@ -2484,50 +2486,76 @@ void installEntryParallel(
                     changed.wait(lock, [&]() {
                         return stop.load() ||
                             (cancel && cancel->load()) ||
-                            nextRequest == count ||
+                            nextRequest == rangeCount ||
                             nextRequest - nextWrite < connections;
                     });
-                    if (stop.load() || (cancel && cancel->load())) {
+                    if (stop.load() || (cancel && cancel->load()))
                         break;
-                    }
-                    if (nextRequest == count) {
+                    if (nextRequest == rangeCount)
                         break;
-                    }
+
                     index = nextRequest++;
                 }
 
-                const u64 localOffset = index * chunkSize;
-                const auto length = static_cast<std::size_t>(
-                    std::min<u64>(chunkSize, entry.size - localOffset));
-                std::vector<u8> bytes(length);
-                std::size_t received = 0;
+                const u64 relativeOffset = index * rangeSize;
+                const u64 length = std::min<u64>(
+                    rangeSize, entry.size - relativeOffset);
+                auto& slot = slots[index % connections];
+                std::vector<u8> block;
+                block.reserve(blockSize);
+
+                const auto emit = [&]() {
+                    if (block.empty())
+                        return;
+
+                    std::unique_lock<std::mutex> lock(mutex);
+                    changed.wait(lock, [&]() {
+                        return stop.load() ||
+                            (cancel && cancel->load()) ||
+                            slot.blocks.size() < maxBufferedBlocks;
+                    });
+                    if (stop.load() || (cancel && cancel->load()))
+                        throw std::runtime_error("Install cancelled");
+
+                    slot.blocks.emplace_back(std::move(block));
+                    lock.unlock();
+                    changed.notify_all();
+                    block = std::vector<u8>{};
+                    block.reserve(blockSize);
+                };
+
                 source->streamExact(
-                    entry.offset + localOffset,
+                    entry.offset + relativeOffset,
                     length,
-                    [&](const u8* data, std::size_t size) {
-                        if (size > bytes.size() - received) {
-                            throw std::runtime_error("Invalid HTTP range length");
+                    [&](const u8* data, std::size_t bytes) {
+                        progress.addNetworkBytes(bytes);
+                        while (bytes) {
+                            if (stop.load() || (cancel && cancel->load()))
+                                throw std::runtime_error("Install cancelled");
+
+                            const auto take = std::min(
+                                blockSize - block.size(), bytes);
+                            block.insert(block.end(), data, data + take);
+                            data += take;
+                            bytes -= take;
+                            if (block.size() == blockSize)
+                                emit();
                         }
-                        std::memcpy(bytes.data() + received, data, size);
-                        received += size;
-                        progress.addNetworkBytes(size);
                     },
                     &stop);
 
-                if (stop.load()) break;
-
+                emit();
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    auto& slot = slots[index % connections];
-                    slot.data = std::move(bytes);
-                    slot.ready = true;
+                    slot.finished = true;
                 }
                 changed.notify_all();
             }
         } catch (...) {
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                if (!networkError) networkError = std::current_exception();
+                if (!networkError)
+                    networkError = std::current_exception();
             }
             stop.store(true);
             changed.notify_all();
@@ -2535,46 +2563,57 @@ void installEntryParallel(
     };
 
     try {
-        for (std::size_t i = 0; i < connections; ++i) {
+        for (std::size_t i = 0; i < connections; ++i)
             workers.emplace_back(worker);
-        }
 
-        for (u64 index = 0; index < count; ++index) {
-            std::vector<u8> bytes;
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                changed.wait(lock, [&]() {
-                    return slots[index % connections].ready ||
-                        stop.load() || (cancel && cancel->load());
-                });
+        for (u64 index = 0; index < rangeCount; ++index) {
+            auto& slot = slots[index % connections];
 
-                if (cancel && cancel->load()) {
-                    throw std::runtime_error("Install cancelled");
+            while (true) {
+                std::vector<u8> block;
+                bool finished = false;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    changed.wait(lock, [&]() {
+                        return !slot.blocks.empty() || slot.finished ||
+                            stop.load() || (cancel && cancel->load());
+                    });
+
+                    if (cancel && cancel->load())
+                        throw std::runtime_error("Install cancelled");
+                    if (networkError)
+                        std::rethrow_exception(networkError);
+
+                    if (!slot.blocks.empty()) {
+                        block = std::move(slot.blocks.front());
+                        slot.blocks.pop_front();
+                    } else if (slot.finished) {
+                        slot.finished = false;
+                        ++nextWrite;
+                        finished = true;
+                    } else {
+                        throw std::runtime_error("Parallel HTTP transfer stopped");
+                    }
                 }
-                if (networkError) std::rethrow_exception(networkError);
-                if (!slots[index % connections].ready) {
-                    throw std::runtime_error("Parallel HTTP transfer stopped");
-                }
+                changed.notify_all();
 
-                auto& slot = slots[index % connections];
-                bytes = std::move(slot.data);
-                slot.ready = false;
-                ++nextWrite;
+                if (finished)
+                    break;
+
+                output.write(block.data(), block.size());
+                progress.addTransferBytes(block.size());
             }
-            changed.notify_all();
-
-            output.write(bytes.data(), bytes.size());
-            progress.addTransferBytes(bytes.size());
         }
 
-        // All network calls must finish before closing the content storage.
-        for (auto& thread : workers) thread.join();
+        for (auto& thread : workers)
+            thread.join();
         output.finish();
     } catch (...) {
         stop.store(true);
         changed.notify_all();
         for (auto& thread : workers) {
-            if (thread.joinable()) thread.join();
+            if (thread.joinable())
+                thread.join();
         }
         throw;
     }
