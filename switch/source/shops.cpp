@@ -165,48 +165,46 @@ std::string comparable(const std::string& text) {
     return result;
 }
 
-// An asterisk is a wildcard for zero or more characters (no regex dot).
-// Example: "MarioKart8" -> "*m*a*r*i*o*k*a*r*t*8*".
-// Ignore spaces and punctuation, including trademark symbols in shop names.
+// Matches MoviesAndSeries Api.kt isLikePattern() behavior:
+// put '*' between title words, then match each normalized part in order.
+// '*' represents any number of characters, not the regex token ".*".
 std::string wildcardPattern(const std::string& title) {
-    const std::string normalized = comparable(title);
-    if (normalized.empty()) return "";
-    std::string pattern;
-    pattern.reserve(normalized.size() * 2 + 1);
-    pattern.push_back('*');
-    for (const char c : normalized) {
-        pattern.push_back(c);
-        pattern.push_back('*');
+    std::string pattern = "*";
+    bool hasText = false;
+    for (unsigned char c : title) {
+        if (std::isspace(c)) {
+            if (pattern.back() != '*') pattern.push_back('*');
+        } else if (c >= 'A' && c <= 'Z') {
+            pattern.push_back(static_cast<char>(c - 'A' + 'a'));
+            hasText = true;
+        } else if ((c >= 'a' && c <= 'z') ||
+                   (c >= '0' && c <= '9')) {
+            pattern.push_back(static_cast<char>(c));
+            hasText = true;
+        }
     }
+    if (!hasText) return "";
+    if (pattern.back() != '*') pattern.push_back('*');
     return pattern;
 }
 
 bool wildcardMatches(const std::string& text, const std::string& pattern) {
     if (pattern.empty()) return false;
-    std::size_t textIndex = 0;
-    std::size_t patternIndex = 0;
-    std::size_t lastStar = std::string::npos;
-    std::size_t retryIndex = 0;
-
-    while (textIndex < text.size()) {
-        if (patternIndex < pattern.size() &&
-            text[textIndex] == pattern[patternIndex]) {
-            ++textIndex;
-            ++patternIndex;
-        } else if (patternIndex < pattern.size() &&
-                   pattern[patternIndex] == '*') {
-            lastStar = patternIndex++;
-            retryIndex = textIndex;
-        } else if (lastStar != std::string::npos) {
-            patternIndex = lastStar + 1;
-            textIndex = ++retryIndex;
-        } else {
-            return false;
+    std::size_t current = 0;
+    std::size_t start = 0;
+    while (start < pattern.size()) {
+        const auto end = pattern.find('*', start);
+        const std::string part = pattern.substr(start, end == std::string::npos
+            ? std::string::npos : end - start);
+        if (!part.empty()) {
+            const auto index = text.find(part, current);
+            if (index == std::string::npos) return false;
+            current = index + part.size();
         }
+        if (end == std::string::npos) break;
+        start = end + 1;
     }
-    while (patternIndex < pattern.size() && pattern[patternIndex] == '*')
-        ++patternIndex;
-    return patternIndex == pattern.size();
+    return true;
 }
 struct Directory { std::string url; std::size_t depth = 0; };
 std::string entryLink(const Json& obj) {
