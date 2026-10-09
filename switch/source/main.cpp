@@ -5013,6 +5013,12 @@ int main(int, char**) {
                 1216,
                 105
             };
+            SDL_Rect shopRow{
+                32,
+                475,
+                1216,
+                105
+            };
 
             rect(
                 renderer,
@@ -5025,6 +5031,7 @@ int main(int, char**) {
                 newRow,
                 SDL_Color{18,18,18,255}
             );
+            rect(renderer, shopRow, SDL_Color{18,18,18,255});
 
             if (scrapeChoiceCursor == 0) {
                 rect(
@@ -5043,6 +5050,8 @@ int main(int, char**) {
                     true
                 );
             }
+            if (scrapeChoiceCursor == 2)
+                rect(renderer, shopRow, green, true);
 
             label(
                 renderer,
@@ -5107,6 +5116,12 @@ int main(int, char**) {
                 1140,
                 muted
             );
+            label(renderer, big, "Shop",
+                  52, 490, 1140,
+                  scrapeChoiceCursor == 2 ? green : white);
+            label(renderer, small,
+                  "Search game title across OpenNX-listed shops",
+                  52, 538, 1140, muted);
 
             label(
                 renderer,
@@ -5130,6 +5145,50 @@ int main(int, char**) {
             label(renderer,small,"Debrid: " + sgb::debridServiceName(debridConfig.service),32,535,1200,muted);
             label(renderer,small,favourites.count(g.id) ? "Saved to favourites" : "X: Add to favourites",32,575,1200,green);
             label(renderer,small,"A Scrape | X Favourite | B Back",32,620,1200);
+        } else if (page == Page::ShopResults) {
+            const std::string gameTitle = shopGameIndex < games.size()
+                ? games[shopGameIndex].title : "OpenNX";
+            label(renderer, big, gameTitle, 32, 78, 1200, green);
+            label(renderer, small,
+                "TORRENTS [ZL]  |  SHOPS [active]  |  A Queue to Install Manager  |  Y Rescan  |  B Back",
+                32, 122, 1200, muted);
+
+            if (pendingShopSearch.valid()) {
+                std::string text;
+                std::vector<sgb::ShopEntry> unused;
+                shopSearchProgress.snapshot(unused, text);
+                label(renderer, small,
+                      "Searching " +
+                      std::to_string(shopSearchProgress.shopsDone.load()) + "/" +
+                      std::to_string(shopSearchProgress.shopsTotal.load()) +
+                      " OpenNX shops", 32, 636, 1200, green);
+            }
+            if (shopRows.empty()) {
+                label(renderer, big,
+                      pendingShopSearch.valid() ? "Searching shop indexes..." :
+                      "No compatible direct HTTPS packages found",
+                      32, 300, 1200, muted);
+            }
+            const size_t visibleStart = (shopCursor / 7) * 7;
+            for (size_t slot = 0; slot < 7 &&
+                 visibleStart + slot < shopRows.size(); ++slot) {
+                const size_t index = visibleStart + slot;
+                const auto& item = shopRows[index];
+                const int y = 155 + static_cast<int>(slot) * 67;
+                SDL_Rect itemRect{32, y, 1216, 60};
+                rect(renderer, itemRect, SDL_Color{18,18,18,255});
+                if (index == shopCursor)
+                    rect(renderer, itemRect, green, true);
+                marqueeLabel(renderer, small, item.name,
+                             48, y+5, 1160, index == shopCursor, white);
+                label(renderer, small,
+                      item.shop + "  |  " +
+                      (item.size ? formatTransferBytes(item.size) :
+                       std::string("Size unknown")) +
+                      "  |  Direct HTTPS",
+                      48, y+33, 1160, muted);
+            }
+
         } else if (page == Page::Torrents && !rows.empty()) {
             const auto& g =
                 games[rows[cursor]];
@@ -5142,7 +5201,7 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "SEARCH RESULTS  |  A Download / Add to Debrid  |  X View Files  |  - Filter  |  Y Refresh  |  B Back",
+                "TORRENTS [active]  |  SHOPS [ZL]  |  A Add to Debrid  |  X Files  |  - Filter  |  Y Refresh  |  B Back",
                 32,122,1200,muted
             );
 
