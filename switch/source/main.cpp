@@ -2939,11 +2939,11 @@ int main(int, char**) {
                                 release.infoHash
                         ) {
                             alreadyPresent = true;
-                        if (existing.seeders < 0 && release.seeders >= 0)
-                            existing.seeders = release.seeders;
-                        if (existing.leechers < 0 && release.leechers >= 0)
-                            existing.leechers = release.leechers;
-                        break;
+                            if (existing.seeders < 0 && release.seeders >= 0)
+                                existing.seeders = release.seeders;
+                            if (existing.leechers < 0 && release.leechers >= 0)
+                                existing.leechers = release.leechers;
+                            break;
                         }
 
                         if (
@@ -2954,11 +2954,11 @@ int main(int, char**) {
                                 release.title
                         ) {
                             alreadyPresent = true;
-                        if (existing.seeders < 0 && release.seeders >= 0)
-                            existing.seeders = release.seeders;
-                        if (existing.leechers < 0 && release.leechers >= 0)
-                            existing.leechers = release.leechers;
-                        break;
+                            if (existing.seeders < 0 && release.seeders >= 0)
+                                existing.seeders = release.seeders;
+                            if (existing.leechers < 0 && release.leechers >= 0)
+                                existing.leechers = release.leechers;
+                            break;
                         }
                     }
 
