@@ -1767,6 +1767,7 @@ int main(int, char**) {
     std::future<DebridManagerResult> pendingDebridManager;
     std::future<DebridRemoveResult> pendingDebridRemove;
     std::future<sgb::InstallResult> pendingInstall;
+    bool installCpuBoosted = false;
     sgb::LiveSearchProgress liveSearchProgress;
 
     std::shared_ptr<sgb::InstallProgress>
@@ -2594,6 +2595,13 @@ int main(int, char**) {
                 auto result =
                     pendingInstall.get();
 
+                // Match Sphaira's FastLoad CPU mode for the duration of
+                // active cloud installation, then restore normal clocks.
+                if (installCpuBoosted) {
+                    appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+                    installCpuBoosted = false;
+                }
+
                 if (activeRowValid) {
                     auto& row =
                         installRows[
@@ -2678,6 +2686,14 @@ int main(int, char**) {
                 installRows[i].error.clear();
 
                 persistInstallQueue();
+
+                // Sphaira enables this for transfer progress by default.
+                // Without it, concurrent HTTPS, SD writes and rendering all
+                // compete at the normal CPU clock during installations.
+                if (!installCpuBoosted) {
+                    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+                    installCpuBoosted = true;
+                }
 
                 pendingInstall =
                     std::async(
@@ -5276,6 +5292,10 @@ int main(int, char**) {
 
     if (pendingInstall.valid())
         pendingInstall.wait();
+    if (installCpuBoosted) {
+        appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+        installCpuBoosted = false;
+    }
     saveState(); for (auto& p : covers) SDL_DestroyTexture(p.second);
     TTF_CloseFont(small); TTF_CloseFont(big); SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window);
     IMG_Quit(); TTF_Quit(); SDL_Quit(); plExit(); curl_global_cleanup(); romfsExit(); socketExit();
