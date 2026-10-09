@@ -1330,6 +1330,7 @@ struct InstallQueueRow {
     std::uint64_t httpWaitMs = 0;
     std::uint64_t bufferWaitMs = 0;
     bool hasTimings = false;
+    std::string benchmarkResult;
     std::string error;
 };
 
@@ -1461,6 +1462,7 @@ static std::vector<InstallQueueRow> loadInstallQueue(
             row.httpWaitMs = node.value("httpWaitMs", std::uint64_t(0));
             row.bufferWaitMs = node.value("bufferWaitMs", std::uint64_t(0));
             row.hasTimings = node.value("hasTimings", false);
+            row.benchmarkResult = node.value("benchmarkResult", "");
 
             if (
                 row.state == "Downloading" ||
@@ -1554,7 +1556,8 @@ static void saveInstallQueue(
             {"sdWriteMs", row.sdWriteMs},
             {"httpWaitMs", row.httpWaitMs},
             {"bufferWaitMs", row.bufferWaitMs},
-            {"hasTimings", row.hasTimings}
+            {"hasTimings", row.hasTimings},
+            {"benchmarkResult", row.benchmarkResult}
         });
     }
 
@@ -1782,6 +1785,9 @@ int main(int, char**) {
     std::future<DebridManagerResult> pendingDebridManager;
     std::future<DebridRemoveResult> pendingDebridRemove;
     std::future<sgb::InstallResult> pendingInstall;
+    std::future<sgb::NetworkBenchmarkResult> pendingNetworkBenchmark;
+    std::shared_ptr<std::atomic<bool>> networkBenchmarkCancel;
+    std::string networkBenchmarkTargetId;
     bool installCpuBoosted = false;
     sgb::LiveSearchProgress liveSearchProgress;
 
@@ -2560,6 +2566,28 @@ int main(int, char**) {
                 startDebridManagerRefresh();
         }
 
+        // Network-only TorBox test: never opens Switch content storage.
+        if (pendingNetworkBenchmark.valid() &&
+            pendingNetworkBenchmark.wait_for(
+                std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+            const auto result = pendingNetworkBenchmark.get();
+            for (auto& row : installRows) {
+                if (row.job.id == networkBenchmarkTargetId) {
+                    row.benchmarkResult = result.message;
+                    break;
+                }
+            }
+            status = result.message;
+            networkBenchmarkTargetId.clear();
+            networkBenchmarkCancel.reset();
+            if (installCpuBoosted && !pendingInstall.valid()) {
+                appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+                installCpuBoosted = false;
+            }
+            persistInstallQueue();
+        }
+
         if (
             pendingInstall.valid() &&
             activeInstallProgress
@@ -2666,7 +2694,8 @@ int main(int, char**) {
             }
         }
 
-        if (!pendingInstall.valid()) {
+        if (!pendingInstall.valid() &&
+            !pendingNetworkBenchmark.valid()) {
             for (
                 size_t i = 0;
                 i < installRows.size();
@@ -3593,6 +3622,39 @@ int main(int, char**) {
             }
 
             if (!installRows.empty()) {
+                // ZL benchmarks existing TorBox queue entry over HTTP only.
+                // A second press cancels the diagnostic; no install is started.
+                if (keys & HidNpadButton_ZL) {
+                    if (pendingNetworkBenchmark.valid()) {
+                        if (networkBenchmarkCancel)
+                            networkBenchmarkCancel->store(true);
+                        status = "Cancelling network benchmark...";
+                    } else if (pendingInstall.valid()) {
+                        status = "Finish the installation before testing HTTP";
+                    } else {
+                        const auto job = installRows[installManagerCursor].job;
+                        const auto config = debridConfig;
+                        networkBenchmarkTargetId = job.id;
+                        networkBenchmarkCancel =
+                            std::make_shared<std::atomic<bool>>(false);
+                        auto cancel = networkBenchmarkCancel;
+                        installRows[installManagerCursor].benchmarkResult =
+                            "HTTP-only test running (1x then 4x)...";
+                        status = "Benchmarking TorBox HTTP with no SD writes...";
+                        // Apply the same CPU boost as a real install.
+                        if (!installCpuBoosted) {
+                            appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+                            installCpuBoosted = true;
+                        }
+                        pendingNetworkBenchmark = std::async(
+                            std::launch::async,
+                            [config, job, cancel]() {
+                                return sgb::runNetworkBenchmark(
+                                    config, job, cancel);
+                            });
+                    }
+                }
+
                 if (
                     (keys & HidNpadButton_Up) &&
                     installManagerCursor > 0
@@ -4484,7 +4546,7 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "A Details | X Cancel/Remove | Y Retry | L/R Page | B Back",
+                "ZL HTTP Test | A Details | X Cancel/Remove | Y Retry | L/R Page | B Back",
                 32,112,1200,muted
             );
 
@@ -4607,7 +4669,10 @@ int main(int, char**) {
                 // global status field to display timings.
                 const auto& selected = installRows[
                     std::min(installManagerCursor, installRows.size() - 1)];
-                if (selected.hasTimings) {
+                if (!selected.benchmarkResult.empty()) {
+                    label(renderer, small, selected.benchmarkResult,
+                          32, 645, 1216, green);
+                } else if (selected.hasTimings) {
                     char timingText[256]{};
                     std::snprintf(timingText, sizeof(timingText),
                         "Timing: SD write %.1fs  |  HTTP wait %.1fs  |  Buffer wait %.1fs",
@@ -5338,6 +5403,12 @@ int main(int, char**) {
 
     if (pendingInstall.valid())
         pendingInstall.wait();
+
+    if (networkBenchmarkCancel)
+        networkBenchmarkCancel->store(true);
+    if (pendingNetworkBenchmark.valid())
+        pendingNetworkBenchmark.wait();
+
     if (installCpuBoosted) {
         appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
         installCpuBoosted = false;
