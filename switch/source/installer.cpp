@@ -354,14 +354,12 @@ public:
         curl_easy_setopt(
             curl_,
             CURLOPT_PROTOCOLS,
-            CURLPROTO_HTTP |
-                CURLPROTO_HTTPS);
+            CURLPROTO_HTTPS);
 
         curl_easy_setopt(
             curl_,
             CURLOPT_REDIR_PROTOCOLS,
-            CURLPROTO_HTTP |
-                CURLPROTO_HTTPS);
+            CURLPROTO_HTTPS);
 
 #ifdef __SWITCH__
         curl_easy_setopt(
@@ -3698,34 +3696,37 @@ InstallResult runInstallJob(
     (void)cacheDirectory;
 
     try {
-        if (
-            config.service ==
-                DebridService::None ||
-            config.apiKey.empty()
-        ) {
-            throw std::runtime_error(
-                "Debrid authorization is required");
+        // Shop jobs are direct, user-authorized HTTPS links from Tinfoil
+        // public index files. The existing content installer handles the
+        // same NSP/NSZ/XCI/XCZ package bytes and Install Manager progress.
+        const bool shopJob = job.source == "OpenNX Shop";
+        std::string url;
+        if (shopJob) {
+            if (job.file.link.rfind("https://", 0) != 0 ||
+                job.file.link.find('\n') != std::string::npos ||
+                job.file.link.find('\r') != std::string::npos) {
+                throw std::runtime_error("Shop package needs a direct HTTPS URL");
+            }
+            // Fragment is Tinfoil's optional filename override.
+            url = job.file.link.substr(0, job.file.link.find('#'));
+            if (!endsWithInsensitive(job.file.name, ".nsp") &&
+                !endsWithInsensitive(job.file.name, ".nsz") &&
+                !endsWithInsensitive(job.file.name, ".xci") &&
+                !endsWithInsensitive(job.file.name, ".xcz"))
+                throw std::runtime_error("Unsupported shop package extension");
+        } else {
+            if (config.service == DebridService::None ||
+                config.apiKey.empty())
+                throw std::runtime_error("Debrid authorization is required");
+            if (job.remoteId.empty())
+                throw std::runtime_error("Debrid torrent ID is missing");
+            auto backend = createDebridBackend(config);
+            if (!backend)
+                throw std::runtime_error("Unable to initialize debrid service");
+            url = backend->downloadUrl(job.remoteId, job.file);
+            if (url.empty())
+                throw std::runtime_error("Debrid did not return a download URL");
         }
-
-        if (job.remoteId.empty())
-            throw std::runtime_error(
-                "Debrid torrent ID is missing");
-
-        auto backend =
-            createDebridBackend(config);
-
-        if (!backend)
-            throw std::runtime_error(
-                "Unable to initialize debrid service");
-
-        const std::string url =
-            backend->downloadUrl(
-                job.remoteId,
-                job.file);
-
-        if (url.empty())
-            throw std::runtime_error(
-                "Debrid did not return a download URL");
 
         if (
             cancelRequested &&
