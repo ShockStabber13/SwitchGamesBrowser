@@ -2630,17 +2630,10 @@ void installEntry(
     int basePercent,
     int spanPercent)
 {
-    // Concurrent ranged GETs provide better throughput on servers that
-    // limit per-connection speed. Small entries use the original pipeline.
-    if (entry.size >= 32ULL * 1024 * 1024) {
-        installEntryParallel(package, entry, contentId, storage,
-                             progress, cancel, basePercent, spanPercent);
-        return;
-    }
-
-    // Keep libcurl and content-storage writes on separate threads. Network
-    // callbacks never block on ncmContentStorageWritePlaceHolder directly.
-    // The four-block queue caps buffered data at roughly 4 MiB.
+    // Match Sphaira's continuous HTTP read pattern for throughput testing.
+    // The four-connection ranged implementation remains available above for
+    // a reversible A/B comparison, but is not selected in this test build.
+    // Reads and NCM writes still run concurrently on separate threads.
     constexpr std::size_t streamBufferSize = 4 * 1024 * 1024;
     constexpr std::size_t maxQueuedBlocks = 2;
 
