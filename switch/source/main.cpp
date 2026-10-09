@@ -4621,7 +4621,7 @@ int main(int, char**) {
         } else if (page == Page::Settings) {
             label(
                 renderer,big,
-                "SETTINGS"
+                "SETTINGS",
                 32,70,1200,green
             );
 
