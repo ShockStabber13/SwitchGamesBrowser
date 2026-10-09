@@ -92,3 +92,5 @@ std::vector<std::string> probeCpuClockReadOnly() {
     lines.emplace_back("Read-only test finished; no overrides applied.");
     return lines;
 }
+
+} // namespace sgb
