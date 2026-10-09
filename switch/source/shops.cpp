@@ -149,11 +149,20 @@ std::uint64_t sizeField(const Json& object) {
     }
     return 0;
 }
-std::string comparable(std::string text) {
-    text = lower(std::move(text));
-    for (char& c : text)
-        if (c == '_' || c == '.' || c == '-' || c == ':') c = ' ';
-    return text;
+// Canonicalize titles for search: the catalog contains symbols like
+// Mario Kart™ 8 and Crash™ Team Racing that IGDB titles omit.
+// Ignore punctuation, whitespace and UTF-8 symbol bytes consistently.
+std::string comparable(const std::string& text) {
+    std::string result;
+    result.reserve(text.size());
+    for (unsigned char byte : text) {
+        if (byte >= 'A' && byte <= 'Z')
+            result.push_back(static_cast<char>(byte + ('a' - 'A')));
+        else if ((byte >= 'a' && byte <= 'z') ||
+                 (byte >= '0' && byte <= '9'))
+            result.push_back(static_cast<char>(byte));
+    }
+    return result;
 }
 struct Directory { std::string url; std::size_t depth = 0; };
 std::string entryLink(const Json& obj) {
