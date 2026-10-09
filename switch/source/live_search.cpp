@@ -685,6 +685,10 @@ LiveSearchResult runLiveSearch(
                                 release.source =
                                     fresh[freshIndex]
                                         .source;
+                                release.seeders =
+                                    fresh[freshIndex].provider.seeders;
+                                release.leechers =
+                                    fresh[freshIndex].provider.leechers;
 
                                 progress.publishResult(
                                     release,
