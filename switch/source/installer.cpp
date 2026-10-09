@@ -541,12 +541,6 @@ public:
         }
     }
 
-    // The on-console CyberFoil relay is single-client; avoid competing
-    // range requests against its serialized upstream download path.
-    bool isLocalRelay() const {
-        return initialUrl_.rfind("http://127.0.0.1:8080/raw?u=", 0) == 0;
-    }
-
     // Separate easy handles are required for concurrent HTTP ranges.
     std::unique_ptr<HttpPackageSource> clone() const {
         return std::make_unique<HttpPackageSource>(url_, cancel_, knownSize_);
@@ -2921,11 +2915,12 @@ void installEntry(
     constexpr u64 largeEntryThreshold = 32ULL * 1024 * 1024;
     const bool largeEntry = entry.size >= largeEntryThreshold;
 
-    // HTTP/1.1: use the existing four concurrent 4 MiB range readers
-    // for large files from network providers. The local CyberFoil relay
-    // can only serve one request at a time, so keep it on the efficient
-    // single persistent connection instead.
-    if (largeEntry && !package.source->isLocalRelay()) {
+    // Keep a single continuous HTTP/1.1 ranged GET per NCA/NCZ,
+    // including TorBox, AllDebrid, and the local CyberFoil relay.
+    // Preserve the optional four-worker implementation for future tests,
+    // but explicitly disable it for all providers.
+    constexpr bool useParallelRangeDownloads = false;
+    if (useParallelRangeDownloads && largeEntry) {
         installEntryParallel(package, entry, contentId, storage,
                              progress, cancel, basePercent, spanPercent);
         return;
