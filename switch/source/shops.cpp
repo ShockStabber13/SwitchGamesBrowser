@@ -164,6 +164,50 @@ std::string comparable(const std::string& text) {
     }
     return result;
 }
+
+// An asterisk is a wildcard for zero or more characters (no regex dot).
+// Example: "MarioKart8" -> "*m*a*r*i*o*k*a*r*t*8*".
+// Ignore spaces and punctuation, including trademark symbols in shop names.
+std::string wildcardPattern(const std::string& title) {
+    const std::string normalized = comparable(title);
+    if (normalized.empty()) return "";
+    std::string pattern;
+    pattern.reserve(normalized.size() * 2 + 1);
+    pattern.push_back('*');
+    for (const char c : normalized) {
+        pattern.push_back(c);
+        pattern.push_back('*');
+    }
+    return pattern;
+}
+
+bool wildcardMatches(const std::string& text, const std::string& pattern) {
+    if (pattern.empty()) return false;
+    std::size_t textIndex = 0;
+    std::size_t patternIndex = 0;
+    std::size_t lastStar = std::string::npos;
+    std::size_t retryIndex = 0;
+
+    while (textIndex < text.size()) {
+        if (patternIndex < pattern.size() &&
+            text[textIndex] == pattern[patternIndex]) {
+            ++textIndex;
+            ++patternIndex;
+        } else if (patternIndex < pattern.size() &&
+                   pattern[patternIndex] == '*') {
+            lastStar = patternIndex++;
+            retryIndex = textIndex;
+        } else if (lastStar != std::string::npos) {
+            patternIndex = lastStar + 1;
+            textIndex = ++retryIndex;
+        } else {
+            return false;
+        }
+    }
+    while (patternIndex < pattern.size() && pattern[patternIndex] == '*')
+        ++patternIndex;
+    return patternIndex == pattern.size();
+}
 struct Directory { std::string url; std::size_t depth = 0; };
 std::string entryLink(const Json& obj) {
     return obj.is_string() ? obj.get<std::string>() : stringField(obj, "url");
@@ -343,7 +387,7 @@ ShopSearchResult searchNotUltraNxRelay(
             throw std::runtime_error("NotUltraNX relay returned invalid catalog JSON");
         }
 
-        const std::string query = comparable(title);
+        const std::string query = wildcardPattern(title);
         std::set<std::string> seen;
         std::vector<ShopEntry> matches;
         for (const auto& row : catalog["files"]) {
@@ -356,7 +400,7 @@ ShopSearchResult searchNotUltraNxRelay(
                 link.rfind(kNotUltraNxDownload, 0) != 0 ||
                 link.find('\r') != std::string::npos ||
                 link.find('\n') != std::string::npos ||
-                comparable(name).find(query) == std::string::npos)
+                !wildcardMatches(comparable(name), query))
                 continue;
             addUnique(matches, seen, {name, link, "NotUltraNX", sizeField(row)});
         }
