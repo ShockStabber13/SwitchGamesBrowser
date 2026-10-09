@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 #include <climits>
+#include <cstdint>
 #include <initializer_list>
 #include <string>
 
@@ -37,13 +38,13 @@ inline int jsonCount(
         auto found = item.find(key);
         if (found == item.end() || found->is_null())
             continue;
-        if (found->is_number_integer()) {
-            const auto number = found->get<std::int64_t>();
-            if (number >= 0 && number <= INT_MAX)
-                return static_cast<int>(number);
-        } else if (found->is_number_unsigned()) {
+        if (found->is_number_unsigned()) {
             const auto number = found->get<std::uint64_t>();
             if (number <= INT_MAX)
+                return static_cast<int>(number);
+        } else if (found->is_number_integer()) {
+            const auto number = found->get<std::int64_t>();
+            if (number >= 0 && number <= INT_MAX)
                 return static_cast<int>(number);
         } else if (found->is_string()) {
             const int count = nonnegativeCount(found->get<std::string>());
