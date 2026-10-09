@@ -1951,7 +1951,7 @@ int main(int, char**) {
     auto startShopSearch = [&](size_t gameIndex) {
         if (gameIndex >= games.size()) return;
         if (pendingShopSearch.valid()) {
-            status = "An OpenNX shop search is still running";
+            status = "A NotUltraNX search is still running";
             page = Page::ShopResults;
             return;
         }
@@ -1962,11 +1962,11 @@ int main(int, char**) {
         const auto cancel = shopSearchCancel;
         const std::string title = games[gameIndex].title;
         page = Page::ShopResults;
-        status = "Searching OpenNX-listed shops...";
+        status = "Searching NotUltraNX relay...";
         pendingShopSearch = std::async(
             std::launch::async,
             [title, cancel, &shopSearchProgress]() {
-                return sgb::searchOpenNxShops(title, shopSearchProgress, cancel);
+                return sgb::searchNotUltraNxRelay(title, shopSearchProgress, cancel);
             });
     };
 
@@ -3073,15 +3073,15 @@ int main(int, char**) {
                 shopGameIndex < games.size()) {
                 const auto& item = shopRows[shopCursor];
                 if (!sgb::isShopPackage(item.name) ||
-                    item.url.rfind("https://", 0) != 0) {
-                    status = "Shop entry is not a direct HTTPS package";
+                    item.url.rfind("http://127.0.0.1:8080/raw?u=", 0) != 0) {
+                    status = "NotUltraNX relay URL is invalid";
                 } else {
                     sgb::DebridFile file;
                     file.name = item.name;
                     file.link = item.url;
                     file.size = item.size;
                     appendInstallJob(games[shopGameIndex].title, item.name,
-                                     "", "OpenNX Shop", "", file);
+                                     "", "NotUltraNX Relay", "", file);
                     persistInstallQueue();
                     installManagerCursor = installRows.size() - 1;
                     installManagerReturnPage = Page::ShopResults;
@@ -5120,7 +5120,7 @@ int main(int, char**) {
                   52, 490, 1140,
                   scrapeChoiceCursor == 2 ? green : white);
             label(renderer, small,
-                  "Search game title across OpenNX-listed shops",
+                  "Search NotUltraNX catalog through the existing relay",
                   52, 538, 1140, muted);
 
             label(
@@ -5161,12 +5161,12 @@ int main(int, char**) {
                       "Searching " +
                       std::to_string(shopSearchProgress.shopsDone.load()) + "/" +
                       std::to_string(shopSearchProgress.shopsTotal.load()) +
-                      " OpenNX shops", 32, 636, 1200, green);
+                      " NotUltraNX relay source", 32, 636, 1200, green);
             }
             if (shopRows.empty()) {
                 label(renderer, big,
-                      pendingShopSearch.valid() ? "Searching shop indexes..." :
-                      "No compatible direct HTTPS packages found",
+                      pendingShopSearch.valid() ? "Reading NotUltraNX catalog..." :
+                      "No matching NotUltraNX base games",
                       32, 300, 1200, muted);
             }
             const size_t visibleStart = (shopCursor / 7) * 7;
@@ -5185,7 +5185,7 @@ int main(int, char**) {
                       item.shop + "  |  " +
                       (item.size ? formatTransferBytes(item.size) :
                        std::string("Size unknown")) +
-                      "  |  Direct HTTPS",
+                      "  |  Relay HTTP",
                       48, y+33, 1160, muted);
             }
 
