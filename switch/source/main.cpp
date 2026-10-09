@@ -2807,7 +2807,7 @@ int main(int, char**) {
                 bool alreadyPresent = false;
 
                 for (
-                    const auto& existing :
+                    auto& existing :
                         liveGame.releases
                 ) {
                     if (
@@ -2816,6 +2816,10 @@ int main(int, char**) {
                             release.infoHash
                     ) {
                         alreadyPresent = true;
+                        if (existing.seeders < 0 && release.seeders >= 0)
+                            existing.seeders = release.seeders;
+                        if (existing.leechers < 0 && release.leechers >= 0)
+                            existing.leechers = release.leechers;
                         break;
                     }
 
@@ -2827,6 +2831,10 @@ int main(int, char**) {
                             release.title
                     ) {
                         alreadyPresent = true;
+                        if (existing.seeders < 0 && release.seeders >= 0)
+                            existing.seeders = release.seeders;
+                        if (existing.leechers < 0 && release.leechers >= 0)
+                            existing.leechers = release.leechers;
                         break;
                     }
                 }
@@ -2922,7 +2930,7 @@ int main(int, char**) {
                     bool alreadyPresent = false;
 
                     for (
-                        const auto& existing :
+                        auto& existing :
                             finishedGame.releases
                     ) {
                         if (
@@ -2931,7 +2939,11 @@ int main(int, char**) {
                                 release.infoHash
                         ) {
                             alreadyPresent = true;
-                            break;
+                        if (existing.seeders < 0 && release.seeders >= 0)
+                            existing.seeders = release.seeders;
+                        if (existing.leechers < 0 && release.leechers >= 0)
+                            existing.leechers = release.leechers;
+                        break;
                         }
 
                         if (
@@ -2942,7 +2954,11 @@ int main(int, char**) {
                                 release.title
                         ) {
                             alreadyPresent = true;
-                            break;
+                        if (existing.seeders < 0 && release.seeders >= 0)
+                            existing.seeders = release.seeders;
+                        if (existing.leechers < 0 && release.leechers >= 0)
+                            existing.leechers = release.leechers;
+                        break;
                         }
                     }
 
