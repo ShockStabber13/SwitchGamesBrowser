@@ -2668,8 +2668,17 @@ void installEntryParallel(
     constexpr std::size_t maxBufferedBlocks = 2;
     const u64 rangeCount = 1 + (entry.size - 1) / rangeSize;
 
+    // Stage 1: four HTTP readers; stage 2: ordered NCA/NCZ processing
+    // in this consumer; stage 3: dedicated bounded SD write worker.
+    // Construct writer first so NcaOutput is destroyed before its storage
+    // worker, and always join the worker before placeholder cleanup.
+    AsyncContentWriter writer(storage, contentId, cancel, progress);
     NcaOutput output(
-        storage, contentId, cancel, progress, basePercent, spanPercent);
+        storage, contentId, cancel, progress, basePercent, spanPercent,
+        [&writer](u64 offset, const u8* data, std::size_t size) {
+            writer.append(offset, data, size);
+        },
+        [&writer]() { writer.finish(); });
 
     struct Slot {
         std::deque<std::vector<u8>> blocks;
@@ -2821,12 +2830,10 @@ void installEntryParallel(
                 if (finished)
                     break;
 
-                const auto writeStarted = std::chrono::steady_clock::now();
+                // The processing thread performs NCZ decompression and
+                // crypto, queuing processed output without waiting for
+                // each physical SD write unless the bounded queue fills.
                 output.write(block.data(), block.size());
-                progress.writerActiveNanoseconds.fetch_add(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - writeStarted).count(),
-                    std::memory_order_relaxed);
                 progress.addTransferBytes(block.size());
             }
         }
@@ -2841,6 +2848,9 @@ void installEntryParallel(
             if (thread.joinable())
                 thread.join();
         }
+        // No storage calls may remain outstanding when NcaOutput's
+        // destructor removes an incomplete placeholder.
+        writer.abort();
         throw;
     }
 }
