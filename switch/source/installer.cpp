@@ -2470,7 +2470,9 @@ void installEntryParallel(
 {
     progress.parallelEntryCount.fetch_add(1, std::memory_order_relaxed);
     constexpr std::size_t connections = 4;
-    constexpr u64 rangeSize = 16ULL * 1024 * 1024;
+    // A/B test: fewer short HTTP range requests and less CDN request churn.
+    // Buffer memory stays capped to two 4 MiB blocks per connection.
+    constexpr u64 rangeSize = 64ULL * 1024 * 1024;
     // Match Sphaira's 4 MiB NCA write granularity.
     constexpr std::size_t blockSize = 4 * 1024 * 1024;
     constexpr std::size_t maxBufferedBlocks = 2;
