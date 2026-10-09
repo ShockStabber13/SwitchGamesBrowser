@@ -105,7 +105,9 @@ Json releaseToJson(const Release& release)
         {"title", release.title},
         {"magnet", release.magnet},
         {"infoHash", release.infoHash},
-        {"source", release.source}
+        {"source", release.source},
+        {"seeders", release.seeders},
+        {"leechers", release.leechers}
     };
 }
 
@@ -135,6 +137,8 @@ bool releaseFromJson(
         item.value(
             "source",
             std::string{});
+    release.seeders = releasePeerCount(item, "seeders");
+    release.leechers = releasePeerCount(item, "leechers");
 
     return
         !release.title.empty() &&
