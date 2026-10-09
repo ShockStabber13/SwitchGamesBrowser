@@ -2446,8 +2446,8 @@ void installEntry(
     // Keep libcurl and content-storage writes on separate threads. Network
     // callbacks never block on ncmContentStorageWritePlaceHolder directly.
     // The four-block queue caps buffered data at roughly 4 MiB.
-    constexpr std::size_t streamBufferSize = 1024 * 1024;
-    constexpr std::size_t maxQueuedBlocks = 4;
+    constexpr std::size_t streamBufferSize = 4 * 1024 * 1024;
+    constexpr std::size_t maxQueuedBlocks = 2;
 
     NcaOutput output(
         storage, contentId, cancel, progress, basePercent, spanPercent);
@@ -2490,6 +2490,7 @@ void installEntry(
                 entry.offset,
                 entry.size,
                 [&](const u8* data, std::size_t bytes) {
+                    progress.addNetworkBytes(static_cast<std::uint64_t>(bytes));
                     while (bytes) {
                         if (stopDownload.load() || (cancel && cancel->load())) {
                             throw std::runtime_error("Install cancelled");
@@ -2911,6 +2912,8 @@ void InstallProgress::beginTransfer(
     bytesDone.store(0);
     bytesTotal.store(totalBytes);
     bytesPerSecond.store(0);
+    networkBytesPerSecond.store(0);
+    networkBytesDone.store(0);
 
     std::lock_guard<std::mutex>
         lock(mutex);
@@ -2919,6 +2922,8 @@ void InstallProgress::beginTransfer(
         std::chrono::steady_clock::now();
 
     transferSampleBytes_ = 0;
+    networkSampleStarted_ = transferSampleStarted_;
+    networkSampleBytes_ = 0;
 }
 
 void InstallProgress::addTransferBytes(
@@ -2976,6 +2981,23 @@ void InstallProgress::addTransferBytes(
     }
 }
 
+void InstallProgress::addNetworkBytes(std::uint64_t bytes)
+{
+    if (!bytes) return;
+    const auto done = networkBytesDone.fetch_add(bytes) + bytes;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsedMs = std::chrono::duration_cast<
+        std::chrono::milliseconds>(now - networkSampleStarted_).count();
+    if (elapsedMs >= 1000) {
+        const auto delta = done - networkSampleBytes_;
+        networkBytesPerSecond.store(
+            delta * 1000 / static_cast<std::uint64_t>(elapsedMs));
+        networkSampleBytes_ = done;
+        networkSampleStarted_ = now;
+    }
+}
+
 void InstallProgress::snapshot(
     std::string& outStage,
     int& outPercent,
@@ -2994,7 +3016,8 @@ void InstallProgress::snapshot(
 void InstallProgress::snapshotTransfer(
     std::uint64_t& outDone,
     std::uint64_t& outTotal,
-    std::uint64_t& outBytesPerSecond) const
+    std::uint64_t& outBytesPerSecond,
+    std::uint64_t& outNetworkBytesPerSecond) const
 {
     outDone =
         bytesDone.load();
@@ -3004,6 +3027,7 @@ void InstallProgress::snapshotTransfer(
 
     outBytesPerSecond =
         bytesPerSecond.load();
+    outNetworkBytesPerSecond = networkBytesPerSecond.load();
 }
 
 InstallResult runInstallJob(
