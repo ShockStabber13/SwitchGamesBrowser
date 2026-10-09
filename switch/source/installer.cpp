@@ -2484,8 +2484,8 @@ void installEntryParallel(
                     changed.wait(lock, [&]() {
                         return stop.load() ||
                             (cancel && cancel->load()) ||
-                            (nextRequest < count &&
-                             nextRequest - nextWrite < connections);
+                            nextRequest == count ||
+                            nextRequest - nextWrite < connections;
                     });
                     if (stop.load() || (cancel && cancel->load())) {
                         break;
