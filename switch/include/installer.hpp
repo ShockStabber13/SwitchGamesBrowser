@@ -34,6 +34,10 @@ struct InstallProgress {
     std::atomic<std::uint64_t>
         bytesPerSecond{0};
 
+    // Measured independently of content-storage writes.
+    std::atomic<std::uint64_t> networkBytesPerSecond{0};
+    std::atomic<std::uint64_t> networkBytesDone{0};
+
     mutable std::mutex mutex;
     std::string stage = "Queued";
     std::string detail;
@@ -49,6 +53,9 @@ struct InstallProgress {
     void addTransferBytes(
         std::uint64_t bytes);
 
+    void addNetworkBytes(
+        std::uint64_t bytes);
+
     void snapshot(
         std::string& outStage,
         int& outPercent,
@@ -57,7 +64,8 @@ struct InstallProgress {
     void snapshotTransfer(
         std::uint64_t& outDone,
         std::uint64_t& outTotal,
-        std::uint64_t& outBytesPerSecond) const;
+        std::uint64_t& outBytesPerSecond,
+        std::uint64_t& outNetworkBytesPerSecond) const;
 
 private:
     std::chrono::steady_clock::time_point
@@ -65,6 +73,9 @@ private:
 
     std::uint64_t
         transferSampleBytes_ = 0;
+
+    std::chrono::steady_clock::time_point networkSampleStarted_{};
+    std::uint64_t networkSampleBytes_ = 0;
 };
 
 struct InstallResult {
