@@ -2453,7 +2453,8 @@ void installEntryParallel(
 {
     constexpr std::size_t connections = 4;
     constexpr u64 rangeSize = 16ULL * 1024 * 1024;
-    constexpr std::size_t blockSize = 1024 * 1024;
+    // Match Sphaira's 4 MiB NCA write granularity.
+    constexpr std::size_t blockSize = 4 * 1024 * 1024;
     constexpr std::size_t maxBufferedBlocks = 2;
     const u64 rangeCount = 1 + (entry.size - 1) / rangeSize;
 
@@ -3177,18 +3178,9 @@ void InstallProgress::addTransferBytes(
 void InstallProgress::addNetworkBytes(std::uint64_t bytes)
 {
     if (!bytes) return;
-    const auto done = networkBytesDone.fetch_add(bytes) + bytes;
-    std::lock_guard<std::mutex> lock(mutex);
-    const auto now = std::chrono::steady_clock::now();
-    const auto elapsedMs = std::chrono::duration_cast<
-        std::chrono::milliseconds>(now - networkSampleStarted_).count();
-    if (elapsedMs >= 1000) {
-        const auto delta = done - networkSampleBytes_;
-        networkBytesPerSecond.store(
-            delta * 1000 / static_cast<std::uint64_t>(elapsedMs));
-        networkSampleBytes_ = done;
-        networkSampleStarted_ = now;
-    }
+    // Libcurl calls this frequently from up to four download threads.
+    // The UI samples networkBytesDone directly for its live speed readout.
+    networkBytesDone.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void InstallProgress::snapshot(
