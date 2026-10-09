@@ -97,6 +97,19 @@ struct InstallResult {
     std::string message;
 };
 
+// Downloads sample TorBox ranges into RAM/discards them. Never opens
+// content-storage or installs files. Reports 1 vs 4 HTTP streams.
+struct NetworkBenchmarkResult {
+    bool success = false;
+    std::string message;
+};
+
+NetworkBenchmarkResult runNetworkBenchmark(
+    const DebridConfig& config,
+    const InstallJob& job,
+    const std::shared_ptr<std::atomic<bool>>& cancelRequested
+);
+
 InstallResult runInstallJob(
     const DebridConfig& config,
     const InstallJob& job,
