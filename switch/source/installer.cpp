@@ -480,6 +480,11 @@ public:
         }
     }
 
+    // Separate easy handles are required for concurrent HTTP ranges.
+    std::unique_ptr<HttpPackageSource> clone() const {
+        return std::make_unique<HttpPackageSource>(url_, cancel_, knownSize_);
+    }
+
     void readExact(
         u64 offset,
         void* output,
@@ -2433,6 +2438,148 @@ void installApplicationRecord(
             "Failed to register application");
 }
 
+// Fetch a large NCA using four independent HTTP range connections.  Only
+// four 8 MiB chunks can be outstanding at once, and the consumer writes each
+// completed chunk in ascending file order. This preserves NCZ stream ordering.
+void installEntryParallel(
+    Package& package,
+    const PackageEntry& entry,
+    const NcmContentId& contentId,
+    NcmContentStorage* storage,
+    InstallProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancel,
+    int basePercent,
+    int spanPercent)
+{
+    constexpr std::size_t connections = 4;
+    constexpr u64 chunkSize = 8ULL * 1024 * 1024;
+    const u64 count = 1 + (entry.size - 1) / chunkSize;
+
+    NcaOutput output(
+        storage, contentId, cancel, progress, basePercent, spanPercent);
+
+    struct Slot {
+        std::vector<u8> data;
+        bool ready = false;
+    };
+    std::array<Slot, connections> slots;
+    std::mutex mutex;
+    std::condition_variable changed;
+    u64 nextRequest = 0;
+    u64 nextWrite = 0;
+    std::exception_ptr networkError;
+    std::atomic<bool> stop{false};
+
+    std::vector<std::thread> workers;
+    workers.reserve(connections);
+
+    const auto worker = [&]() {
+        try {
+            // A libcurl easy handle must never be shared between threads.
+            auto source = package.source->clone();
+            while (!stop.load()) {
+                u64 index;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    changed.wait(lock, [&]() {
+                        return stop.load() ||
+                            (cancel && cancel->load()) ||
+                            (nextRequest < count &&
+                             nextRequest - nextWrite < connections);
+                    });
+                    if (stop.load() || (cancel && cancel->load())) {
+                        break;
+                    }
+                    if (nextRequest == count) {
+                        break;
+                    }
+                    index = nextRequest++;
+                }
+
+                const u64 localOffset = index * chunkSize;
+                const auto length = static_cast<std::size_t>(
+                    std::min<u64>(chunkSize, entry.size - localOffset));
+                std::vector<u8> bytes(length);
+                std::size_t received = 0;
+                source->streamExact(
+                    entry.offset + localOffset,
+                    length,
+                    [&](const u8* data, std::size_t size) {
+                        if (size > bytes.size() - received) {
+                            throw std::runtime_error("Invalid HTTP range length");
+                        }
+                        std::memcpy(bytes.data() + received, data, size);
+                        received += size;
+                        progress.addNetworkBytes(size);
+                    },
+                    &stop);
+
+                if (stop.load()) break;
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    auto& slot = slots[index % connections];
+                    slot.data = std::move(bytes);
+                    slot.ready = true;
+                }
+                changed.notify_all();
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!networkError) networkError = std::current_exception();
+            }
+            stop.store(true);
+            changed.notify_all();
+        }
+    };
+
+    try {
+        for (std::size_t i = 0; i < connections; ++i) {
+            workers.emplace_back(worker);
+        }
+
+        for (u64 index = 0; index < count; ++index) {
+            std::vector<u8> bytes;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                changed.wait(lock, [&]() {
+                    return slots[index % connections].ready ||
+                        stop.load() || (cancel && cancel->load());
+                });
+
+                if (cancel && cancel->load()) {
+                    throw std::runtime_error("Install cancelled");
+                }
+                if (networkError) std::rethrow_exception(networkError);
+                if (!slots[index % connections].ready) {
+                    throw std::runtime_error("Parallel HTTP transfer stopped");
+                }
+
+                auto& slot = slots[index % connections];
+                bytes = std::move(slot.data);
+                slot.ready = false;
+                ++nextWrite;
+            }
+            changed.notify_all();
+
+            output.write(bytes.data(), bytes.size());
+            progress.addTransferBytes(bytes.size());
+        }
+
+        // All network calls must finish before closing the content storage.
+        for (auto& thread : workers) thread.join();
+        output.finish();
+    } catch (...) {
+        stop.store(true);
+        changed.notify_all();
+        for (auto& thread : workers) {
+            if (thread.joinable()) thread.join();
+        }
+        throw;
+    }
+}
+
 void installEntry(
     Package& package,
     const PackageEntry& entry,
@@ -2443,6 +2590,14 @@ void installEntry(
     int basePercent,
     int spanPercent)
 {
+    // Concurrent ranged GETs provide better throughput on servers that
+    // limit per-connection speed. Small entries use the original pipeline.
+    if (entry.size >= 32ULL * 1024 * 1024) {
+        installEntryParallel(package, entry, contentId, storage,
+                             progress, cancel, basePercent, spanPercent);
+        return;
+    }
+
     // Keep libcurl and content-storage writes on separate threads. Network
     // callbacks never block on ncmContentStorageWritePlaceHolder directly.
     // The four-block queue caps buffered data at roughly 4 MiB.
