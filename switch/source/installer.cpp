@@ -3512,6 +3512,130 @@ void InstallProgress::snapshotTransfer(
     }
 }
 
+
+NetworkBenchmarkResult runNetworkBenchmark(
+    const DebridConfig& config,
+    const InstallJob& job,
+    const std::shared_ptr<std::atomic<bool>>& cancelRequested)
+{
+    NetworkBenchmarkResult result;
+    try {
+        constexpr u64 kChunk = 4ULL * 1024 * 1024;
+        constexpr unsigned kConnections = 4;
+
+        if (config.service == DebridService::None || config.apiKey.empty())
+            throw std::runtime_error("Authorize your debrid account first");
+        if (job.remoteId.empty() || job.file.id.empty())
+            throw std::runtime_error("Benchmark requires a TorBox file in the install queue");
+        if (job.file.size < 16 * kChunk)
+            throw std::runtime_error("Benchmark requires a file of at least 64 MiB");
+        if (cancelRequested && cancelRequested->load())
+            throw std::runtime_error("Benchmark cancelled");
+
+        auto backend = createDebridBackend(config);
+        if (!backend)
+            throw std::runtime_error("Unable to initialize debrid service");
+        const std::string url = backend->downloadUrl(job.remoteId, job.file);
+        if (url.empty())
+            throw std::runtime_error("Debrid did not return a download URL");
+
+        // The same HTTP implementation as install, with no NCM writes,
+        // NCA processing or SD file creation. Prime the TorBox -> CDN
+        // redirect outside the timed samples to measure CDN throughput.
+        HttpPackageSource source(url, cancelRequested, job.file.size);
+        source.streamExact(0, kChunk, [](const u8*, std::size_t) {});
+
+        const u64 wholeChunks = job.file.size / kChunk;
+        const u64 singleChunks = std::min<u64>(8, (wholeChunks - 1) / 3);
+        const u64 parallelChunks = std::min<u64>(
+            32, wholeChunks - 1 - singleChunks);
+        if (!singleChunks || parallelChunks < kConnections)
+            throw std::runtime_error("Not enough file data for benchmark");
+
+        const auto singleStart = std::chrono::steady_clock::now();
+        for (u64 index = 0; index < singleChunks; ++index) {
+            if (cancelRequested && cancelRequested->load())
+                throw std::runtime_error("Benchmark cancelled");
+            source.streamExact(
+                (1 + index) * kChunk, kChunk,
+                [](const u8*, std::size_t) {});
+        }
+        const auto singleEnd = std::chrono::steady_clock::now();
+
+        // Four independent curl handles, using the same IPv4/HTTP1.1
+        // options and 4 MiB range sizes as the installation code.
+        std::atomic<u64> nextChunk{0};
+        std::atomic<bool> stop{false};
+        std::mutex errorMutex;
+        std::exception_ptr transferError;
+        std::vector<std::thread> workers;
+        workers.reserve(kConnections);
+
+        const auto worker = [&]() {
+            try {
+                auto local = source.clone();
+                while (!stop.load()) {
+                    const u64 index = nextChunk.fetch_add(1);
+                    if (index >= parallelChunks)
+                        break;
+                    local->streamExact(
+                        (1 + singleChunks + index) * kChunk, kChunk,
+                        [](const u8*, std::size_t) {},
+                        &stop);
+                }
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    if (!transferError)
+                        transferError = std::current_exception();
+                }
+                stop.store(true);
+            }
+        };
+
+        const auto parallelStart = std::chrono::steady_clock::now();
+        try {
+            for (unsigned i = 0; i < kConnections; ++i)
+                workers.emplace_back(worker);
+            for (auto& thread : workers)
+                thread.join();
+        } catch (...) {
+            stop.store(true);
+            for (auto& thread : workers) {
+                if (thread.joinable())
+                    thread.join();
+            }
+            throw;
+        }
+        const auto parallelEnd = std::chrono::steady_clock::now();
+        if (transferError)
+            std::rethrow_exception(transferError);
+        if (cancelRequested && cancelRequested->load())
+            throw std::runtime_error("Benchmark cancelled");
+
+        const double singleSeconds =
+            std::chrono::duration<double>(singleEnd - singleStart).count();
+        const double parallelSeconds =
+            std::chrono::duration<double>(parallelEnd - parallelStart).count();
+        if (singleSeconds <= 0 || parallelSeconds <= 0)
+            throw std::runtime_error("Invalid benchmark duration");
+
+        // Each chunk is exactly 4 MiB; units are MiB/s, not decimal MB/s.
+        char report[256]{};
+        std::snprintf(report, sizeof(report),
+            "HTTP only: 1x %.1f MiB/s (%llu MiB) | 4x %.1f MiB/s (%llu MiB)",
+            4.0 * static_cast<double>(singleChunks) / singleSeconds,
+            static_cast<unsigned long long>(4 * singleChunks),
+            4.0 * static_cast<double>(parallelChunks) / parallelSeconds,
+            static_cast<unsigned long long>(4 * parallelChunks));
+        result.success = true;
+        result.message = report;
+    } catch (const std::exception& e) {
+        result.message = e.what();
+    }
+    return result;
+}
+
 InstallResult runInstallJob(
     const DebridConfig& config,
     const InstallJob& job,
