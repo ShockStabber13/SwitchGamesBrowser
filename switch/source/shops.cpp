@@ -14,7 +14,11 @@
 namespace sgb {
 namespace {
 using Json = nlohmann::json;
-constexpr std::size_t kMaxIndexBytes = 3 * 1024 * 1024;
+constexpr std::size_t kMaxIndexBytes = 8 * 1024 * 1024;
+constexpr const char* kNotUltraNxCatalog =
+    "http://127.0.0.1:8080/cyberfoil/base-games";
+constexpr const char* kNotUltraNxDownload =
+    "http://127.0.0.1:8080/raw?u=";
 constexpr std::size_t kMaxMatches = 400;
 
 std::string lower(std::string s) {
@@ -86,13 +90,15 @@ int requestProgress(void* context, curl_off_t, curl_off_t, curl_off_t, curl_off_
     return cancelled && cancelled->load() ? 1 : 0;
 }
 std::string fetch(const std::string& url, const std::atomic<bool>* cancel) {
-    if (!https(url)) throw std::runtime_error("Shop index requires HTTPS");
+    const bool localRelay = (url == kNotUltraNxCatalog);
+    if (!localRelay && !https(url))
+        throw std::runtime_error("Shop index requires HTTPS");
     CURL* curl = curl_easy_init();
     if (!curl) throw std::runtime_error("Shop connection unavailable");
     Body body;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "SwitchGamesBrowser/0.4");
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, localRelay ? 0L : 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 4L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
@@ -102,8 +108,10 @@ std::string fetch(const std::string& url, const std::atomic<bool>* cancel) {
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, requestProgress);
     curl_easy_setopt(curl, CURLOPT_XFERINFODATA, const_cast<std::atomic<bool>*>(cancel));
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS,
+                     localRelay ? CURLPROTO_HTTP : CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS,
+                     localRelay ? CURLPROTO_HTTP : CURLPROTO_HTTPS);
 #ifdef __SWITCH__
     curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
 #endif
@@ -113,8 +121,15 @@ std::string fetch(const std::string& url, const std::atomic<bool>* cancel) {
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     curl_easy_cleanup(curl);
-    if (code != CURLE_OK || status < 200 || status >= 300)
+    if (code != CURLE_OK || status < 200 || status >= 300) {
+        if (localRelay) {
+            if (status == 503 || status == 502)
+                throw std::runtime_error("NotUltraNX relay needs DBI priming / catalog");
+            throw std::runtime_error("NotUltraNX relay unavailable (HTTP " +
+                                     std::to_string(status) + ")");
+        }
         throw std::runtime_error("Shop index unavailable or requires authentication");
+    }
     return std::move(body.text);
 }
 std::string stringField(const Json& object, const char* key) {
@@ -291,6 +306,70 @@ ShopSearchResult searchOpenNxShops(
     }
     { std::lock_guard<std::mutex> lock(progress.mutex);
       progress.message = result.message; }
+    progress.running.store(false);
+    return result;
+}
+
+ShopSearchResult searchNotUltraNxRelay(
+    const std::string& title, ShopSearchProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancel)
+{
+    ShopSearchResult result;
+    progress.running.store(true);
+    progress.shopsDone.store(0);
+    progress.shopsTotal.store(1);
+    {
+        std::lock_guard<std::mutex> guard(progress.mutex);
+        progress.matches.clear();
+        progress.message = "Reading NotUltraNX relay catalog...";
+    }
+    try {
+        if (!cancel || cancel->load())
+            throw std::runtime_error("Shop search cancelled");
+
+        const Json catalog = Json::parse(fetch(kNotUltraNxCatalog, cancel.get()),
+                                        nullptr, false);
+        if (!catalog.is_object() || !catalog.contains("files") ||
+            !catalog["files"].is_array()) {
+            throw std::runtime_error("NotUltraNX relay returned invalid catalog JSON");
+        }
+
+        const std::string query = comparable(title);
+        std::set<std::string> seen;
+        std::vector<ShopEntry> matches;
+        for (const auto& row : catalog["files"]) {
+            if (cancel->load())
+                throw std::runtime_error("Shop search cancelled");
+            if (!row.is_object()) continue;
+            const std::string name = stringField(row, "name");
+            const std::string link = stringField(row, "url");
+            if (!isShopPackage(name) ||
+                link.rfind(kNotUltraNxDownload, 0) != 0 ||
+                link.find('\r') != std::string::npos ||
+                link.find('\n') != std::string::npos ||
+                comparable(name).find(query) == std::string::npos)
+                continue;
+            addUnique(matches, seen, {name, link, "NotUltraNX", sizeField(row)});
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(progress.mutex);
+            progress.matches = matches;
+        }
+        result.matches = std::move(matches);
+        result.message = "NotUltraNX: " +
+            std::to_string(result.matches.size()) +
+            " matching file(s) from " +
+            std::to_string(catalog["files"].size()) + " base games";
+        result.success = true;
+    } catch (const std::exception& e) {
+        result.message = e.what();
+    }
+    progress.shopsDone.store(1);
+    {
+        std::lock_guard<std::mutex> guard(progress.mutex);
+        progress.message = result.message;
+    }
     progress.running.store(false);
     return result;
 }
