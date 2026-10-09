@@ -11,6 +11,8 @@ struct ProviderResult {
     std::string magnet;
     std::string infoHash;
     std::string torrentUrl;
+    int seeders = -1;  // -1: unknown; zero: no seeders reported
+    int leechers = -1;
 };
 
 class Provider {
