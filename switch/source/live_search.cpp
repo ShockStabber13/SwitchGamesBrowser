@@ -378,6 +378,17 @@ void LiveSearchProgress::publishResult(
     const DebridTorrentStatus& status)
 {
     std::lock_guard<std::mutex> lock(resultMutex);
+    // Several providers may find the same hash. Preserve the first
+    // listing, but enrich previously unavailable peer counts.
+    for (auto& existing : liveReleases) {
+        if (existing.infoHash != hash)
+            continue;
+        if (existing.seeders < 0 && release.seeders >= 0)
+            existing.seeders = release.seeders;
+        if (existing.leechers < 0 && release.leechers >= 0)
+            existing.leechers = release.leechers;
+        return;
+    }
     liveReleases.push_back(release);
     liveStatuses[hash] = status;
 }
@@ -664,9 +675,8 @@ LiveSearchResult runLiveSearch(
                                             .second;
                                 }
 
-                                if (!firstResult)
-                                    return;
-
+                                // Duplicate hashes can still contribute
+                                // missing seed/leech counts to the first row.
                                 Release release;
 
                                 release.title =
@@ -695,8 +705,8 @@ LiveSearchResult runLiveSearch(
                                     hash,
                                     state->second);
 
-                                progress.validFound
-                                    .fetch_add(1);
+                                if (firstResult)
+                                    progress.validFound.fetch_add(1);
                             };
 
                             while (true) {
