@@ -240,6 +240,7 @@ public:
             cancel,
         u64 knownSize)
         : url_(std::move(url)),
+          initialUrl_(url_),
           cancel_(std::move(cancel)),
           knownSize_(knownSize)
     {
@@ -478,6 +479,21 @@ public:
             throw std::runtime_error(
                 "Cloud package read was incomplete");
         }
+
+        // Resolve the TorBox requestdl redirect once and reuse the final
+        // HTTPS URL for subsequent ranges and cloned worker connections.
+        if (initialUrl_.rfind(
+                "https://api.torbox.app/v1/api/torrents/requestdl", 0) == 0) {
+            char* effective = nullptr;
+            if (curl_easy_getinfo(
+                    curl_, CURLINFO_EFFECTIVE_URL, &effective) == CURLE_OK &&
+                effective &&
+                std::strncmp(effective, "https://", 8) == 0 &&
+                url_ != effective) {
+                url_ = effective;
+                curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
+            }
+        }
     }
 
     // Separate easy handles are required for concurrent HTTP ranges.
@@ -518,6 +534,7 @@ public:
 
 private:
     std::string url_;
+    std::string initialUrl_;
 
     std::shared_ptr<std::atomic<bool>>
         cancel_;
@@ -2630,10 +2647,15 @@ void installEntry(
     int basePercent,
     int spanPercent)
 {
-    // Match Sphaira's continuous HTTP read pattern for throughput testing.
-    // The four-connection ranged implementation remains available above for
-    // a reversible A/B comparison, but is not selected in this test build.
-    // Reads and NCM writes still run concurrently on separate threads.
+    // Restore the faster four-connection ranged downloader for large files.
+    // The initial TorBox request resolves its CDN URL before workers clone it.
+    if (entry.size >= 32ULL * 1024 * 1024) {
+        installEntryParallel(package, entry, contentId, storage,
+                             progress, cancel, basePercent, spanPercent);
+        return;
+    }
+
+    // Small entries keep the single-stream download/write pipeline.
     constexpr std::size_t streamBufferSize = 4 * 1024 * 1024;
     constexpr std::size_t maxQueuedBlocks = 2;
 
