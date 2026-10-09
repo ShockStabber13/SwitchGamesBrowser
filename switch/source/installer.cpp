@@ -2468,6 +2468,7 @@ void installEntryParallel(
     int basePercent,
     int spanPercent)
 {
+    progress.parallelEntryCount.fetch_add(1, std::memory_order_relaxed);
     constexpr std::size_t connections = 4;
     constexpr u64 rangeSize = 16ULL * 1024 * 1024;
     // Match Sphaira's 4 MiB NCA write granularity.
@@ -2526,12 +2527,17 @@ void installEntryParallel(
                     if (block.empty())
                         return;
 
+                    const auto waitStarted = std::chrono::steady_clock::now();
                     std::unique_lock<std::mutex> lock(mutex);
                     changed.wait(lock, [&]() {
                         return stop.load() ||
                             (cancel && cancel->load()) ||
                             slot.blocks.size() < maxBufferedBlocks;
                     });
+                    progress.producerBackpressureNanoseconds.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - waitStarted).count(),
+                        std::memory_order_relaxed);
                     if (stop.load() || (cancel && cancel->load()))
                         throw std::runtime_error("Install cancelled");
 
@@ -2591,11 +2597,16 @@ void installEntryParallel(
                 std::vector<u8> block;
                 bool finished = false;
                 {
+                    const auto waitStarted = std::chrono::steady_clock::now();
                     std::unique_lock<std::mutex> lock(mutex);
                     changed.wait(lock, [&]() {
                         return !slot.blocks.empty() || slot.finished ||
                             stop.load() || (cancel && cancel->load());
                     });
+                    progress.writerIdleNanoseconds.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - waitStarted).count(),
+                        std::memory_order_relaxed);
 
                     if (cancel && cancel->load())
                         throw std::runtime_error("Install cancelled");
@@ -2618,7 +2629,12 @@ void installEntryParallel(
                 if (finished)
                     break;
 
+                const auto writeStarted = std::chrono::steady_clock::now();
                 output.write(block.data(), block.size());
+                progress.writerActiveNanoseconds.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - writeStarted).count(),
+                    std::memory_order_relaxed);
                 progress.addTransferBytes(block.size());
             }
         }
@@ -3259,6 +3275,10 @@ InstallResult runInstallJob(
     InstallResult result;
 
     progress.running.store(true);
+    progress.writerActiveNanoseconds.store(0);
+    progress.writerIdleNanoseconds.store(0);
+    progress.producerBackpressureNanoseconds.store(0);
+    progress.parallelEntryCount.store(0);
     progress.set(
         "Installing",
         0,
@@ -3327,8 +3347,18 @@ InstallResult runInstallJob(
             job.file.name);
 
         result.success = true;
-        result.message =
-            "Install completed";
+        result.message = "Install completed";
+        if (progress.parallelEntryCount.load() > 0) {
+            // Times count all large NCA transfers, not small metadata files.
+            const auto ms = [](std::uint64_t ns) { return ns / 1000000; };
+            result.message += " | SD writing " +
+                std::to_string(ms(progress.writerActiveNanoseconds.load())) +
+                " ms | Waiting for HTTP " +
+                std::to_string(ms(progress.writerIdleNanoseconds.load())) +
+                " ms | Network backpressure " +
+                std::to_string(ms(progress.producerBackpressureNanoseconds.load())) +
+                " ms";
+        }
     }
     catch (const std::exception& e) {
         gInstallCancel = nullptr;
