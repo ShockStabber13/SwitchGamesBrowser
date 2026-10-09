@@ -2938,17 +2938,17 @@ void installEntry(
         writer = std::make_unique<AsyncContentWriter>(
             storage, contentId, cancel, progress);
 
+    std::function<void(u64, const u8*, std::size_t)> enqueueWrite;
+    std::function<void()> finishWrites;
+    if (writer) {
+        enqueueWrite = [&writer](u64 offset, const u8* data, std::size_t size) {
+            writer->append(offset, data, size);
+        };
+        finishWrites = [&writer]() { writer->finish(); };
+    }
     NcaOutput output(
         storage, contentId, cancel, progress, basePercent, spanPercent,
-        [&writer](u64 offset, const u8* data, std::size_t size) {
-            if (!writer)
-                throw std::runtime_error("Storage writer unavailable");
-            writer->append(offset, data, size);
-        },
-        [&writer]() {
-            if (writer)
-                writer->finish();
-        });
+        std::move(enqueueWrite), std::move(finishWrites));
 
     std::mutex queueMutex;
     std::condition_variable queueChanged;
