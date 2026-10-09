@@ -115,7 +115,8 @@ InstallResult runInstallJob(
     const InstallJob& job,
     const std::string& cacheDirectory,
     InstallProgress& progress,
-    const std::shared_ptr<std::atomic<bool>>& cancelRequested
+    const std::shared_ptr<std::atomic<bool>>& cancelRequested,
+    bool sphairaStyleStream = false
 );
 
 } // namespace sgb
