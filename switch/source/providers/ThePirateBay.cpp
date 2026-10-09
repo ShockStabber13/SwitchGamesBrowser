@@ -1,5 +1,6 @@
 #include "provider.hpp"
 #include "provider_api_utils.hpp"
+#include "provider_stats.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -59,6 +60,8 @@ public:
             result.title = title;
             result.infoHash = hash;
             result.magnet = sgb_api::magnetFromHash(hash, title);
+            result.seeders = sgb_stats::seeders(item);
+            result.leechers = sgb_stats::leechers(item);
             results.push_back(std::move(result));
         }
 
