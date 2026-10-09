@@ -2910,20 +2910,45 @@ void installEntry(
     int basePercent,
     int spanPercent)
 {
-    // Restore the faster four-connection ranged downloader for large files.
-    // The initial TorBox request resolves its CDN URL before workers clone it.
-    if (entry.size >= 32ULL * 1024 * 1024) {
+    constexpr u64 largeEntryThreshold = 32ULL * 1024 * 1024;
+    // A/B test: one continuous HTTP Range GET per NCA, no parallel
+    // segments. Flip to false to restore the previous four-range path.
+    constexpr bool continuousLargeEntries = true;
+    const bool largeEntry = entry.size >= largeEntryThreshold;
+    if (!continuousLargeEntries && largeEntry) {
         installEntryParallel(package, entry, contentId, storage,
                              progress, cancel, basePercent, spanPercent);
         return;
     }
 
-    // Small entries keep the single-stream download/write pipeline.
+    // Stage 1: a single long-lived curl read for the complete NCA.
+    // Stage 2: ordered NCA/NCZ decoding on the installer thread.
+    // Stage 3 (large entries): async content-storage writing, as before.
+    // Small entries retain the existing synchronous storage path.
     constexpr std::size_t streamBufferSize = 4 * 1024 * 1024;
-    constexpr std::size_t maxQueuedBlocks = 2;
+    constexpr std::size_t maxQueuedBlocks = 4;
+
+    if (largeEntry)
+        progress.parallelEntryCount.fetch_add(1, std::memory_order_relaxed);
+
+    // Storage worker must outlive NcaOutput, and must be explicitly joined
+    // on exceptional paths before NcaOutput removes a failed placeholder.
+    std::unique_ptr<AsyncContentWriter> writer;
+    if (largeEntry)
+        writer = std::make_unique<AsyncContentWriter>(
+            storage, contentId, cancel, progress);
 
     NcaOutput output(
-        storage, contentId, cancel, progress, basePercent, spanPercent);
+        storage, contentId, cancel, progress, basePercent, spanPercent,
+        [&writer](u64 offset, const u8* data, std::size_t size) {
+            if (!writer)
+                throw std::runtime_error("Storage writer unavailable");
+            writer->append(offset, data, size);
+        },
+        [&writer]() {
+            if (writer)
+                writer->finish();
+        });
 
     std::mutex queueMutex;
     std::condition_variable queueChanged;
@@ -2940,12 +2965,19 @@ void installEntry(
             const auto enqueue = [&]() {
                 if (buffer.empty()) return;
 
+                const auto waitStarted = std::chrono::steady_clock::now();
                 std::unique_lock<std::mutex> lock(queueMutex);
                 queueChanged.wait(lock, [&]() {
                     return stopDownload.load() ||
                         (cancel && cancel->load()) ||
                         queue.size() < maxQueuedBlocks;
                 });
+                if (largeEntry) {
+                    progress.producerBackpressureNanoseconds.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - waitStarted).count(),
+                        std::memory_order_relaxed);
+                }
 
                 if (stopDownload.load() || (cancel && cancel->load())) {
                     throw std::runtime_error("Install cancelled");
@@ -2997,11 +3029,18 @@ void installEntry(
         while (true) {
             std::vector<u8> chunk;
             {
+                const auto waitStarted = std::chrono::steady_clock::now();
                 std::unique_lock<std::mutex> lock(queueMutex);
                 queueChanged.wait(lock, [&]() {
                     return !queue.empty() || downloadDone ||
                         (cancel && cancel->load());
                 });
+                if (largeEntry) {
+                    progress.writerIdleNanoseconds.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - waitStarted).count(),
+                        std::memory_order_relaxed);
+                }
 
                 if (cancel && cancel->load()) {
                     throw std::runtime_error("Install cancelled");
@@ -3017,8 +3056,8 @@ void installEntry(
             }
             queueChanged.notify_all();
 
-            // The main installer thread exclusively owns the Switch storage
-            // handle; count bytes once they are written successfully.
+            // Decode on the installer thread. Large entries queue the
+            // resulting bytes for an independent content-storage writer.
             output.write(chunk.data(), chunk.size());
             progress.addTransferBytes(static_cast<std::uint64_t>(chunk.size()));
         }
@@ -3031,6 +3070,9 @@ void installEntry(
         stopDownload.store(true);
         queueChanged.notify_all();
         if (downloader.joinable()) downloader.join();
+        // Prevent an unfinished async storage call racing with NCA cleanup.
+        if (writer)
+            writer->abort();
         throw;
     }
 }
