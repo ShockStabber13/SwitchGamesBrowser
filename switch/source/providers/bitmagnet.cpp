@@ -1,5 +1,6 @@
 ﻿#include "provider.hpp"
 #include "provider_api_utils.hpp"
+#include "provider_stats.hpp"
 
 #include <fstream>
 #include <regex>
@@ -210,6 +211,8 @@ public:
             row.title = title;
             row.infoHash = hash;
             row.magnet = magnet;
+            row.seeders = sgb_stats::seeders(item);
+            row.leechers = sgb_stats::leechers(item);
 
             results.push_back(
                 std::move(row));
