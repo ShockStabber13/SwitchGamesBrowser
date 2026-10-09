@@ -8,6 +8,7 @@
 #include "provider.hpp"
 #include "live_search.hpp"
 #include "installer.hpp"
+#include "shops.hpp"
 #include "scrape_cache.hpp"
 #include "provider_diagnostics.hpp"
 #include <atomic>
@@ -1569,7 +1570,7 @@ static void saveInstallQueue(
 enum class Page {
     Browse, Detail, Torrents, Files, Settings, Providers,
     SearchProgress, Options, ScrapeChoice, DebridManager,
-    DebridManagerFiles, InstallManager
+    DebridManagerFiles, InstallManager, ShopResults
 };
 
 static DebridCheckResult liveDebridCheck(
@@ -1785,6 +1786,12 @@ int main(int, char**) {
     std::future<DebridManagerResult> pendingDebridManager;
     std::future<DebridRemoveResult> pendingDebridRemove;
     std::future<sgb::InstallResult> pendingInstall;
+    std::future<sgb::ShopSearchResult> pendingShopSearch;
+    sgb::ShopSearchProgress shopSearchProgress;
+    std::shared_ptr<std::atomic<bool>> shopSearchCancel;
+    std::vector<sgb::ShopEntry> shopRows;
+    std::size_t shopCursor = 0;
+    std::size_t shopGameIndex = 0;
     std::future<sgb::NetworkBenchmarkResult> pendingNetworkBenchmark;
     std::shared_ptr<std::atomic<bool>> networkBenchmarkCancel;
     std::string networkBenchmarkTargetId;
@@ -1806,6 +1813,7 @@ int main(int, char**) {
                 root + "install-queue.json");
 
     size_t installManagerCursor = 0;
+    Page installManagerReturnPage = Page::Settings;
 
     std::shared_ptr<std::atomic<bool>>
         liveSearchCancel;
@@ -1936,6 +1944,30 @@ int main(int, char**) {
 
         installRows.push_back(
             std::move(row));
+    };
+
+    // OpenNX shop search is independent from the IGDB metadata browser
+    // and from the existing cached/uncached torrent search.
+    auto startShopSearch = [&](size_t gameIndex) {
+        if (gameIndex >= games.size()) return;
+        if (pendingShopSearch.valid()) {
+            status = "An OpenNX shop search is still running";
+            page = Page::ShopResults;
+            return;
+        }
+        shopGameIndex = gameIndex;
+        shopRows.clear();
+        shopCursor = 0;
+        shopSearchCancel = std::make_shared<std::atomic<bool>>(false);
+        const auto cancel = shopSearchCancel;
+        const std::string title = games[gameIndex].title;
+        page = Page::ShopResults;
+        status = "Searching OpenNX-listed shops...";
+        pendingShopSearch = std::async(
+            std::launch::async,
+            [title, cancel, &shopSearchProgress]() {
+                return sgb::searchOpenNxShops(title, shopSearchProgress, cancel);
+            });
     };
 
     auto queueSelectedFiles =
@@ -2566,6 +2598,21 @@ int main(int, char**) {
                 startDebridManagerRefresh();
         }
 
+        // Shop search publishes matches incrementally while providers load.
+        if (pendingShopSearch.valid()) {
+            std::string detail;
+            shopSearchProgress.snapshot(shopRows, detail);
+            if (pendingShopSearch.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+                auto outcome = pendingShopSearch.get();
+                shopRows = std::move(outcome.matches);
+                status = outcome.message;
+                shopSearchCancel.reset();
+                if (shopCursor >= shopRows.size())
+                    shopCursor = shopRows.empty() ? 0 : shopRows.size() - 1;
+            }
+        }
+
         // Network-only TorBox test: never opens Switch content storage.
         if (pendingNetworkBenchmark.valid() &&
             pendingNetworkBenchmark.wait_for(
@@ -2997,24 +3044,62 @@ int main(int, char**) {
                 page = Page::Detail;
             }
 
+        } else if (page == Page::ShopResults) {
+            if (keys & HidNpadButton_B) {
+                if (shopSearchCancel && pendingShopSearch.valid())
+                    shopSearchCancel->store(true);
+                page = Page::Detail;
+            }
+            if ((keys & HidNpadButton_ZL) &&
+                shopGameIndex < games.size()) {
+                if (!games[shopGameIndex].releases.empty())
+                    page = Page::Torrents;
+                else
+                    page = Page::Detail;
+            }
+            if (keys & HidNpadButton_Up) {
+                if (shopCursor > 0) --shopCursor;
+            }
+            if (keys & HidNpadButton_Down) {
+                if (shopCursor + 1 < shopRows.size()) ++shopCursor;
+            }
+            if (keys & HidNpadButton_L)
+                shopCursor = shopCursor >= 7 ? shopCursor - 7 : 0;
+            if ((keys & HidNpadButton_R) && !shopRows.empty())
+                shopCursor = std::min(shopCursor + 7, shopRows.size() - 1);
+            if ((keys & HidNpadButton_Y) && !pendingShopSearch.valid())
+                startShopSearch(shopGameIndex);
+            if ((keys & HidNpadButton_A) && shopCursor < shopRows.size() &&
+                shopGameIndex < games.size()) {
+                const auto& item = shopRows[shopCursor];
+                if (!sgb::isShopPackage(item.name) ||
+                    item.url.rfind("https://", 0) != 0) {
+                    status = "Shop entry is not a direct HTTPS package";
+                } else {
+                    sgb::DebridFile file;
+                    file.name = item.name;
+                    file.link = item.url;
+                    file.size = item.size;
+                    appendInstallJob(games[shopGameIndex].title, item.name,
+                                     "", "OpenNX Shop", "", file);
+                    persistInstallQueue();
+                    installManagerCursor = installRows.size() - 1;
+                    installManagerReturnPage = Page::ShopResults;
+                    page = Page::InstallManager;
+                    status = "Queued shop package in Install Manager";
+                }
+            }
+
         } else if (page == Page::ScrapeChoice) {
             if (keys & HidNpadButton_B) {
                 page = Page::Detail;
             }
 
-            if (keys & HidNpadButton_AnyUp) {
-                scrapeChoiceCursor =
-                    scrapeChoiceCursor == 0
-                        ? 1
-                        : 0;
-            }
+            if (keys & HidNpadButton_AnyUp)
+                scrapeChoiceCursor = (scrapeChoiceCursor + 2) % 3;
 
-            if (keys & HidNpadButton_AnyDown) {
-                scrapeChoiceCursor =
-                    scrapeChoiceCursor == 0
-                        ? 1
-                        : 0;
-            }
+            if (keys & HidNpadButton_AnyDown)
+                scrapeChoiceCursor = (scrapeChoiceCursor + 1) % 3;
 
             if (keys & HidNpadButton_A) {
                 if (
@@ -3070,9 +3155,11 @@ int main(int, char**) {
                         page = Page::Torrents;
                     }
                 }
+                else if (scrapeChoiceCursor == 1) {
+                    startLiveSearch(scrapeChoiceGameIndex);
+                }
                 else {
-                    startLiveSearch(
-                        scrapeChoiceGameIndex);
+                    startShopSearch(scrapeChoiceGameIndex);
                 }
             }
         } else if (page == Page::Browse) {
@@ -3390,6 +3477,7 @@ int main(int, char**) {
                                 : installRows.size() - 1;
                     }
 
+                    installManagerReturnPage = Page::Settings;
                     page = Page::InstallManager;
 
                     status =
@@ -3635,7 +3723,7 @@ int main(int, char**) {
         } else if (page == Page::InstallManager) {
             if (keys & HidNpadButton_B) {
                 settingsCursor = 6;
-                page = Page::Settings;
+                page = installManagerReturnPage;
             }
 
             if (!installRows.empty()) {
@@ -3863,6 +3951,8 @@ int main(int, char**) {
                     openScrapeChoice(rows[cursor]);
                 }
             } else if (page == Page::Torrents) {
+                if (keys & HidNpadButton_ZL)
+                    startShopSearch(rows[cursor]);
                 if (keys & HidNpadButton_B) {
                     if (
                         pendingLiveSearch.valid() &&
@@ -5413,7 +5503,9 @@ int main(int, char**) {
 
     if (pending.valid()) pending.wait();
     if (pendingLangegen.valid()) pendingLangegen.wait();
-    if (pendingLiveSearch.valid()) pendingLiveSearch.wait(); 
+    if (pendingLiveSearch.valid()) pendingLiveSearch.wait();
+    if (shopSearchCancel) shopSearchCancel->store(true);
+    if (pendingShopSearch.valid()) pendingShopSearch.wait(); 
     if (pendingDebridCheck.valid()) pendingDebridCheck.wait();
     if (pendingDebridAdd.valid()) pendingDebridAdd.wait();
     if (pendingDebridManager.valid()) pendingDebridManager.wait();
