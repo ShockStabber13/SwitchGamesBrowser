@@ -282,10 +282,14 @@ public:
             CURLOPT_USERAGENT,
             "SwitchGamesBrowser/0.4");
 
+        // The local NotUltraNX sysmodule serves ranged bytes directly.
+        // Never follow an external redirect from its HTTP endpoint.
+        const bool localRelay =
+            url_.rfind("http://127.0.0.1:8080/raw?u=", 0) == 0;
         curl_easy_setopt(
             curl_,
             CURLOPT_FOLLOWLOCATION,
-            1L);
+            localRelay ? 0L : 1L);
 
         curl_easy_setopt(
             curl_,
@@ -354,12 +358,12 @@ public:
         curl_easy_setopt(
             curl_,
             CURLOPT_PROTOCOLS,
-            CURLPROTO_HTTPS);
+            localRelay ? CURLPROTO_HTTP : CURLPROTO_HTTPS);
 
         curl_easy_setopt(
             curl_,
             CURLOPT_REDIR_PROTOCOLS,
-            CURLPROTO_HTTPS);
+            localRelay ? CURLPROTO_HTTP : CURLPROTO_HTTPS);
 
 #ifdef __SWITCH__
         curl_easy_setopt(
@@ -3696,19 +3700,21 @@ InstallResult runInstallJob(
     (void)cacheDirectory;
 
     try {
-        // Shop jobs are direct, user-authorized HTTPS links from Tinfoil
-        // public index files. The existing content installer handles the
-        // same NSP/NSZ/XCI/XCZ package bytes and Install Manager progress.
-        const bool shopJob = job.source == "OpenNX Shop";
+        // Both source types use the existing Install Manager. NotUltraNX
+        // routes only to the on-console Stage4A relay at 127.0.0.1:8080.
+        const bool localShop = job.source == "NotUltraNX Relay";
+        const bool onlineShop = job.source == "OpenNX Shop";
         std::string url;
-        if (shopJob) {
-            if (job.file.link.rfind("https://", 0) != 0 ||
-                job.file.link.find('\n') != std::string::npos ||
-                job.file.link.find('\r') != std::string::npos) {
-                throw std::runtime_error("Shop package needs a direct HTTPS URL");
-            }
+        if (localShop || onlineShop) {
+            if (job.file.link.find('\n') != std::string::npos ||
+                job.file.link.find('\r') != std::string::npos)
+                throw std::runtime_error("Invalid shop package URL");
             // Fragment is Tinfoil's optional filename override.
             url = job.file.link.substr(0, job.file.link.find('#'));
+            if ((localShop &&
+                 url.rfind("http://127.0.0.1:8080/raw?u=", 0) != 0) ||
+                (onlineShop && url.rfind("https://", 0) != 0))
+                throw std::runtime_error("Shop URL is not an allowed source");
             if (!endsWithInsensitive(job.file.name, ".nsp") &&
                 !endsWithInsensitive(job.file.name, ".nsz") &&
                 !endsWithInsensitive(job.file.name, ".xci") &&
