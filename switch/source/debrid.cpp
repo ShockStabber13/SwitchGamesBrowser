@@ -517,29 +517,12 @@ public:
             throw std::runtime_error(
                 "TorBox file ID is missing");
 
-        // Match pipensx's TorBox flow: ask the API for its JSON
-        // download URL once, then connect directly to that HTTPS CDN.
-        // Avoid sending every file range through a requestdl redirect.
-        const std::string endpoint =
+        return
             "https://api.torbox.app/v1/api/torrents/requestdl"
             "?token=" + encode(config_.apiKey) +
             "&torrent_id=" + encode(remoteId) +
-            "&file_id=" + encode(file.id);
-        const auto response = jsonResponse(
-            requestRetry(endpoint, false, authHeaders()),
-            "TorBox direct download link");
-
-        const auto it = response.find("data");
-        if (it == response.end() || !it->is_string()) {
-            throw std::runtime_error(
-                "TorBox did not provide a direct download link");
-        }
-        const std::string link = it->get<std::string>();
-        if (link.rfind("https://", 0) != 0) {
-            throw std::runtime_error(
-                "TorBox returned an invalid HTTPS download link");
-        }
-        return link;
+            "&file_id=" + encode(file.id) +
+            "&redirect=true";
     }
 
     void remove(
