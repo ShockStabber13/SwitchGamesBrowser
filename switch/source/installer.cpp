@@ -603,7 +603,15 @@ public:
                 std::rethrow_exception(context.error);
             if (status == 200)
                 throw std::runtime_error("Cloud source ignored HTTP Range");
-            if (status != 206)
+            // On a failed connection attempt libcurl may have no HTTP status.
+            // The transport can reconnect; an HTTP denial must still fail.
+            const bool networkFailureNoResponse =
+                status == 0 && (code == CURLE_COULDNT_CONNECT ||
+                    code == CURLE_OPERATION_TIMEDOUT ||
+                    code == CURLE_RECV_ERROR ||
+                    code == CURLE_SEND_ERROR ||
+                    code == CURLE_GOT_NOTHING);
+            if (status != 206 && !networkFailureNoResponse)
                 throw std::runtime_error("Cloud read HTTP " + std::to_string(status));
 
             received += context.received;
