@@ -8,6 +8,7 @@
 #include "provider.hpp"
 #include "live_search.hpp"
 #include "installer.hpp"
+#include "installer_backend.hpp"
 #include "shops.hpp"
 #include "scrape_cache.hpp"
 #include "provider_diagnostics.hpp"
@@ -2811,7 +2812,8 @@ int main(int, char**) {
                             progressCopy,
                             cancelCopy
                         ]() {
-                            return sgb::runInstallJob(
+                            return sgb::dispatchInstallJob(
+                                sgb::InstallerBackend::Original,
                                 configCopy,
                                 job,
                                 root + "install-cache",
