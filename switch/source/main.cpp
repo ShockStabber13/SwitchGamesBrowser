@@ -5177,13 +5177,18 @@ int main(int, char**) {
                         }
                     }
 
+                    // Show provider snapshots; unknown is not zero.
+                    const std::string seeds = rel.seeders >= 0
+                        ? std::to_string(rel.seeders) : "-";
+                    const std::string leeches = rel.leechers >= 0
+                        ? std::to_string(rel.leechers) : "-";
                     label(
                         renderer,small,
                         rel.source +
-                            "  " +
-                            rel.size +
-                            "  " +
-                            state,
+                            "  S:" + seeds +
+                            "  L:" + leeches +
+                            "  " + rel.size +
+                            "  " + state,
                         48,y+34,1150,
                         stateColour
                     );
