@@ -1,6 +1,9 @@
 name: Build Switch browser
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - performance/parallel-http-install-pipeline
 permissions:
   contents: read
 jobs:
