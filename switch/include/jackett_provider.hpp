@@ -2,6 +2,7 @@
 
 #include "provider.hpp"
 #include "provider_api_utils.hpp"
+#include "provider_stats.hpp"
 #include "torrent_metainfo.hpp"
 
 #include <fstream>
@@ -273,6 +274,8 @@ inline std::vector<sgb::ProviderResult> search(
         row.magnet = magnet;
         row.infoHash = hash;
         row.torrentUrl = torrentUrl;
+        row.seeders = sgb_stats::seeders(item);
+        row.leechers = sgb_stats::leechers(item);
 
         results.push_back(
             std::move(row));
