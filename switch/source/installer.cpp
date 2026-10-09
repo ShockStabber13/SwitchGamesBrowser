@@ -15,6 +15,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
@@ -146,6 +151,7 @@ struct HttpRangeContext {
         cancel;
 
     std::exception_ptr error;
+    const std::atomic<bool>* stop = nullptr;
 
     u64 expected = 0;
     u64 received = 0;
@@ -161,10 +167,8 @@ size_t httpRangeWrite(
         static_cast<HttpRangeContext*>(
             opaque);
 
-    if (
-        context->cancel &&
-        context->cancel->load()
-    ) {
+    if ((context->cancel && context->cancel->load()) ||
+        (context->stop && context->stop->load())) {
         return 0;
     }
 
@@ -224,11 +228,8 @@ int httpRangeProgress(
         static_cast<HttpRangeContext*>(
             opaque);
 
-    return
-        context->cancel &&
-        context->cancel->load()
-            ? 1
-            : 0;
+    return ((context->cancel && context->cancel->load()) ||
+            (context->stop && context->stop->load())) ? 1 : 0;
 }
 
 class HttpPackageSource {
@@ -370,7 +371,8 @@ public:
         u64 size,
         const std::function<void(
             const u8*,
-            std::size_t)>& consume)
+            std::size_t)>& consume,
+        const std::atomic<bool>* stop = nullptr)
     {
         if (!size)
             return;
@@ -407,6 +409,7 @@ public:
         HttpRangeContext context;
         context.consume = consume;
         context.cancel = cancel_;
+        context.stop = stop;
         context.expected = size;
 
         curl_easy_setopt(
@@ -2440,81 +2443,122 @@ void installEntry(
     int basePercent,
     int spanPercent)
 {
-    constexpr std::size_t streamBufferSize =
-        1024 * 1024;
+    // Keep libcurl and content-storage writes on separate threads. Network
+    // callbacks never block on ncmContentStorageWritePlaceHolder directly.
+    // The four-block queue caps buffered data at roughly 4 MiB.
+    constexpr std::size_t streamBufferSize = 1024 * 1024;
+    constexpr std::size_t maxQueuedBlocks = 4;
 
     NcaOutput output(
-        storage,
-        contentId,
-        cancel,
-        progress,
-        basePercent,
-        spanPercent);
+        storage, contentId, cancel, progress, basePercent, spanPercent);
 
-    std::vector<u8> buffer;
-    buffer.reserve(
-        streamBufferSize);
+    std::mutex queueMutex;
+    std::condition_variable queueChanged;
+    std::deque<std::vector<u8>> queue;
+    std::exception_ptr downloadError;
+    bool downloadDone = false;
+    std::atomic<bool> stopDownload{false};
 
-    auto flush =
-        [&]()
-    {
-        if (buffer.empty())
-            return;
+    std::thread downloader([&]() {
+        try {
+            std::vector<u8> buffer;
+            buffer.reserve(streamBufferSize);
 
-        output.write(
-            buffer.data(),
-            buffer.size());
+            const auto enqueue = [&]() {
+                if (buffer.empty()) return;
 
-        buffer.clear();
-    };
+                std::unique_lock<std::mutex> lock(queueMutex);
+                queueChanged.wait(lock, [&]() {
+                    return stopDownload.load() ||
+                        (cancel && cancel->load()) ||
+                        queue.size() < maxQueuedBlocks;
+                });
 
-    package.source->streamExact(
-        entry.offset,
-        entry.size,
-        [&](const u8* data,
-            std::size_t bytes)
+                if (stopDownload.load() || (cancel && cancel->load())) {
+                    throw std::runtime_error("Install cancelled");
+                }
+
+                queue.emplace_back(std::move(buffer));
+                lock.unlock();
+                queueChanged.notify_all();
+
+                buffer = std::vector<u8>{};
+                buffer.reserve(streamBufferSize);
+            };
+
+            package.source->streamExact(
+                entry.offset,
+                entry.size,
+                [&](const u8* data, std::size_t bytes) {
+                    while (bytes) {
+                        if (stopDownload.load() || (cancel && cancel->load())) {
+                            throw std::runtime_error("Install cancelled");
+                        }
+
+                        const auto take = std::min(
+                            streamBufferSize - buffer.size(), bytes);
+                        buffer.insert(buffer.end(), data, data + take);
+                        data += take;
+                        bytes -= take;
+
+                        if (buffer.size() == streamBufferSize) enqueue();
+                    }
+                },
+                &stopDownload);
+
+            enqueue();
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            downloadError = std::current_exception();
+        }
+
         {
-            progress.addTransferBytes(
-                static_cast<std::uint64_t>(
-                    bytes));
+            std::lock_guard<std::mutex> lock(queueMutex);
+            downloadDone = true;
+        }
+        queueChanged.notify_all();
+    });
 
-            while (bytes) {
-                if (
-                    cancel &&
-                    cancel->load()
-                ) {
-                    throw std::runtime_error(
-                        "Install cancelled");
+    try {
+        while (true) {
+            std::vector<u8> chunk;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                queueChanged.wait(lock, [&]() {
+                    return !queue.empty() || downloadDone ||
+                        (cancel && cancel->load());
+                });
+
+                if (cancel && cancel->load()) {
+                    throw std::runtime_error("Install cancelled");
                 }
 
-                const std::size_t available =
-                    streamBufferSize -
-                    buffer.size();
-
-                const std::size_t take =
-                    std::min(
-                        available,
-                        bytes);
-
-                buffer.insert(
-                    buffer.end(),
-                    data,
-                    data + take);
-
-                data += take;
-                bytes -= take;
-
-                if (
-                    buffer.size() ==
-                        streamBufferSize
-                ) {
-                    flush();
+                if (queue.empty()) {
+                    if (downloadError) std::rethrow_exception(downloadError);
+                    break;
                 }
+
+                chunk = std::move(queue.front());
+                queue.pop_front();
             }
-        });
+            queueChanged.notify_all();
 
-    flush();
-    output.finish();
+            // The main installer thread exclusively owns the Switch storage
+            // handle; count bytes once they are written successfully.
+            output.write(chunk.data(), chunk.size());
+            progress.addTransferBytes(static_cast<std::uint64_t>(chunk.size()));
+        }
+
+        downloader.join();
+        output.finish();
+    } catch (...) {
+        // Also interrupts the transfer's progress/write callbacks, so the
+        // worker can exit even if the storage writer fails.
+        stopDownload.store(true);
+        queueChanged.notify_all();
+        if (downloader.joinable()) downloader.join();
+        throw;
+    }
 }
 
 void installPackageCloud(
