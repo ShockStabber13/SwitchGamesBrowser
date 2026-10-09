@@ -1325,6 +1325,11 @@ struct InstallQueueRow {
     std::uint64_t bytesTotal = 0;
     std::uint64_t bytesPerSecond = 0;
     std::uint64_t networkBytesPerSecond = 0;
+    // Cumulative performance timings (ms), retained with the install row.
+    std::uint64_t sdWriteMs = 0;
+    std::uint64_t httpWaitMs = 0;
+    std::uint64_t bufferWaitMs = 0;
+    bool hasTimings = false;
     std::string error;
 };
 
@@ -1452,6 +1457,10 @@ static std::vector<InstallQueueRow> loadInstallQueue(
 
             row.error =
                 node.value("error", "");
+            row.sdWriteMs = node.value("sdWriteMs", std::uint64_t(0));
+            row.httpWaitMs = node.value("httpWaitMs", std::uint64_t(0));
+            row.bufferWaitMs = node.value("bufferWaitMs", std::uint64_t(0));
+            row.hasTimings = node.value("hasTimings", false);
 
             if (
                 row.state == "Downloading" ||
@@ -1460,6 +1469,8 @@ static std::vector<InstallQueueRow> loadInstallQueue(
                 row.state = "Queued";
                 row.progress = 0;
                 row.error.clear();
+                row.sdWriteMs = row.httpWaitMs = row.bufferWaitMs = 0;
+                row.hasTimings = false;
             }
 
             if (!row.job.file.name.empty())
@@ -1539,7 +1550,11 @@ static void saveInstallQueue(
             },
             {"state", row.state},
             {"progress", row.progress},
-            {"error", row.error}
+            {"error", row.error},
+            {"sdWriteMs", row.sdWriteMs},
+            {"httpWaitMs", row.httpWaitMs},
+            {"bufferWaitMs", row.bufferWaitMs},
+            {"hasTimings", row.hasTimings}
         });
     }
 
@@ -2585,6 +2600,16 @@ int main(int, char**) {
                 row.bytesPerSecond =
                     bytesPerSecond;
                 row.networkBytesPerSecond = networkBytesPerSecond;
+                // Refresh timing counters on every render-loop iteration.
+                constexpr std::uint64_t nsPerMs = 1000000;
+                row.sdWriteMs = activeInstallProgress->
+                    writerActiveNanoseconds.load() / nsPerMs;
+                row.httpWaitMs = activeInstallProgress->
+                    writerIdleNanoseconds.load() / nsPerMs;
+                row.bufferWaitMs = activeInstallProgress->
+                    producerBackpressureNanoseconds.load() / nsPerMs;
+                row.hasTimings = activeInstallProgress->
+                    parallelEntryCount.load() > 0;
             }
 
             if (
@@ -2683,6 +2708,11 @@ int main(int, char**) {
                 installRows[i].bytesDone = 0;
                 installRows[i].bytesTotal = 0;
                 installRows[i].bytesPerSecond = 0;
+                installRows[i].networkBytesPerSecond = 0;
+                installRows[i].sdWriteMs = 0;
+                installRows[i].httpWaitMs = 0;
+                installRows[i].bufferWaitMs = 0;
+                installRows[i].hasTimings = false;
                 installRows[i].error.clear();
 
                 persistInstallQueue();
@@ -3619,6 +3649,8 @@ int main(int, char**) {
                         row.state = "Queued";
                         row.progress = 0;
                         row.error.clear();
+                        row.sdWriteMs = row.httpWaitMs = row.bufferWaitMs = 0;
+                        row.hasTimings = false;
 
                         persistInstallQueue();
 
@@ -4570,12 +4602,26 @@ int main(int, char**) {
                             : muted
                     );
                 }
+
+                // Dedicated profiler line: do not rely on the clipped
+                // global status field to display timings.
+                const auto& selected = installRows[
+                    std::min(installManagerCursor, installRows.size() - 1)];
+                if (selected.hasTimings) {
+                    char timingText[256]{};
+                    std::snprintf(timingText, sizeof(timingText),
+                        "Timing: SD write %.1fs  |  HTTP wait %.1fs  |  Buffer wait %.1fs",
+                        selected.sdWriteMs / 1000.0,
+                        selected.httpWaitMs / 1000.0,
+                        selected.bufferWaitMs / 1000.0);
+                    label(renderer, small, timingText, 32, 645, 1216, green);
+                }
             }
 
         } else if (page == Page::Settings) {
             label(
                 renderer,big,
-                "SETTINGS",
+                "SETTINGS"
                 32,70,1200,green
             );
 
