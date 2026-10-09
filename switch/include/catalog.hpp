@@ -2,6 +2,7 @@
 #include "json.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -11,7 +12,19 @@
 
 namespace sgb {
 using Json = nlohmann::json;
-struct Release { std::string title, magnet, size, infoHash, source; std::vector<std::string> files; };
+struct Release {
+    std::string title, magnet, size, infoHash, source;
+    std::vector<std::string> files;
+    int seeders = -1;
+    int leechers = -1;
+};
+inline int releasePeerCount(const Json& row, const char* key) {
+    auto it = row.find(key);
+    if (it == row.end() || !it->is_number_integer()) return -1;
+    const auto value = it->get<std::int64_t>();
+    return value >= 0 && value <= 2147483647LL
+        ? static_cast<int>(value) : -1;
+}
 struct Game {
     std::string id, title, titleId, date, cover, summary, ratingSource, ratingUrl;
     std::vector<std::string> genres;
@@ -57,6 +70,8 @@ inline std::vector<Game> parse(const std::string& bytes) {
         if (!releases.is_array()) throw std::runtime_error("Invalid release list");
         for (const auto& r : releases) {
             Release release{field(r, "title", 1024), field(r, "magnet", 4096), field(r, "size", 100), field(r, "infoHash", 64), field(r, "source", 128), {}};
+            release.seeders = releasePeerCount(r, "seeders");
+            release.leechers = releasePeerCount(r, "leechers");
             if (r.contains("files") && r["files"].is_array()) {
                 if (r["files"].size() > 512) throw std::runtime_error("Too many release files");
                 for (const auto& f : r["files"]) if (f.is_string()) release.files.push_back(f.get<std::string>().substr(0, 1024));
@@ -228,7 +243,9 @@ inline std::vector<Game> parseTorrentShard(
                     field(row, "size", 1024),
                     field(row, "infoHash", 256),
                     source,
-                    std::move(files)
+                    std::move(files),
+                    releasePeerCount(row, "seeders"),
+                    releasePeerCount(row, "leechers")
                 }
             );
         }
