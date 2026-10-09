@@ -331,6 +331,21 @@ public:
             CURLOPT_SOCKOPTFUNCTION,
             tuneCloudDownloadSocket);
 
+        // Match pipensx's tested TorBox CDN transport options. Switch's
+        // older libcurl uses HTTP/1.1 for these independent range handles.
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_HTTP_VERSION,
+            CURL_HTTP_VERSION_1_1);
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_IPRESOLVE,
+            CURL_IPRESOLVE_V4);
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_TCP_KEEPALIVE,
+            1L);
+
         curl_easy_setopt(
             curl_,
             CURLOPT_ACCEPT_ENCODING,
@@ -2689,9 +2704,10 @@ void installEntryParallel(
 {
     progress.parallelEntryCount.fetch_add(1, std::memory_order_relaxed);
     constexpr std::size_t connections = 4;
-    // A/B test: fewer short HTTP range requests and less CDN request churn.
-    // Buffer memory stays capped to two 4 MiB blocks per connection.
-    constexpr u64 rangeSize = 64ULL * 1024 * 1024;
+    // pipensx-style short ranged CDN requests. A worker completes each
+    // 4 MiB range before being assigned the next ordered range.
+    // Existing per-worker queues remain bounded.
+    constexpr u64 rangeSize = 4ULL * 1024 * 1024;
     // Match Sphaira's 4 MiB NCA write granularity.
     constexpr std::size_t blockSize = 4 * 1024 * 1024;
     constexpr std::size_t maxBufferedBlocks = 2;
