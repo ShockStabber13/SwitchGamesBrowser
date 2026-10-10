@@ -1467,11 +1467,11 @@ static std::vector<InstallQueueRow> loadInstallQueue(
             row.hasTimings = node.value("hasTimings", false);
             row.benchmarkResult = node.value("benchmarkResult", "");
 
-            if (
-                row.state == "Downloading" ||
-                row.state == "Installing"
-            ) {
-                row.state = "Queued";
+            if (row.state == "Downloading" ||
+                row.state == "Installing") {
+                // Recover interrupted work into the correct manager.
+                row.state = row.state == "Downloading"
+                    ? "QueuedDownload" : "Queued";
                 row.progress = 0;
                 row.error.clear();
                 row.sdWriteMs = row.httpWaitMs = row.bufferWaitMs = 0;
@@ -1573,7 +1573,7 @@ static void saveInstallQueue(
 enum class Page {
     Browse, Detail, Torrents, Files, Settings, Providers,
     SearchProgress, Options, ScrapeChoice, DebridManager,
-    DebridManagerFiles, InstallManager, ShopResults,
+    DebridManagerFiles, DownloadManager, InstallManager, ShopResults,
     CpuClockDiagnostics
 };
 
@@ -1833,6 +1833,7 @@ int main(int, char**) {
     std::future<DebridManagerResult> pendingDebridManager;
     std::future<DebridRemoveResult> pendingDebridRemove;
     std::future<sgb::InstallResult> pendingInstall;
+    std::future<sgb::InstallResult> pendingDownload;
     std::future<sgb::ShopSearchResult> pendingShopSearch;
     sgb::ShopSearchProgress shopSearchProgress;
     std::shared_ptr<std::atomic<bool>> shopSearchCancel;
@@ -1848,6 +1849,12 @@ int main(int, char**) {
 
     std::shared_ptr<sgb::InstallProgress>
         activeInstallProgress;
+    std::shared_ptr<sgb::InstallProgress> activeDownloadProgress;
+    std::shared_ptr<std::atomic<bool>> downloadCancel;
+    std::optional<size_t> activeDownloadIndex;
+    size_t downloadManagerCursor = 0;
+    Page downloadManagerReturnPage = Page::Settings;
+    std::string confirmDownloadDeleteId;
 
     std::shared_ptr<std::atomic<bool>>
         installCancel;
@@ -1988,7 +1995,7 @@ int main(int, char**) {
         row.job.source = source;
         row.job.remoteId = remoteId;
         row.job.file = file;
-        row.state = "Queued";
+        row.state = "QueuedDownload";
 
         installRows.push_back(
             std::move(row));
@@ -2086,7 +2093,7 @@ int main(int, char**) {
         status =
             "Queued " +
             std::to_string(queued) +
-            " file(s) for install";
+            " file(s) for Download Manager";
     };
 
     auto queueDebridManagerFiles =
@@ -2145,7 +2152,7 @@ int main(int, char**) {
         status =
             "Queued " +
             std::to_string(queued) +
-            " file(s) for install";
+            " file(s) for Download Manager";
     };
 
     auto saveDebridStatuses = [&]() {
