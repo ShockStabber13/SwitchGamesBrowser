@@ -489,11 +489,11 @@ bool websiteTitleMatches(const std::string& title, const std::string& html) {
 }
 
 
-// Website catalog cache uses title IDs and normalized *nearby card text*.
-// Every search hit is subsequently checked against its actual game-page h1
-// before allowing any game/download selection.
+// The NotUltraNX listing supplies IDs, while Nlib supplies accurate names.
+// Keep both in a persistent offline catalog; Shop never scans listing pages.
 struct WebsiteCatalogRow {
     std::string id;
+    std::string name;
     std::string cardText;
 };
 std::vector<WebsiteCatalogRow> catalogRowsFromHtml(
@@ -529,7 +529,7 @@ std::vector<WebsiteCatalogRow> catalogRowsFromHtml(
     }
     std::vector<WebsiteCatalogRow> result;
     for (auto& pair : rows)
-        result.push_back({pair.first, std::move(pair.second)});
+        result.push_back({pair.first, "", std::move(pair.second)});
     return result;
 }
 std::vector<WebsiteCatalogRow> loadWebsiteCatalog(
@@ -553,8 +553,9 @@ std::vector<WebsiteCatalogRow> loadWebsiteCatalog(
         if (!game.is_object()) continue;
         const auto id = stringField(game, "id");
         const auto text = stringField(game, "cardText");
-        if (validTitleId(id) && !text.empty() && text.size() <= 3400)
-            rows.push_back({id, text});
+        const auto name = stringField(game, "name");
+        if (validTitleId(id) && !name.empty() && name.size() <= 512)
+            rows.push_back({id, name, text});
         if (rows.size() >= 10000) break;
     }
     return rows;
@@ -637,14 +638,97 @@ std::string downloadNotUltraNxCatalog(
                 "Only " + std::to_string(found.size()) +
                 " game IDs found in website pages; catalog not replaced");
 
+        // Reuse names from any prior successfully enriched catalog.
+        // Nlib's documented /nx/<title-id>?fields=name endpoint provides
+        // authoritative ID->name metadata; it is not a title-search API.
+        const auto previouslyNamed = loadWebsiteCatalog(catalogPath);
+        std::map<std::string, std::string> oldNames;
+        for (const auto& entry : previouslyNamed)
+            oldNames.emplace(entry.id, entry.name);
+        std::vector<WebsiteCatalogRow> enriched;
+        enriched.reserve(found.size());
+        for (const auto& entry : found) {
+            auto old = oldNames.find(entry.first);
+            enriched.push_back({entry.first,
+                old == oldNames.end() ? "" : old->second, entry.second});
+        }
+        std::atomic<std::size_t> nextName{0};
+        std::atomic<std::size_t> checkedNames{0};
+        std::atomic<std::size_t> lookupFailures{0};
+        std::atomic<std::size_t> lookupSuccess{0};
+        std::atomic<bool> apiUnavailable{false};
+        progress.shopsTotal.store(finished.load() + enriched.size());
+        progress.shopsDone.store(finished.load());
+        {
+            std::lock_guard<std::mutex> guard(progress.mutex);
+            progress.message = "Resolving names from Nintendo title IDs...";
+        }
+        auto resolveName = [&]() {
+            while (!cancel->load() && !apiUnavailable.load()) {
+                const auto index = nextName.fetch_add(1);
+                if (index >= enriched.size()) break;
+                auto& game = enriched[index]; // Disjoint entries per thread.
+                if (game.name.empty()) {
+                    try {
+                        const auto response = Json::parse(fetch(
+                            "https://api.nlib.cc/nx/" + game.id +
+                                "?fields=name&lang=en",
+                            cancel.get()), nullptr, false);
+                        if (response.is_object()) {
+                            const auto name = stringField(response, "name");
+                            if (!name.empty() && name.size() <= 512) {
+                                game.name = name;
+                                ++lookupSuccess;
+                            } else {
+                                ++lookupFailures;
+                            }
+                        } else {
+                            ++lookupFailures;
+                        }
+                    } catch (...) {
+                        ++lookupFailures;
+                    }
+                    // Avoid hammering a community metadata provider.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                } else {
+                    ++lookupSuccess;
+                }
+                const auto done = checkedNames.fetch_add(1) + 1;
+                progress.shopsDone.store(finished.load() + done);
+                if (done >= 24 && lookupSuccess.load() == 0) {
+                    apiUnavailable.store(true);
+                }
+                if ((done % 20) == 0 || done == enriched.size()) {
+                    std::lock_guard<std::mutex> guard(progress.mutex);
+                    progress.message = "Named " +
+                        std::to_string(lookupSuccess.load()) + "/" +
+                        std::to_string(enriched.size()) +
+                        " NotUltraNX titles";
+                }
+            }
+        };
+        workers.clear();
+        for (int i = 0; i < 4; ++i) workers.emplace_back(resolveName);
+        for (auto& workerThread : workers) workerThread.join();
+        if (cancel->load())
+            throw std::runtime_error("Catalog download cancelled");
+        if (apiUnavailable.load() || lookupSuccess.load() < 20)
+            throw std::runtime_error(
+                "Nlib name lookup unavailable; previous catalog retained");
         Json data = {
             {"schemaVersion", 1},
             {"source", "https://not.ultranx.ru/en"},
+            {"nameSource", "https://api.nlib.cc/nx"},
             {"games", Json::array()}
         };
-        for (const auto& entry : found)
-            data["games"].push_back(
-                {{"id", entry.first}, {"cardText", entry.second}});
+        for (const auto& entry : enriched) {
+            if (!entry.name.empty())
+                data["games"].push_back({
+                    {"id", entry.id},
+                    {"name", entry.name},
+                    {"cardText", entry.cardText}
+                });
+        }
         // Atomic replacement preserves a previously working cache.
         const std::string tempPath = catalogPath + ".part";
         {
@@ -661,9 +745,9 @@ std::string downloadNotUltraNxCatalog(
             std::remove(tempPath.c_str());
             throw std::runtime_error("Cannot replace NotUltraNX catalog");
         }
-        message = "Saved " + std::to_string(found.size()) +
-            " NotUltraNX game IDs (" +
-            std::to_string(finished.load()) + " pages)";
+        message = "Saved " + std::to_string(lookupSuccess.load()) +
+            " named NotUltraNX games from " +
+            std::to_string(found.size()) + " title IDs";
     } catch (const std::exception& e) {
         message = e.what();
     }
@@ -700,7 +784,7 @@ ShopSearchResult searchNotUltraNxWebsite(
             const auto normalizedTitle = comparable(title);
             for (const auto& entry : cached) {
                 if (normalizedTitle.size() < 3 ||
-                    entry.cardText.find(normalizedTitle) == std::string::npos)
+                    comparable(entry.name).find(normalizedTitle) == std::string::npos)
                     continue;
                 try {
                     const auto page = fetch(
@@ -720,9 +804,9 @@ ShopSearchResult searchNotUltraNxWebsite(
                 throw std::runtime_error(
                     "NotUltraNX catalog missing or invalid. Download it in Settings.");
             throw std::runtime_error(
-                "Game not indexed in NotUltraNX catalog (" +
+                "Game name not matched in local NotUltraNX catalog (" +
                 std::to_string(cached.size()) +
-                " entries). Refresh catalog in Settings.");
+                " named entries). Update catalog in Settings.");
         }
         if (cancel->load())
             throw std::runtime_error("Shop search cancelled");
