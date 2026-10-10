@@ -41,6 +41,11 @@ struct InstallProgress {
     std::atomic<std::uint64_t> networkBytesPerSecond{0};
     std::atomic<std::uint64_t> networkBytesDone{0};
 
+    // Actual NCA bytes committed by ncmContentStorageWritePlaceHolder.
+    // Like upstream Sphaira's write thread, this advances only after a
+    // successful content-storage write, not on a completed source read.
+    std::atomic<std::uint64_t> storageBytesWritten{0};
+
     // Diagnostic counters; not shown as separate speeds in the UI.
     std::atomic<std::uint64_t> writerActiveNanoseconds{0};
     std::atomic<std::uint64_t> writerIdleNanoseconds{0};
@@ -63,6 +68,9 @@ struct InstallProgress {
         std::uint64_t bytes);
 
     void addNetworkBytes(
+        std::uint64_t bytes);
+
+    void addStorageWritten(
         std::uint64_t bytes);
 
     void snapshot(
@@ -90,6 +98,12 @@ private:
     mutable std::deque<std::pair<
         std::chrono::steady_clock::time_point,
         std::uint64_t>> liveSpeedSamples_;
+
+    // Smooth NCA writer throughput over real writes; never substitute
+    // network progress for offline installation speed.
+    mutable std::deque<std::pair<
+        std::chrono::steady_clock::time_point,
+        std::uint64_t>> storageSpeedSamples_;
 };
 
 struct InstallResult {
