@@ -5751,9 +5751,15 @@ int main(int, char**) {
             }
             if (shopRows.empty()) {
                 label(renderer, big,
-                      pendingShopSearch.valid() ? "Reading NotUltraNX website..." :
+                      pendingShopSearch.valid() ? "Reading NotUltraNX catalog..." :
                       "No matching NotUltraNX packages",
                       32, 300, 1200, muted);
+                std::vector<sgb::ShopEntry> unused;
+                std::string detail;
+                shopSearchProgress.snapshot(unused, detail);
+                if (!detail.empty())
+                    label(renderer, small, detail,
+                          32, 348, 1200, green);
             }
             const size_t visibleStart = (shopCursor / 7) * 7;
             for (size_t slot = 0; slot < 7 &&
