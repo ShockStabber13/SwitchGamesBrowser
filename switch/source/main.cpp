@@ -1431,6 +1431,7 @@ static std::vector<InstallQueueRow> loadInstallQueue(
 
             row.job.remoteId =
                 node.value("remoteId", "");
+            row.job.savedPath = node.value("savedPath", "");
 
             const auto& file =
                 node["file"];
@@ -1543,6 +1544,7 @@ static void saveInstallQueue(
             {"infoHash", row.job.infoHash},
             {"source", row.job.source},
             {"remoteId", row.job.remoteId},
+            {"savedPath", row.job.savedPath},
             {
                 "file",
                 {
@@ -2758,6 +2760,7 @@ int main(int, char**) {
                         installRows[
                             *activeInstallIndex];
 
+                    row.job.savedPath = result.savedPath;
                     row.state =
                         result.success
                             ? "Completed"
@@ -2829,7 +2832,7 @@ int main(int, char**) {
                     installCancel;
 
                 installRows[i].state =
-                    "Installing";
+                    "Downloading";
 
                 installRows[i].progress = 0;
                 installRows[i].bytesDone = 0;
