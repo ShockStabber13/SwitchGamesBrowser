@@ -8,6 +8,7 @@ on:
       - experiment/native-cpu-clock-boost-10s
       - experiment/native-cpu-clock-persistent
       - experiment/alldebrid-sphaira-buffering
+      - experiment/cpu-1785-preset
 permissions:
   contents: read
 jobs:

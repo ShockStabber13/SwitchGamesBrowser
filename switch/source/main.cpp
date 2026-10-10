@@ -1805,14 +1805,14 @@ int main(int, char**) {
     sgb::CpuClockBoostTrial cpuClockBoostTrial;
     // CPU frequency preference is stored separately from debrid credentials.
     // It only applies while SwitchGamesBrowser is running.
-    constexpr int kCpuPresetsMHz[] = {0, 1224, 1326, 1428, 1581};
+    constexpr int kCpuPresetsMHz[] = {0, 1224, 1326, 1428, 1581, 1785};
     int cpuClockChoiceMHz = 0;
     try {
         const auto saved = sgb::Json::parse(
             sgb::read(root + "cpu-clock.json", 4096));
         const int preset = saved.value("cpuClockMHz", 0);
         if (preset == 0 || preset == 1224 || preset == 1326 ||
-            preset == 1428 || preset == 1581) {
+            preset == 1428 || preset == 1581 || preset == 1785) {
             cpuClockChoiceMHz = preset;
             if (preset != 0) {
                 cpuClockBoostLines = cpuClockBoostTrial.begin(
@@ -3556,14 +3556,14 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Left) ||
                 (keys & HidNpadButton_Right)) {
                 int index = 0;
-                for (int i = 0; i < 5; ++i) {
+                for (int i = 0; i < 6; ++i) {
                     if (kCpuPresetsMHz[i] == cpuClockChoiceMHz)
                         index = i;
                 }
                 if (keys & HidNpadButton_Left)
-                    index = (index + 4) % 5;
+                    index = (index + 5) % 6;
                 else
-                    index = (index + 1) % 5;
+                    index = (index + 1) % 6;
                 cpuClockChoiceMHz = kCpuPresetsMHz[index];
                 status = "CPU preset selected; press X to apply and save";
             }
@@ -5143,7 +5143,8 @@ int main(int, char**) {
             }
             label(renderer, small,
                   "SELECTED CPU: " + std::string(cpuClockChoiceMHz == 0
-                      ? "OFF" : std::to_string(cpuClockChoiceMHz) + " MHz"),
+                      ? "OFF" : std::to_string(cpuClockChoiceMHz) + " MHz") +
+                  (cpuClockChoiceMHz == 1785 ? " (high power/heat)" : ""),
                   32, 350, 1216, green);
             label(renderer, small,
                   cpuClockBoostTrial.held()

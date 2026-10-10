@@ -104,3 +104,21 @@ receive window; other providers retain their previous 256 KiB request.
 
 This is a measured A/B experiment, not a claim of identical throughput
 to Sphaira. Keep the same network and an equivalent link when comparing.
+
+## Optional 1785 MHz CPU preset
+
+The `experiment/cpu-1785-preset` branch adds `1785 MHz` as an optional
+CPU-only setting alongside Off, 1224, 1326, 1428 and 1581 MHz.
+It retains the AllDebrid Sphaira-style buffering experiment.
+
+The app refuses to apply 1785 MHz unless the active firmware's
+`clkrstGetPossibleClockRates` reports that exact rate as a **discrete
+allowed CPU frequency**. A successful `clkrstSetClockRate` must then
+be corroborated by `clkrstGetClockRate`; unverified changes are
+rolled back, and failed choices are not saved. The clock is requested
+only while SwitchGamesBrowser runs, and the original rate is restored
+on normal exit. **There is no crash-proof background restore.**
+
+**1785 MHz draws more power and generates more heat.** Use adequate
+cooling and monitor temperatures; stop if the Switch becomes unusually
+hot or unstable. This change never modifies GPU, RAM or voltages.

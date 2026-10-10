@@ -95,8 +95,9 @@ std::vector<std::string> probeCpuClockReadOnly() {
 
 
 namespace {
-constexpr std::array<u32, 4> kAllowedCpuPresets{{
-    1224000000u, 1326000000u, 1428000000u, 1581000000u
+constexpr std::array<u32, 5> kAllowedCpuPresets{{
+    1224000000u, 1326000000u, 1428000000u, 1581000000u,
+    1785000000u
 }};
 constexpr auto kTrialDuration = std::chrono::seconds(10);
 
