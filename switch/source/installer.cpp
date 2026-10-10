@@ -4134,71 +4134,63 @@ InstallResult runInstallJob(
     progress.producerBackpressureNanoseconds.store(0);
     progress.parallelEntryCount.store(0);
     progress.set(
-        "Installing",
+        "Downloading",
         0,
         job.file.name);
 
     (void)cacheDirectory;
 
     try {
-        // Both source types use the existing Install Manager. NotUltraNX
-        // routes only to the on-console Stage4A relay at 127.0.0.1:8080.
-        const bool localShop = job.source == "NotUltraNX Relay";
-        const bool onlineShop = job.source == "OpenNX Shop";
-        std::string url;
-        if (localShop || onlineShop) {
-            if (job.file.link.find('\n') != std::string::npos ||
-                job.file.link.find('\r') != std::string::npos)
-                throw std::runtime_error("Invalid shop package URL");
-            // Fragment is Tinfoil's optional filename override.
-            url = job.file.link.substr(0, job.file.link.find('#'));
-            if ((localShop &&
-                 url.rfind("http://127.0.0.1:8080/raw?u=", 0) != 0) ||
-                (onlineShop && url.rfind("https://", 0) != 0))
-                throw std::runtime_error("Shop URL is not an allowed source");
-            if (!endsWithInsensitive(job.file.name, ".nsp") &&
-                !endsWithInsensitive(job.file.name, ".nsz") &&
-                !endsWithInsensitive(job.file.name, ".xci") &&
-                !endsWithInsensitive(job.file.name, ".xcz"))
-                throw std::runtime_error("Unsupported shop package extension");
+        // Reuse only our own deterministic Games pathname, after checking
+        // the exact expected size. A fully staged file survives app restarts
+        // and failed installs, so retries do not need debrid again.
+        const std::string path = downloadedGamePath(job);
+        std::string saved;
+        if (completeSavedGame(path, job.file.size)) {
+            saved = path;
         } else {
-            if (config.service == DebridService::None ||
-                config.apiKey.empty())
-                throw std::runtime_error("Debrid authorization is required");
-            if (job.remoteId.empty())
-                throw std::runtime_error("Debrid torrent ID is missing");
-            auto backend = createDebridBackend(config);
-            if (!backend)
-                throw std::runtime_error("Unable to initialize debrid service");
-            url = backend->downloadUrl(job.remoteId, job.file);
-            if (url.empty())
-                throw std::runtime_error("Debrid did not return a download URL");
+            progress.set("Downloading", 0, job.file.name);
+            const bool localShop = job.source == "NotUltraNX Relay";
+            const bool onlineShop = job.source == "OpenNX Shop";
+            std::string url;
+            if (localShop || onlineShop) {
+                if (job.file.link.find('\\n') != std::string::npos ||
+                    job.file.link.find('\\r') != std::string::npos)
+                    throw std::runtime_error("Invalid shop package URL");
+                url = job.file.link.substr(0, job.file.link.find('#'));
+                if ((localShop &&
+                     url.rfind("http://127.0.0.1:8080/raw?u=", 0) != 0) ||
+                    (onlineShop && url.rfind("https://", 0) != 0))
+                    throw std::runtime_error("Shop URL is not an allowed source");
+            } else {
+                if (config.service == DebridService::None ||
+                    config.apiKey.empty())
+                    throw std::runtime_error("Debrid authorization is required");
+                if (job.remoteId.empty())
+                    throw std::runtime_error("Debrid torrent ID is missing");
+                auto backend = createDebridBackend(config);
+                if (!backend)
+                    throw std::runtime_error("Unable to initialize debrid service");
+                url = backend->downloadUrl(job.remoteId, job.file);
+                if (url.empty())
+                    throw std::runtime_error("Debrid did not return a download URL");
+            }
+
+            saved = downloadFullGame(url, job,
+                !localShop && !onlineShop &&
+                    config.service == DebridService::AllDebrid,
+                progress, cancelRequested);
         }
+        result.savedPath = saved;
+        if (cancelRequested && cancelRequested->load())
+            throw std::runtime_error("Install cancelled");
 
-        if (
-            cancelRequested &&
-            cancelRequested->load()
-        ) {
-            throw std::runtime_error(
-                "Install cancelled");
-        }
-
-        progress.set(
-            "Installing",
-            0,
-            job.file.name);
-
-        gInstallCancel =
-            cancelRequested.get();
-
-        installPackageCloud(
-            url,
-            job.file.name,
-            job.file.size,
-            progress,
-            cancelRequested,
-            !localShop && !onlineShop &&
-                config.service == DebridService::AllDebrid);
+        // Install ONLY from saved SD bytes. This call cannot fall back to
+        // HTTP; a failed local read reports an error instead.
+        progress.set("Installing", 0, job.file.name);
+        gInstallCancel = cancelRequested.get();
+        installPackageCloud(saved, job.file.name, job.file.size,
+                            progress, cancelRequested, false, true);
 
         gInstallCancel = nullptr;
 
@@ -4208,7 +4200,7 @@ InstallResult runInstallJob(
             job.file.name);
 
         result.success = true;
-        result.message = "Install completed";
+        result.message = "Installed; saved to sdmc:/Games";
         if (progress.parallelEntryCount.load() > 0) {
             // Times count all large NCA transfers, not small metadata files.
             const auto ms = [](std::uint64_t ns) { return ns / 1000000; };
