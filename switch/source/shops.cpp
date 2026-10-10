@@ -702,80 +702,14 @@ ShopSearchResult searchNotUltraNxWebsite(
             }
         }
         if (id.empty()) {
-            // IGDB's catalog does not always carry a Nintendo title ID.
-            // Scan the website's paginated HTML directory without using
-            // NotUltraNX's catalog API. Four fetchers keep this bounded.
-            // Try the site's own HTML search before paginated browsing.
-            // Its public pagination links use ?p= and ?s= parameters.
-            constexpr std::size_t maxPages = 48;
-            const std::string searchUrl = "https://not.ultranx.ru/en?s=" +
-                websiteQueryEncode(title);
-            progress.shopsTotal.store(maxPages);
-            std::atomic<std::size_t> nextPage{1};
-            std::atomic<std::size_t> finished{0};
-            std::atomic<bool> found{false};
-            std::mutex foundMutex;
-            const std::string normalized = comparable(title);
-            auto scan = [&]() {
-                while (!found.load() && !cancel->load()) {
-                    const std::size_t page = nextPage.fetch_add(1);
-                    if (page > maxPages) break;
-                    try {
-                        const std::string listing = fetch(
-                            page == 1 ? searchUrl :
-                            "https://not.ultranx.ru/en?p=" +
-                                std::to_string(page - 1), cancel.get());
-                        std::set<std::string> candidates;
-                        const auto pattern = wildcardPattern(title);
-                        for (const auto& link : websiteAnchors(listing)) {
-                            const std::string candidate = anchorGameId(link.href);
-                            const auto caption = comparable(link.caption);
-                            if (!candidate.empty() && normalized.size() >= 3 &&
-                                (caption.find(normalized) != std::string::npos ||
-                                 wildcardMatches(caption, pattern)))
-                                candidates.insert(candidate);
-                        }
-                        // Some card templates use a clickable container
-                        // instead of an <a>. Match the game path in those
-                        // HTML attributes too, then verify its h1 title.
-                        std::size_t pos = 0;
-                        while ((pos = listing.find("/game/", pos)) != std::string::npos) {
-                            const auto candidate = anchorGameId(listing.substr(pos, 22));
-                            const auto start = pos > 400 ? pos - 400 : 0;
-                            const auto end = std::min(listing.size(), pos + 600);
-                            const auto surrounding = comparable(htmlText(
-                                listing.substr(start, end - start)));
-                            if (!candidate.empty() && normalized.size() >= 3 &&
-                                (surrounding.find(normalized) != std::string::npos ||
-                                 wildcardMatches(surrounding, pattern)))
-                                candidates.insert(candidate);
-                            pos += 6;
-                        }
-                        for (const auto& candidate : candidates) {
-                            if (found.load() || cancel->load()) break;
-                            try {
-                                const auto gamePage = fetch(
-                                    "https://not.ultranx.ru/en/game/" + candidate,
-                                    cancel.get());
-                                if (!websiteTitleMatches(title, gamePage)) continue;
-                                std::lock_guard<std::mutex> lock(foundMutex);
-                                if (!found.exchange(true)) id = candidate;
-                                break;
-                            } catch (...) {}
-                        }
-                    } catch (...) {
-                        // A failed page should not hide the rest of the site.
-                    }
-                    const auto count = finished.fetch_add(1) + 1;
-                    progress.shopsDone.store(count);
-                    std::lock_guard<std::mutex> guard(progress.mutex);
-                    progress.message = "Checked " + std::to_string(count) +
-                        "/" + std::to_string(maxPages) + " website pages";
-                }
-            };
-            std::vector<std::thread> workers;
-            for (int i = 0; i < 4; ++i) workers.emplace_back(scan);
-            for (auto& worker : workers) worker.join();
+            const auto cached = loadWebsiteCatalog(catalogPath);
+            if (cached.empty())
+                throw std::runtime_error(
+                    "NotUltraNX catalog missing or invalid. Download it in Settings.");
+            throw std::runtime_error(
+                "Game not indexed in NotUltraNX catalog (" +
+                std::to_string(cached.size()) +
+                " entries). Refresh catalog in Settings.");
         }
         if (cancel->load())
             throw std::runtime_error("Shop search cancelled");
