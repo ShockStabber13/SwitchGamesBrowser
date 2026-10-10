@@ -4016,7 +4016,11 @@ static std::string downloadFullGame(
     progress.beginTransfer(job.file.size);
     progress.set("Downloading", 0, job.file.name);
 
-    constexpr std::size_t blockSize = 512 * 1024;
+    // libcurl may call the receive callback with only ~16 KiB per call.
+    // Aggregate those callbacks into 1 MiB chunks before issuing SD writes.
+    // Sending each tiny HTTP callback straight to FAT can throttle the
+    // network producer to microSD metadata/write-call latency.
+    constexpr std::size_t blockSize = 1024 * 1024;
     constexpr std::size_t maxBuffered = 8 * 1024 * 1024;
     std::mutex mutex;
     std::condition_variable cv;
@@ -4072,30 +4076,46 @@ static std::string downloadFullGame(
     });
 
     try {
+        // Staging is local to the HTTP producer. No per-callback allocation
+        // or SD write is performed until a complete 1 MiB block is ready.
+        std::vector<u8> staging;
+        staging.reserve(blockSize);
+        const auto enqueue = [&]() {
+            if (staging.empty()) return;
+            const std::size_t n = staging.size();
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] {
+                    return pendingBytes + n <= maxBuffered ||
+                           writeError || (cancel && cancel->load());
+                });
+                if (writeError)
+                    std::rethrow_exception(writeError);
+                if (cancel && cancel->load())
+                    throw std::runtime_error("Download cancelled");
+                pendingBytes += n;
+                pending.emplace_back(std::move(staging));
+                cv.notify_all();
+            }
+            staging = std::vector<u8>{};
+            staging.reserve(blockSize);
+        };
         HttpPackageSource source(url, cancel, job.file.size, sphairaStyleBuffering);
         source.streamExact(0, job.file.size,
             [&](const u8* data, std::size_t size) {
                 while (size) {
-                    const std::size_t n = std::min(blockSize, size);
-                    std::vector<u8> chunk(data, data + n);
-                    {
-                        std::unique_lock<std::mutex> lock(mutex);
-                        cv.wait(lock, [&] {
-                            return pendingBytes + n <= maxBuffered ||
-                                   writeError || (cancel && cancel->load());
-                        });
-                        if (writeError)
-                            std::rethrow_exception(writeError);
-                        if (cancel && cancel->load())
-                            throw std::runtime_error("Download cancelled");
-                        pendingBytes += n;
-                        pending.emplace_back(std::move(chunk));
-                        cv.notify_all();
-                    }
+                    const std::size_t n = std::min(
+                        blockSize - staging.size(), size);
+                    staging.insert(staging.end(), data, data + n);
+                    if (staging.size() == blockSize)
+                        enqueue();
                     data += n;
                     size -= n;
                 }
             });
+        // Flush the final partial block only after the complete HTTP Range
+        // was verified; the renamed output must always be a full package.
+        enqueue();
     } catch (...) {
         networkError = std::current_exception();
     }
