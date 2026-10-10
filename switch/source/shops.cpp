@@ -434,6 +434,20 @@ std::vector<WebsiteAnchor> websiteAnchors(const std::string& markup) {
     }
     return links;
 }
+std::string websiteQueryEncode(const std::string& value) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string output;
+    for (unsigned char c : value) {
+        if (std::isalnum(c) && c < 128) output.push_back(static_cast<char>(c));
+        else if (c == '-' || c == '_' || c == '.') output.push_back(c);
+        else {
+            output.push_back('%');
+            output.push_back(hex[c >> 4]);
+            output.push_back(hex[c & 15]);
+        }
+    }
+    return output;
+}
 bool validTitleId(const std::string& id) {
     if (id.size() != 16) return false;
     for (unsigned char c : id)
@@ -473,7 +487,11 @@ ShopSearchResult searchNotUltraNxWebsite(
             // IGDB's catalog does not always carry a Nintendo title ID.
             // Scan the website's paginated HTML directory without using
             // NotUltraNX's catalog API. Four fetchers keep this bounded.
-            constexpr std::size_t maxPages = 64;
+            // Try the site's own HTML search before paginated browsing.
+            // Its public pagination links use ?p= and ?s= parameters.
+            constexpr std::size_t maxPages = 48;
+            const std::string searchUrl = "https://not.ultranx.ru/en?s=" +
+                websiteQueryEncode(title);
             progress.shopsTotal.store(maxPages);
             std::atomic<std::size_t> nextPage{1};
             std::atomic<std::size_t> finished{0};
@@ -486,8 +504,9 @@ ShopSearchResult searchNotUltraNxWebsite(
                     if (page > maxPages) break;
                     try {
                         const std::string listing = fetch(
+                            page == 1 ? searchUrl :
                             "https://not.ultranx.ru/en?p=" +
-                            std::to_string(page), cancel.get());
+                                std::to_string(page - 1), cancel.get());
                         for (const auto& link : websiteAnchors(listing)) {
                             if (found.load() || cancel->load()) break;
                             const std::string candidate = anchorGameId(link.href);
@@ -523,6 +542,25 @@ ShopSearchResult searchNotUltraNxWebsite(
 
         const auto html = fetch(
             "https://not.ultranx.ru/en/game/" + id, cancel.get());
+        // Without an ID supplied by the catalog, refuse an ambiguous
+        // website hit rather than accidentally downloading another game.
+        if (!validTitleId(titleId)) {
+            const auto open = html.find("<h1");
+            const auto begin = open == std::string::npos
+                ? std::string::npos : html.find('>', open);
+            const auto end = begin == std::string::npos
+                ? std::string::npos : html.find("</h1>", begin);
+            const auto pageTitle = end == std::string::npos
+                ? "" : comparable(htmlText(html.substr(begin + 1, end - begin - 1)));
+            const auto expected = comparable(title);
+            if (pageTitle.empty() || expected.empty() ||
+                (pageTitle != expected &&
+                 (expected.size() < 8 ||
+                  pageTitle.find(expected) == std::string::npos ||
+                  expected.size() * 5 < pageTitle.size() * 4)))
+                throw std::runtime_error(
+                    "NotUltraNX result title does not match selected game");
+        }
         const auto links = websiteAnchors(html);
         std::set<std::string> seen;
         std::vector<ShopEntry> matches;
