@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 namespace sgb {
 namespace {
@@ -266,13 +267,31 @@ public:
         std::shared_ptr<std::atomic<bool>>
             cancel,
         u64 knownSize,
-        bool sphairaStyleBuffering = false)
+        bool sphairaStyleBuffering = false,
+        bool localFile = false)
         : url_(std::move(url)),
           initialUrl_(url_),
           cancel_(std::move(cancel)),
           knownSize_(knownSize),
-          sphairaStyleBuffering_(sphairaStyleBuffering)
+          sphairaStyleBuffering_(sphairaStyleBuffering),
+          localFile_(localFile)
     {
+        if (localFile_) {
+            localFd_ = ::open(url_.c_str(), O_RDONLY);
+            if (localFd_ < 0)
+                throw std::runtime_error(std::string("Cannot open saved game: ") +
+                                         std::strerror(errno));
+            struct stat st{};
+            if (::fstat(localFd_, &st) != 0 || !S_ISREG(st.st_mode) ||
+                (knownSize_ && static_cast<u64>(st.st_size) != knownSize_)) {
+                ::close(localFd_);
+                localFd_ = -1;
+                throw std::runtime_error("Saved game size does not match download");
+            }
+            knownSize_ = static_cast<u64>(st.st_size);
+            return; // Local reads never touch libcurl/network.
+        }
+
         curl_ =
             curl_easy_init();
 
@@ -412,6 +431,7 @@ public:
 
     ~HttpPackageSource()
     {
+        if (localFd_ >= 0) ::close(localFd_);
         if (curl_) {
             curl_easy_cleanup(
                 curl_);
@@ -456,6 +476,26 @@ public:
         ) {
             throw std::runtime_error(
                 "Install cancelled");
+        }
+
+        if (localFile_) {
+            // pread does not change the shared file position, which also
+            // makes this compatible with optional parallel NCA reads.
+            std::vector<u8> block(512 * 1024);
+            u64 done = 0;
+            while (done < size) {
+                if ((cancel_ && cancel_->load()) || (stop && stop->load()))
+                    throw std::runtime_error("Install cancelled");
+                const std::size_t count = static_cast<std::size_t>(
+                    std::min<u64>(block.size(), size - done));
+                const ssize_t n = ::pread(localFd_, block.data(), count,
+                                          static_cast<off_t>(offset + done));
+                if (n <= 0)
+                    throw std::runtime_error("Saved game read failed");
+                consume(block.data(), static_cast<std::size_t>(n));
+                done += static_cast<u64>(n);
+            }
+            return;
         }
 
         const std::string range =
@@ -556,7 +596,7 @@ public:
     // Separate easy handles are required for concurrent HTTP ranges.
     std::unique_ptr<HttpPackageSource> clone() const {
         return std::make_unique<HttpPackageSource>(
-            url_, cancel_, knownSize_, sphairaStyleBuffering_);
+            url_, cancel_, knownSize_, sphairaStyleBuffering_, localFile_);
     }
 
     void readExact(
@@ -599,6 +639,8 @@ private:
 
     u64 knownSize_ = 0;
     bool sphairaStyleBuffering_ = false;
+    bool localFile_ = false;
+    int localFd_ = -1;
 
     CURL* curl_ = nullptr;
 };
@@ -952,7 +994,8 @@ Package openPackage(
     const std::shared_ptr<
         std::atomic<bool>>& cancel,
     u64 knownSize,
-    bool sphairaStyleBuffering)
+    bool sphairaStyleBuffering,
+    bool localFile = false)
 {
     auto source =
         std::make_shared<
@@ -960,7 +1003,8 @@ Package openPackage(
                 url,
                 cancel,
                 knownSize,
-                sphairaStyleBuffering);
+                sphairaStyleBuffering,
+                localFile);
 
     if (
         endsWithInsensitive(name, ".nsp") ||
@@ -3110,14 +3154,15 @@ void installPackageCloud(
     u64 knownSize,
     InstallProgress& progress,
     const std::shared_ptr<std::atomic<bool>>& cancel,
-    bool sphairaStyleBuffering)
+    bool sphairaStyleBuffering,
+    bool localFile = false)
 {
     InstallServices services;
 
     progress.set(
         "Installing",
         0,
-        "Opening cloud package");
+        localFile ? "Opening saved game" : "Opening cloud package");
 
     Package package =
         openPackage(
@@ -3125,7 +3170,8 @@ void installPackageCloud(
             name,
             cancel,
             knownSize,
-            sphairaStyleBuffering);
+            sphairaStyleBuffering,
+            localFile);
 
     if (package.entries.empty())
         throw std::runtime_error(
