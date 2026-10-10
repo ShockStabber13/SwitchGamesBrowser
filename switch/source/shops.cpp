@@ -7,6 +7,9 @@
 #include <chrono>
 #include <deque>
 #include <cstring>
+#include <fstream>
+#include <cstdio>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -485,11 +488,184 @@ bool websiteTitleMatches(const std::string& title, const std::string& html) {
           expected.size() * 5 >= actual.size() * 4));
 }
 
+
+// Website catalog cache uses title IDs and normalized *nearby card text*.
+// Every search hit is subsequently checked against its actual game-page h1
+// before allowing any game/download selection.
+struct WebsiteCatalogRow {
+    std::string id;
+    std::string cardText;
+};
+std::vector<WebsiteCatalogRow> catalogRowsFromHtml(
+    const std::string& html)
+{
+    std::map<std::string, std::string> rows;
+    // Site cards may be anchors OR onclick containers. Index the path
+    // wherever it appears; do not assume one specific card template.
+    std::size_t pos = 0;
+    while ((pos = html.find("/game/", pos)) != std::string::npos) {
+        const auto id = anchorGameId(html.substr(pos, 24));
+        if (!id.empty()) {
+            const auto start = pos > 220 ? pos - 220 : 0;
+            const auto stop = std::min(html.size(), pos + 520);
+            const auto nearby = comparable(
+                htmlText(html.substr(start, stop - start)));
+            if (!nearby.empty())
+                rows.emplace(id, nearby.substr(0, 800));
+        }
+        pos += 6;
+    }
+    std::vector<WebsiteCatalogRow> result;
+    for (auto& pair : rows)
+        result.push_back({pair.first, std::move(pair.second)});
+    return result;
+}
+std::vector<WebsiteCatalogRow> loadWebsiteCatalog(
+    const std::string& path)
+{
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) return {};
+    const auto size = input.tellg();
+    if (size <= 0 || size > 5 * 1024 * 1024)
+        return {};
+    input.seekg(0);
+    const std::string bytes(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    const auto root = Json::parse(bytes, nullptr, false);
+    if (!root.is_object() || root.value("schemaVersion", 0) != 1 ||
+        !root.contains("games") || !root["games"].is_array())
+        return {};
+    std::vector<WebsiteCatalogRow> rows;
+    for (const auto& game : root["games"]) {
+        if (!game.is_object()) continue;
+        const auto id = stringField(game, "id");
+        const auto text = stringField(game, "cardText");
+        if (validTitleId(id) && !text.empty() && text.size() <= 800)
+            rows.push_back({id, text});
+        if (rows.size() >= 10000) break;
+    }
+    return rows;
+}
+
 } // namespace
+
+std::string downloadNotUltraNxCatalog(
+    const std::string& catalogPath,
+    ShopSearchProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancel)
+{
+    constexpr std::size_t maxPages = 96;
+    constexpr std::size_t maxRows = 10000;
+    progress.running.store(true);
+    progress.shopsDone.store(0);
+    progress.shopsTotal.store(maxPages);
+    {
+        std::lock_guard<std::mutex> guard(progress.mutex);
+        progress.message = "Downloading NotUltraNX website catalog...";
+    }
+    std::string message;
+    try {
+        if (!cancel || cancel->load())
+            throw std::runtime_error("Catalog download cancelled");
+        // Four parallel webpage readers; stop after consecutive pages
+        // stop adding new title IDs. No authenticated API or relay is used.
+        std::mutex mutex;
+        std::map<std::string, std::string> found;
+        std::atomic<std::size_t> nextPage{1};
+        std::atomic<std::size_t> finished{0};
+        std::atomic<std::size_t> stalePages{0};
+        std::atomic<bool> stop{false};
+        std::atomic<bool> firstPageFailed{false};
+        std::string firstPageError;
+        auto worker = [&]() {
+            while (!stop.load() && !cancel->load()) {
+                const auto page = nextPage.fetch_add(1);
+                if (page > maxPages) break;
+                try {
+                    const auto url = "https://not.ultranx.ru/en?p=" +
+                        std::to_string(page) + "&s=&sb=release_date&so=desc";
+                    const auto html = fetch(url, cancel.get());
+                    const auto rows = catalogRowsFromHtml(html);
+                    std::size_t added = 0;
+                    {
+                        std::lock_guard<std::mutex> guard(mutex);
+                        for (const auto& row : rows) {
+                            if (found.size() >= maxRows) break;
+                            if (found.emplace(row.id, row.cardText).second)
+                                ++added;
+                        }
+                    }
+                    if (added) stalePages.store(0);
+                    else if (stalePages.fetch_add(1) + 1 >= 8)
+                        stop.store(true);
+                } catch (const std::exception& e) {
+                    if (page == 1) {
+                        firstPageError = e.what();
+                        firstPageFailed.store(true);
+                        stop.store(true);
+                    } else if (stalePages.fetch_add(1) + 1 >= 8)
+                        stop.store(true);
+                }
+                const auto done = finished.fetch_add(1) + 1;
+                progress.shopsDone.store(done);
+                std::lock_guard<std::mutex> guard(progress.mutex);
+                progress.message = "NotUltraNX catalog: " +
+                    std::to_string(done) + " pages checked";
+            }
+        };
+        std::vector<std::thread> workers;
+        for (int i = 0; i < 4; ++i) workers.emplace_back(worker);
+        for (auto& workerThread : workers) workerThread.join();
+        if (cancel->load()) throw std::runtime_error("Catalog download cancelled");
+        if (firstPageFailed.load())
+            throw std::runtime_error("Catalog homepage failed: " + firstPageError);
+        if (found.empty())
+            throw std::runtime_error(
+                "Website pages returned no game IDs; catalog not replaced");
+
+        Json data = {
+            {"schemaVersion", 1},
+            {"source", "https://not.ultranx.ru/en"},
+            {"games", Json::array()}
+        };
+        for (const auto& entry : found)
+            data["games"].push_back(
+                {{"id", entry.first}, {"cardText", entry.second}});
+        // Atomic replacement preserves a previously working cache.
+        const std::string tempPath = catalogPath + ".part";
+        {
+            std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
+            if (!output)
+                throw std::runtime_error("Cannot write NotUltraNX catalog");
+            const std::string serialized = data.dump();
+            output.write(serialized.data(), serialized.size());
+            output.flush();
+            if (!output)
+                throw std::runtime_error("Cannot finish NotUltraNX catalog");
+        }
+        if (std::rename(tempPath.c_str(), catalogPath.c_str()) != 0) {
+            std::remove(tempPath.c_str());
+            throw std::runtime_error("Cannot replace NotUltraNX catalog");
+        }
+        message = "Saved " + std::to_string(found.size()) +
+            " NotUltraNX game IDs (" +
+            std::to_string(finished.load()) + " pages)";
+    } catch (const std::exception& e) {
+        message = e.what();
+    }
+    progress.running.store(false);
+    {
+        std::lock_guard<std::mutex> guard(progress.mutex);
+        progress.message = message;
+    }
+    return message;
+}
 
 ShopSearchResult searchNotUltraNxWebsite(
     const std::string& title,
     const std::string& titleId,
+    const std::string& catalogPath,
     ShopSearchProgress& progress,
     const std::shared_ptr<std::atomic<bool>>& cancel)
 {
@@ -506,6 +682,25 @@ ShopSearchResult searchNotUltraNxWebsite(
         if (!cancel || cancel->load())
             throw std::runtime_error("Shop search cancelled");
         std::string id = validTitleId(titleId) ? titleId : "";
+        if (id.empty()) {
+            const auto cached = loadWebsiteCatalog(catalogPath);
+            const auto normalizedTitle = comparable(title);
+            for (const auto& entry : cached) {
+                if (normalizedTitle.size() < 3 ||
+                    entry.cardText.find(normalizedTitle) == std::string::npos)
+                    continue;
+                try {
+                    const auto page = fetch(
+                        "https://not.ultranx.ru/en/game/" + entry.id,
+                        cancel.get());
+                    if (websiteTitleMatches(title, page)) {
+                        id = entry.id;
+                        break;
+                    }
+                } catch (...) {}
+                if (cancel->load()) break;
+            }
+        }
         if (id.empty()) {
             // IGDB's catalog does not always carry a Nintendo title ID.
             // Scan the website's paginated HTML directory without using
