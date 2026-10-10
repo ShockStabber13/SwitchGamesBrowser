@@ -5020,6 +5020,57 @@ int main(int, char**) {
                 }
             }
 
+        } else if (page == Page::DownloadManager) {
+            label(renderer, big, "DOWNLOAD MANAGER", 32,70,1200,green);
+            label(renderer, small,
+                  "A Retry/Details  |  Y Install  |  X Cancel/Delete Saved (twice)  |  L/R Page  |  B Back",
+                  32,112,1200,muted);
+            if (installRows.empty()) {
+                label(renderer, big, "No downloads queued", 32,280,1200,muted);
+            } else {
+                const size_t start = (downloadManagerCursor / 8) * 8;
+                for (size_t slot = 0; slot < 8 &&
+                     start + slot < installRows.size(); ++slot) {
+                    const size_t index = start + slot;
+                    const auto& row = installRows[index];
+                    const int y = 150 + static_cast<int>(slot) * 62;
+                    SDL_Rect rectangle{32,y,1216,54};
+                    rect(renderer, rectangle, SDL_Color{18,18,18,255});
+                    if (index == downloadManagerCursor)
+                        rect(renderer, rectangle, green, true);
+                    const std::string name = row.job.gameTitle.empty()
+                        ? row.job.file.name
+                        : row.job.gameTitle + " - " + row.job.file.name;
+                    marqueeLabel(renderer,small,name,48,y+6,1160,
+                                 index==downloadManagerCursor,white);
+                    std::string stateText = row.state == "QueuedDownload"
+                        ? "Queued to download"
+                        : row.state;
+                    if (row.state == "Downloading") {
+                        stateText += ": " + std::to_string(row.progress) + "%";
+                        if (row.bytesTotal)
+                            stateText += " | " + formatTransferBytes(row.bytesDone) +
+                                " / " + formatTransferBytes(row.bytesTotal);
+                        stateText += " | " +
+                            formatTransferBytes(row.networkBytesPerSecond) + "/s";
+                    }
+                    if (!row.job.savedPath.empty() &&
+                        row.state != "Downloading") {
+                        stateText += " | Saved to sdmc:/Games";
+                    }
+                    if ((row.state == "Download Failed" ||
+                         row.state == "Download Cancelled") && !row.error.empty())
+                        stateText += " - " + row.error;
+                    label(renderer,small,stateText,48,y+30,1160,
+                          row.job.savedPath.empty() ? muted : green);
+                }
+                const auto& selected = installRows[
+                    std::min(downloadManagerCursor, installRows.size()-1)];
+                if (!selected.job.savedPath.empty())
+                    label(renderer,small,"Saved to " + selected.job.savedPath,
+                          32,647,1216,green);
+            }
+
         } else if (page == Page::InstallManager) {
             label(
                 renderer,big,
