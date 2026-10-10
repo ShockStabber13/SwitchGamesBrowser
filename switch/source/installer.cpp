@@ -486,7 +486,10 @@ public:
             std::lock_guard<std::mutex> localReadLock(localReadMutex_);
             if (::lseek(localFd_, static_cast<off_t>(offset), SEEK_SET) < 0)
                 throw std::runtime_error("Saved game seek failed");
-            std::vector<u8> block(512 * 1024);
+            // Original Sphaira reads local install sources in 4 MiB
+            // chunks, passing them through its processing/write workers.
+            // Match that granularity rather than 512 KiB POSIX reads.
+            std::vector<u8> block(4 * 1024 * 1024);
             u64 done = 0;
             while (done < size) {
                 if ((cancel_ && cancel_->load()) || (stop && stop->load()))
