@@ -219,7 +219,23 @@ std::vector<std::string> CpuClockBoostTrial::begin(u32 requestedHz, bool holdUnt
         return result;
     }
 
-    // Even if a readback fails, an accepted write must be restored.
+    // Do not hold an unverified CPU clock. A successful IPC write is not
+    // proof the requested frequency actually took effect.
+    if (R_FAILED(verify) || actualHz != requestedHz) {
+        result.push_back(R_FAILED(verify)
+            ? resultLine("Clock readback failed", verify)
+            : "Requested CPU frequency not confirmed (" + mhz(actualHz) + ")");
+        const Result restored = clkrstSetClockRate(&session_, originalHz_);
+        u32 restoredHz = 0;
+        const Result checked = clkrstGetClockRate(&session_, &restoredHz);
+        result.emplace_back(R_SUCCEEDED(restored) && R_SUCCEEDED(checked) &&
+                            restoredHz == originalHz_
+            ? "Original CPU clock restored."
+            : "WARNING: failed to verify original CPU clock!");
+        close();
+        return result;
+    }
+
     active_ = true;
     deadline_ = std::chrono::steady_clock::now() + kTrialDuration;
     targetHz_ = requestedHz;
