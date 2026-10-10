@@ -433,11 +433,10 @@ std::vector<WebsiteAnchor> websiteAnchors(const std::string& markup) {
         if (!href.empty()) {
             WebsiteAnchor link;
             link.href = std::move(href);
-            // Game cards occasionally put titles beside a linked image.
-            // This short context also covers nested <span> title markup.
-            const auto after = std::min(markup.size(), end + 5 + 260);
+            // Read only this anchor's visible label. Including the text
+            // after </a> can mislabel a neighbouring download button.
             link.caption = htmlText(markup.substr(
-                tagEnd + 1, after - (tagEnd + 1)));
+                tagEnd + 1, end - (tagEnd + 1)));
             links.push_back(std::move(link));
         }
         p = end + 4;
@@ -861,21 +860,28 @@ ShopSearchResult searchNotUltraNxWebsite(
         for (const auto& a : links) {
             const auto url = urlResolve(
                 "https://not.ultranx.ru/en/game/" + id, a.href);
-            // Follow only links embedded on the selected game's real
-            // HTML page, to the official API redirect host. Do not use the
-            // DBI/CyberFoil catalog or local relay.
-            if (url.rfind("https://api.ultranx.ru/", 0) != 0 ||
-                url.find("/download/" + id + "/") == std::string::npos)
+            // Use the real buttons on the verified game page, but allow
+            // NotUltraNX to change its download URL paths or query strings.
+            // Do not accept third-party mirrors, game images or other links.
+            if (url.rfind("https://api.ultranx.ru/", 0) != 0)
                 continue;
-            const auto path = stripQuery(url);
+            const auto label = comparable(a.caption);
+            const auto path = lower(stripQuery(url));
+            const bool downloadPath =
+                path.find("/download/") != std::string::npos;
             std::string name;
-            if (path.size() >= 5 && path.compare(path.size()-5, 5, "/base") == 0)
+            if (label.find("downloadbase") != std::string::npos ||
+                (downloadPath && path.size() >= 5 &&
+                 path.compare(path.size()-5, 5, "/base") == 0))
                 name = title + " [BASE].nsz";
-            else if (path.size() >= 7 &&
-                     path.compare(path.size()-7, 7, "/update") == 0)
+            else if (label.find("downloadupdate") != std::string::npos ||
+                     (downloadPath && path.size() >= 7 &&
+                      path.compare(path.size()-7, 7, "/update") == 0))
                 name = title + " [UPDATE].nsz";
-            else if (path.size() >= 5 &&
-                     path.compare(path.size()-5, 5, "/dlcs") == 0)
+            else if (label.find("downloadalldlc") != std::string::npos ||
+                     label.find("downloaddlc") != std::string::npos ||
+                     (downloadPath && path.size() >= 5 &&
+                      path.compare(path.size()-5, 5, "/dlcs") == 0))
                 name = title + " [DLCs].zip";
             else
                 continue;
