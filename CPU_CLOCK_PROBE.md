@@ -95,3 +95,12 @@ on AllDebrid.
 
 AllDebrid URLs, debrid credentials, and torrent identifiers are not
 displayed by the benchmark.
+
+The build also uses Sphaira's `SocketInitConfig` for
+**application mode** (64 KiB initial TCP send/receive buffers and
+4 MiB maxima, 3 BSD sessions), falling back to libnx defaults when
+that allocation is unavailable. AllDebrid requests a 1 MiB socket
+receive window; other providers retain their previous 256 KiB request.
+
+This is a measured A/B experiment, not a claim of identical throughput
+to Sphaira. Keep the same network and an equivalent link when comparing.
