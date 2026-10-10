@@ -125,6 +125,13 @@ NetworkBenchmarkResult runDownloadFirstBenchmark(
 // Returns false for invalid paths or deletion errors.
 bool removeDownloadedGame(const InstallJob& job);
 
+// Download the complete file to sdmc:/Games. Never installs content.
+InstallResult runDownloadJob(
+    const DebridConfig& config,
+    const InstallJob& job,
+    InstallProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancelRequested);
+
 InstallResult runInstallJob(
     const DebridConfig& config,
     const InstallJob& job,
