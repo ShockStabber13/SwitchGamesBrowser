@@ -1782,6 +1782,25 @@ int main(int, char**) {
     std::vector<std::string> cpuClockDiagnosticLines;
     std::vector<std::string> cpuClockBoostLines{"Press X for 10s / 1224 MHz CPU boost experiment."};
     sgb::CpuClockBoostTrial cpuClockBoostTrial;
+    // CPU frequency preference is stored separately from debrid credentials.
+    // It only applies while SwitchGamesBrowser is running.
+    constexpr int kCpuPresetsMHz[] = {0, 1224, 1326, 1428, 1581};
+    int cpuClockChoiceMHz = 0;
+    try {
+        const auto saved = sgb::Json::parse(
+            sgb::read(root + "cpu-clock.json", 4096));
+        const int preset = saved.value("cpuClockMHz", 0);
+        if (preset == 0 || preset == 1224 || preset == 1326 ||
+            preset == 1428 || preset == 1581) {
+            cpuClockChoiceMHz = preset;
+            if (preset != 0) {
+                cpuClockBoostLines = cpuClockBoostTrial.begin(
+                    static_cast<u32>(preset) * 1000000u, true);
+            }
+        }
+    } catch (...) {
+        // Unconfigured: use the stock system CPU clock.
+    }
     std::set<size_t> selectedFiles;
     std::future<Refresh> pending;
     std::future<std::string> pendingLangegen; 
@@ -2808,7 +2827,7 @@ int main(int, char**) {
                 // Sphaira enables this for transfer progress by default.
                 // Without it, concurrent HTTPS, SD writes and rendering all
                 // compete at the normal CPU clock during installations.
-                if (!installCpuBoosted) {
+                if (!installCpuBoosted && !cpuClockBoostTrial.held()) {
                     appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
                     installCpuBoosted = true;
                 }
@@ -3784,7 +3803,7 @@ int main(int, char**) {
                             "HTTP-only test running (1x then 4x)...";
                         status = "Benchmarking TorBox HTTP with no SD writes...";
                         // Apply the same CPU boost as a real install.
-                        if (!installCpuBoosted) {
+                        if (!installCpuBoosted && !cpuClockBoostTrial.held()) {
                             appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
                             installCpuBoosted = true;
                         }
