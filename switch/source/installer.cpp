@@ -4054,6 +4054,9 @@ static std::string downloadFullGame(
 
     std::thread writer([&]() {
         try {
+            // Keep the real file position independent of UI counters, like
+            // upstream Sphaira's dedicated write_offset.
+            u64 writeOffset = 0;
             for (;;) {
                 std::vector<u8> chunk;
                 {
@@ -4075,13 +4078,17 @@ static std::string downloadFullGame(
                 }
                 if (cancel && cancel->load())
                     throw std::runtime_error("Download cancelled");
+                if (writeOffset > job.file.size ||
+                    chunk.size() > job.file.size - writeOffset)
+                    throw std::runtime_error("Download wrote beyond expected package size");
                 const Result rc = fsFileWrite(
-                    &output.fd, progress.bytesDone.load(),
+                    &output.fd, writeOffset,
                     chunk.data(), chunk.size(), FsWriteOption_None);
                 if (R_FAILED(rc))
                     throw std::runtime_error(
                         "microSD native write failed (FS " +
                         std::to_string(static_cast<unsigned>(rc)) + ")");
+                writeOffset += chunk.size();
                 progress.addTransferBytes(chunk.size());
                 // This is the number of bytes safely handed to the SD writer;
                 // do not use HTTP-only counters as evidence of saved data.
@@ -4096,6 +4103,8 @@ static std::string downloadFullGame(
                 }
             }
             if (networkSucceeded.load()) {
+                if (writeOffset != job.file.size)
+                    throw std::runtime_error("Incomplete SD download after writer finished");
                 const Result rc = fsFileFlush(&output.fd);
                 if (R_FAILED(rc))
                     throw std::runtime_error(
