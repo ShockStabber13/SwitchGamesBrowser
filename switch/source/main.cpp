@@ -2019,12 +2019,14 @@ int main(int, char**) {
         shopSearchCancel = std::make_shared<std::atomic<bool>>(false);
         const auto cancel = shopSearchCancel;
         const std::string title = games[gameIndex].title;
+        const std::string titleId = games[gameIndex].titleId;
         page = Page::ShopResults;
-        status = "Searching NotUltraNX relay...";
+        status = "Searching NotUltraNX website...";
         pendingShopSearch = std::async(
             std::launch::async,
-            [title, cancel, &shopSearchProgress]() {
-                return sgb::searchNotUltraNxRelay(title, shopSearchProgress, cancel);
+            [title, titleId, cancel, &shopSearchProgress]() {
+                return sgb::searchNotUltraNxWebsite(
+                    title, titleId, shopSearchProgress, cancel);
             });
     };
 
@@ -3217,16 +3219,21 @@ int main(int, char**) {
             if ((keys & HidNpadButton_A) && shopCursor < shopRows.size() &&
                 shopGameIndex < games.size()) {
                 const auto& item = shopRows[shopCursor];
-                if (!sgb::isShopPackage(item.name) ||
-                    item.url.rfind("http://127.0.0.1:8080/raw?u=", 0) != 0) {
-                    status = "NotUltraNX relay URL is invalid";
+                const bool validPackage =
+                    sgb::isShopPackage(item.name) ||
+                    (item.name.size() >= 4 &&
+                     item.name.compare(item.name.size() - 4, 4, ".zip") == 0);
+                if (!validPackage ||
+                    item.url.rfind("https://api.ultranx.ru/", 0) != 0 ||
+                    item.url.find("/download/") == std::string::npos) {
+                    status = "NotUltraNX website download URL is invalid";
                 } else {
                     sgb::DebridFile file;
                     file.name = item.name;
                     file.link = item.url;
                     file.size = item.size;
                     appendInstallJob(games[shopGameIndex].title, item.name,
-                                     "", "NotUltraNX Relay", "", file);
+                                     "", "NotUltraNX Website", "", file);
                     persistInstallQueue();
                     downloadManagerCursor = installRows.size() - 1;
                     downloadManagerReturnPage = Page::ShopResults;
@@ -5654,7 +5661,7 @@ int main(int, char**) {
                   52, 490, 1140,
                   scrapeChoiceCursor == 2 ? green : white);
             label(renderer, small,
-                  "Search NotUltraNX catalog through the existing relay",
+                  "Browse website Base, Update and DLC download links",
                   52, 538, 1140, muted);
 
             label(
@@ -5684,7 +5691,7 @@ int main(int, char**) {
                 ? games[shopGameIndex].title : "OpenNX";
             label(renderer, big, gameTitle, 32, 78, 1200, green);
             label(renderer, small,
-                "TORRENTS [ZL]  |  SHOPS [active]  |  A Queue to Install Manager  |  Y Rescan  |  B Back",
+                "TORRENTS [ZL] | SHOPS [active] | A Queue Download | Y Rescan | B Back",
                 32, 122, 1200, muted);
 
             if (pendingShopSearch.valid()) {
@@ -5695,7 +5702,7 @@ int main(int, char**) {
                       "Searching " +
                       std::to_string(shopSearchProgress.shopsDone.load()) + "/" +
                       std::to_string(shopSearchProgress.shopsTotal.load()) +
-                      " NotUltraNX relay source", 32, 636, 1200, green);
+                      " NotUltraNX website pages", 32, 636, 1200, green);
             }
             if (shopRows.empty()) {
                 label(renderer, big,
