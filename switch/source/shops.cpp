@@ -554,7 +554,8 @@ std::vector<WebsiteCatalogRow> loadWebsiteCatalog(
         const auto id = stringField(game, "id");
         const auto text = stringField(game, "cardText");
         const auto name = stringField(game, "name");
-        if (validTitleId(id) && !name.empty() && name.size() <= 512)
+        if (validTitleId(id) && name.size() <= 512 &&
+            text.size() <= 3400)
             rows.push_back({id, name, text});
         if (rows.size() >= 10000) break;
     }
@@ -722,12 +723,13 @@ std::string downloadNotUltraNxCatalog(
             {"games", Json::array()}
         };
         for (const auto& entry : enriched) {
-            if (!entry.name.empty())
-                data["games"].push_back({
-                    {"id", entry.id},
-                    {"name", entry.name},
-                    {"cardText", entry.cardText}
-                });
+            // Keep every scraped ID, including entries Nlib cannot name yet.
+            // An exact ID from another metadata source can still use it.
+            data["games"].push_back({
+                {"id", entry.id},
+                {"name", entry.name},
+                {"cardText", entry.cardText}
+            });
         }
         // Atomic replacement preserves a previously working cache.
         const std::string tempPath = catalogPath + ".part";
