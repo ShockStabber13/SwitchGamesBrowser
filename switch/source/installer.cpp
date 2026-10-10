@@ -4196,27 +4196,16 @@ static std::string downloadFullGame(
     return finalPath;
 }
 
-InstallResult runInstallJob(
+// Download Manager: save a verified complete package but DO NOT install it.
+InstallResult runDownloadJob(
     const DebridConfig& config,
     const InstallJob& job,
-    const std::string& cacheDirectory,
     InstallProgress& progress,
     const std::shared_ptr<std::atomic<bool>>& cancelRequested)
 {
     InstallResult result;
-
     progress.running.store(true);
-    progress.writerActiveNanoseconds.store(0);
-    progress.writerIdleNanoseconds.store(0);
-    progress.producerBackpressureNanoseconds.store(0);
-    progress.parallelEntryCount.store(0);
-    progress.set(
-        "Downloading",
-        0,
-        job.file.name);
-
-    (void)cacheDirectory;
-
+    progress.set("Downloading", 0, job.file.name);
     try {
         // Reuse only our own deterministic Games pathname, after checking
         // the exact expected size. A fully staged file survives app restarts
@@ -4258,6 +4247,51 @@ InstallResult runInstallJob(
                     config.service == DebridService::AllDebrid,
                 progress, cancelRequested);
         }
+        result.savedPath = saved;
+        if (cancelRequested && cancelRequested->load())
+            throw std::runtime_error("Download cancelled");
+
+        result.success = true;
+        progress.set("Downloaded", 100, result.savedPath);
+        result.message = "Saved to " + result.savedPath;
+    } catch (const std::exception& e) {
+        result.cancelled = cancelRequested && cancelRequested->load();
+        result.message = result.cancelled ? "Download cancelled" : e.what();
+        progress.set(result.cancelled ? "Cancelled" : "Failed",
+                     progress.percent.load(), result.message);
+    }
+    progress.running.store(false);
+    return result;
+}
+
+InstallResult runInstallJob(
+    const DebridConfig& config,
+    const InstallJob& job,
+    const std::string& cacheDirectory,
+    InstallProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancelRequested)
+{
+    InstallResult result;
+
+    progress.running.store(true);
+    progress.writerActiveNanoseconds.store(0);
+    progress.writerIdleNanoseconds.store(0);
+    progress.producerBackpressureNanoseconds.store(0);
+    progress.parallelEntryCount.store(0);
+    progress.set(
+        "Installing",
+        0,
+        job.file.name);
+
+    (void)cacheDirectory;
+
+    try {
+        // Install Manager only accepts a previously completed download.
+        // Never fall back to network; download and installation are separate.
+        const std::string saved = downloadedGamePath(job);
+        if (job.savedPath != saved ||
+            !completeSavedGame(saved, job.file.size))
+            throw std::runtime_error("Game not downloaded; use Download Manager first");
         result.savedPath = saved;
         if (cancelRequested && cancelRequested->load())
             throw std::runtime_error("Install cancelled");
