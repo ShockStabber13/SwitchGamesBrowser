@@ -399,6 +399,13 @@ std::vector<WebsiteAnchor> websiteAnchors(const std::string& markup) {
     std::vector<WebsiteAnchor> links;
     std::size_t p = 0;
     while ((p = markup.find("<a", p)) != std::string::npos) {
+        // Don't treat <article> or <aside> as anchor tags.
+        if (p + 2 >= markup.size() ||
+            (markup[p + 2] != '>' &&
+             !std::isspace(static_cast<unsigned char>(markup[p + 2])))) {
+            p += 2;
+            continue;
+        }
         const auto tagEnd = markup.find('>', p + 2);
         if (tagEnd == std::string::npos) break;
         const auto end = markup.find("</a>", tagEnd + 1);
