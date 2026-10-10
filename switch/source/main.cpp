@@ -1842,6 +1842,7 @@ int main(int, char**) {
     std::future<sgb::NetworkBenchmarkResult> pendingNetworkBenchmark;
     std::shared_ptr<std::atomic<bool>> networkBenchmarkCancel;
     std::string networkBenchmarkTargetId;
+    std::string confirmSavedDeletionId;
     bool installCpuBoosted = false;
     sgb::LiveSearchProgress liveSearchProgress;
 
@@ -3878,15 +3879,41 @@ int main(int, char**) {
 
         } else if (page == Page::InstallManager) {
             if (keys & HidNpadButton_B) {
+                confirmSavedDeletionId.clear();
                 settingsCursor = 6;
                 page = installManagerReturnPage;
             }
 
             if (!installRows.empty()) {
-                // ZL: existing network-only test (1x/4x).
-                // ZR: download a bounded 64 MiB sample to SD, measure
-                // download+write and read-back, then delete the sample.
-                if (keys & (HidNpadButton_ZL | HidNpadButton_ZR)) {
+                const auto& selectedJob = installRows[installManagerCursor].job;
+                const bool canDeleteSaved =
+                    !selectedJob.savedPath.empty() &&
+                    installRows[installManagerCursor].state != "Downloading" &&
+                    installRows[installManagerCursor].state != "Installing";
+                // ZR on a saved file is an explicit two-press deletion; never
+                // delete downloaded bytes as part of a successful install.
+                if ((keys & HidNpadButton_ZR) && canDeleteSaved) {
+                    if (pendingInstall.valid() || pendingNetworkBenchmark.valid()) {
+                        status = "Wait for active transfer before deleting saved game";
+                    } else if (confirmSavedDeletionId != selectedJob.id) {
+                        confirmSavedDeletionId = selectedJob.id;
+                        status = "Press ZR again to DELETE saved file from sdmc:/Games";
+                    } else {
+                        confirmSavedDeletionId.clear();
+                        auto& row = installRows[installManagerCursor];
+                        if (sgb::removeDownloadedGame(row.job)) {
+                            row.job.savedPath.clear();
+                            persistInstallQueue();
+                            status = "Saved download removed; installed game kept";
+                        } else {
+                            status = "Could not delete saved download from sdmc:/Games";
+                        }
+                    }
+                }
+                // ZL: existing network-only benchmark.
+                // ZR: bounded SD benchmark when the selected item isn't saved.
+                else if (keys & (HidNpadButton_ZL | HidNpadButton_ZR)) {
+                    confirmSavedDeletionId.clear();
                     const bool toSd = (keys & HidNpadButton_ZR) != 0;
                     if (pendingNetworkBenchmark.valid()) {
                         if (networkBenchmarkCancel)
@@ -3933,6 +3960,7 @@ int main(int, char**) {
                     installManagerCursor > 0
                 ) {
                     --installManagerCursor;
+                    confirmSavedDeletionId.clear();
                 }
 
                 if (
@@ -3941,6 +3969,7 @@ int main(int, char**) {
                         installRows.size()
                 ) {
                     ++installManagerCursor;
+                    confirmSavedDeletionId.clear();
                 }
 
                 if (keys & HidNpadButton_L) {
@@ -4822,7 +4851,7 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "ZL HTTP Test | ZR Download First Test | A Details | X Cancel/Remove | Y Retry | B Back",
+                "ZL HTTP Test | ZR SD Test / Delete Saved (twice) | X Cancel/Remove | Y Retry | B Back",
                 32,112,1200,muted
             );
 
@@ -4921,6 +4950,11 @@ int main(int, char**) {
                             formatTransferBytes(row.networkBytesPerSecond) + "/s";
                     }
 
+                    if (!row.job.savedPath.empty() &&
+                        row.state != "Downloading" &&
+                        row.state != "Installing") {
+                        stateText += " | Saved to sdmc:/Games";
+                    }
                     if (
                         row.state == "Failed" &&
                         !row.error.empty()
@@ -4945,6 +4979,11 @@ int main(int, char**) {
                 // global status field to display timings.
                 const auto& selected = installRows[
                     std::min(installManagerCursor, installRows.size() - 1)];
+                if (!selected.job.savedPath.empty()) {
+                    label(renderer, small,
+                          "Saved to " + selected.job.savedPath,
+                          32, 623, 1216, green);
+                }
                 if (selected.hasTimings) {
                     char timingText[256]{};
                     std::snprintf(timingText, sizeof(timingText),
