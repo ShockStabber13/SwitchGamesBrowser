@@ -104,6 +104,9 @@ inline std::vector<Game> parseIgdbCatalog(const std::string& bytes) {
         Game g;
         g.id = "igdb-" + igdbId;
         g.title = name;
+        // Keep Nintendo IDs when metadata provides them. Shop can then
+        // address the exact game page instead of guessing by title.
+        g.titleId = field(row, "titleId", 16);
 
         if (!ids.insert(g.id).second)
             continue;
@@ -270,10 +273,13 @@ inline void mergeReleases(
     for (auto& game : catalog) {
         auto found = torrents.find(game.id);
 
-        if (found != torrents.end())
+        if (found != torrents.end()) {
             game.releases = found->second->releases;
-        else
+            if (game.titleId.empty())
+                game.titleId = found->second->titleId;
+        } else {
             game.releases.clear();
+        }
     }
 }
 
