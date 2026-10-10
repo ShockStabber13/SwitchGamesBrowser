@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <deque>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -357,6 +358,218 @@ ShopSearchResult searchOpenNxShops(
     }
     { std::lock_guard<std::mutex> lock(progress.mutex);
       progress.message = result.message; }
+    progress.running.store(false);
+    return result;
+}
+
+
+namespace {
+
+// A deliberately small HTML scanner: the site's catalog and its public
+// download buttons are ordinary anchors, so no JSON/API catalog is needed.
+struct WebsiteAnchor {
+    std::string href;
+    std::string caption;
+};
+std::string htmlDecode(std::string value) {
+    for (const auto& mapping : {
+        std::pair<const char*, const char*>{"&amp;", "&"},
+        {"&quot;", "\""}, {"&#39;", "'"}, {"&apos;", "'"},
+        {"&lt;", "<"}, {"&gt;", ">"}, {"&nbsp;", " "}
+    }) {
+        std::size_t p = 0;
+        while ((p = value.find(mapping.first, p)) != std::string::npos) {
+            value.replace(p, std::strlen(mapping.first), mapping.second);
+            p += std::strlen(mapping.second);
+        }
+    }
+    return value;
+}
+std::string htmlText(const std::string& markup) {
+    std::string text;
+    bool tag = false;
+    for (char c : markup) {
+        if (c == '<') tag = true;
+        else if (c == '>') { tag = false; text.push_back(' '); }
+        else if (!tag) text.push_back(c);
+    }
+    return htmlDecode(std::move(text));
+}
+std::vector<WebsiteAnchor> websiteAnchors(const std::string& markup) {
+    std::vector<WebsiteAnchor> links;
+    std::size_t p = 0;
+    while ((p = markup.find("<a", p)) != std::string::npos) {
+        const auto tagEnd = markup.find('>', p + 2);
+        if (tagEnd == std::string::npos) break;
+        const auto end = markup.find("</a>", tagEnd + 1);
+        if (end == std::string::npos) break;
+        const auto tag = markup.substr(p, tagEnd - p);
+        const auto key = tag.find("href");
+        std::string href;
+        if (key != std::string::npos) {
+            auto eq = tag.find('=', key + 4);
+            if (eq != std::string::npos) {
+                ++eq;
+                while (eq < tag.size() && std::isspace(static_cast<unsigned char>(tag[eq])))
+                    ++eq;
+                if (eq < tag.size() && (tag[eq] == '\'' || tag[eq] == '"')) {
+                    const char quote = tag[eq++];
+                    const auto last = tag.find(quote, eq);
+                    if (last != std::string::npos)
+                        href = htmlDecode(tag.substr(eq, last - eq));
+                }
+            }
+        }
+        if (!href.empty()) {
+            WebsiteAnchor link;
+            link.href = std::move(href);
+            // Game cards occasionally put titles beside a linked image.
+            // This short context also covers nested <span> title markup.
+            const auto after = std::min(markup.size(), end + 5 + 260);
+            link.caption = htmlText(markup.substr(
+                tagEnd + 1, after - (tagEnd + 1)));
+            links.push_back(std::move(link));
+        }
+        p = end + 4;
+    }
+    return links;
+}
+bool validTitleId(const std::string& id) {
+    if (id.size() != 16) return false;
+    for (unsigned char c : id)
+        if (!std::isxdigit(c)) return false;
+    return true;
+}
+std::string anchorGameId(const std::string& href) {
+    auto p = href.find("/game/");
+    if (p == std::string::npos) return "";
+    p += 6;
+    const auto id = href.substr(p, 16);
+    return validTitleId(id) ? id : "";
+}
+
+} // namespace
+
+ShopSearchResult searchNotUltraNxWebsite(
+    const std::string& title,
+    const std::string& titleId,
+    ShopSearchProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancel)
+{
+    ShopSearchResult result;
+    progress.running.store(true);
+    progress.shopsDone.store(0);
+    progress.shopsTotal.store(1);
+    {
+        std::lock_guard<std::mutex> guard(progress.mutex);
+        progress.matches.clear();
+        progress.message = "Finding game on NotUltraNX website";
+    }
+    try {
+        if (!cancel || cancel->load())
+            throw std::runtime_error("Shop search cancelled");
+        std::string id = validTitleId(titleId) ? titleId : "";
+        if (id.empty()) {
+            // IGDB's catalog does not always carry a Nintendo title ID.
+            // Scan the website's paginated HTML directory without using
+            // NotUltraNX's catalog API. Four fetchers keep this bounded.
+            constexpr std::size_t maxPages = 64;
+            progress.shopsTotal.store(maxPages);
+            std::atomic<std::size_t> nextPage{1};
+            std::atomic<std::size_t> finished{0};
+            std::atomic<bool> found{false};
+            std::mutex foundMutex;
+            const std::string normalized = comparable(title);
+            auto scan = [&]() {
+                while (!found.load() && !cancel->load()) {
+                    const std::size_t page = nextPage.fetch_add(1);
+                    if (page > maxPages) break;
+                    try {
+                        const std::string listing = fetch(
+                            "https://not.ultranx.ru/en?p=" +
+                            std::to_string(page), cancel.get());
+                        for (const auto& link : websiteAnchors(listing)) {
+                            if (found.load() || cancel->load()) break;
+                            const std::string candidate = anchorGameId(link.href);
+                            if (candidate.empty()) continue;
+                            const auto caption = comparable(link.caption);
+                            if (normalized.size() >= 3 &&
+                                (caption.find(normalized) != std::string::npos ||
+                                 wildcardMatches(caption, wildcardPattern(title)))) {
+                                std::lock_guard<std::mutex> lock(foundMutex);
+                                if (!found.exchange(true)) id = candidate;
+                                break;
+                            }
+                        }
+                    } catch (...) {
+                        // A failed page should not hide the rest of the site.
+                    }
+                    const auto count = finished.fetch_add(1) + 1;
+                    progress.shopsDone.store(count);
+                    std::lock_guard<std::mutex> guard(progress.mutex);
+                    progress.message = "Checked " + std::to_string(count) +
+                        "/" + std::to_string(maxPages) + " website pages";
+                }
+            };
+            std::vector<std::thread> workers;
+            for (int i = 0; i < 4; ++i) workers.emplace_back(scan);
+            for (auto& worker : workers) worker.join();
+        }
+        if (cancel->load())
+            throw std::runtime_error("Shop search cancelled");
+        if (id.empty())
+            throw std::runtime_error(
+                "Game not found on NotUltraNX website (try a title with an ID)");
+
+        const auto html = fetch(
+            "https://not.ultranx.ru/en/game/" + id, cancel.get());
+        const auto links = websiteAnchors(html);
+        std::set<std::string> seen;
+        std::vector<ShopEntry> matches;
+        for (const auto& a : links) {
+            const auto url = urlResolve(
+                "https://not.ultranx.ru/en/game/" + id, a.href);
+            // Follow only links embedded on the selected game's real
+            // HTML page, to the official API redirect host. Do not use the
+            // DBI/CyberFoil catalog or local relay.
+            if (url.rfind("https://api.ultranx.ru/", 0) != 0 ||
+                url.find("/download/" + id + "/") == std::string::npos)
+                continue;
+            const auto path = stripQuery(url);
+            std::string name;
+            if (path.size() >= 5 && path.compare(path.size()-5, 5, "/base") == 0)
+                name = title + " [BASE].nsz";
+            else if (path.size() >= 7 &&
+                     path.compare(path.size()-7, 7, "/update") == 0)
+                name = title + " [UPDATE].nsz";
+            else if (path.size() >= 5 &&
+                     path.compare(path.size()-5, 5, "/dlcs") == 0)
+                name = title + " [DLCs].zip";
+            else
+                continue;
+            if (seen.insert(url).second)
+                matches.push_back({name, url, "NotUltraNX Website", 0});
+        }
+        if (matches.empty())
+            throw std::runtime_error(
+                "Website game found but no Base/Update/DLC download buttons");
+        {
+            std::lock_guard<std::mutex> guard(progress.mutex);
+            progress.matches = matches;
+        }
+        result.matches = std::move(matches);
+        result.success = true;
+        result.message = "NotUltraNX website: " +
+            std::to_string(result.matches.size()) +
+            " Base/Update/DLC download option(s)";
+    } catch (const std::exception& e) {
+        result.message = e.what();
+    }
+    progress.shopsDone.store(progress.shopsTotal.load());
+    {
+        std::lock_guard<std::mutex> guard(progress.mutex);
+        progress.message = result.message;
+    }
     progress.running.store(false);
     return result;
 }
