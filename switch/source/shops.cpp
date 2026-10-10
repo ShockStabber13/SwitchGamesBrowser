@@ -632,9 +632,10 @@ std::string downloadNotUltraNxCatalog(
         if (cancel->load()) throw std::runtime_error("Catalog download cancelled");
         if (firstPageFailed.load())
             throw std::runtime_error("Catalog homepage failed: " + firstPageError);
-        if (found.empty())
+        if (found.size() < 20)
             throw std::runtime_error(
-                "Website pages returned no game IDs; catalog not replaced");
+                "Only " + std::to_string(found.size()) +
+                " game IDs found in website pages; catalog not replaced");
 
         Json data = {
             {"schemaVersion", 1},
