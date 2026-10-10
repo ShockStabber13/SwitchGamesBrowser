@@ -2803,7 +2803,87 @@ int main(int, char**) {
             }
         }
 
+        // Download Manager runs independently of installation. A completed
+        // download is retained on SD until the user explicitly queues Install.
+        if (pendingDownload.valid() && activeDownloadProgress) {
+            std::string stage, detail;
+            int percent = 0;
+            std::uint64_t done = 0, total = 0, speed = 0, netSpeed = 0;
+            activeDownloadProgress->snapshot(stage, percent, detail);
+            activeDownloadProgress->snapshotTransfer(done, total, speed, netSpeed);
+            const bool valid = activeDownloadIndex &&
+                               *activeDownloadIndex < installRows.size();
+            if (valid) {
+                auto& row = installRows[*activeDownloadIndex];
+                row.state = stage;
+                row.progress = percent;
+                row.bytesDone = done;
+                row.bytesTotal = total;
+                row.bytesPerSecond = speed;
+                row.networkBytesPerSecond = netSpeed;
+            }
+            if (pendingDownload.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+                const auto result = pendingDownload.get();
+                if (valid) {
+                    auto& row = installRows[*activeDownloadIndex];
+                    if (!result.savedPath.empty())
+                        row.job.savedPath = result.savedPath;
+                    row.state = result.success ? "Downloaded"
+                              : result.cancelled ? "Download Cancelled"
+                                                 : "Download Failed";
+                    if (result.success) {
+                        row.progress = 100;
+                        row.bytesDone = row.bytesTotal;
+                    }
+                    row.error = result.success ? "" : result.message;
+                }
+                status = result.message;
+                activeDownloadIndex.reset();
+                activeDownloadProgress.reset();
+                downloadCancel.reset();
+                if (installCpuBoosted && !pendingInstall.valid() &&
+                    !pendingNetworkBenchmark.valid()) {
+                    appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+                    installCpuBoosted = false;
+                }
+                persistInstallQueue();
+            }
+        }
+
+        if (!pendingDownload.valid() &&
+            !pendingInstall.valid() && !pendingNetworkBenchmark.valid()) {
+            for (size_t i = 0; i < installRows.size(); ++i) {
+                if (installRows[i].state != "QueuedDownload")
+                    continue;
+                activeDownloadIndex = i;
+                activeDownloadProgress = std::make_shared<sgb::InstallProgress>();
+                downloadCancel = std::make_shared<std::atomic<bool>>(false);
+                const auto job = installRows[i].job;
+                const auto config = debridConfig;
+                const auto progress = activeDownloadProgress;
+                const auto cancel = downloadCancel;
+                auto& row = installRows[i];
+                row.state = "Downloading";
+                row.progress = 0;
+                row.bytesDone = row.bytesTotal = 0;
+                row.bytesPerSecond = row.networkBytesPerSecond = 0;
+                row.error.clear();
+                persistInstallQueue();
+                if (!installCpuBoosted && !cpuClockBoostTrial.held()) {
+                    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+                    installCpuBoosted = true;
+                }
+                pendingDownload = std::async(std::launch::async,
+                    [config, job, progress, cancel]() {
+                        return sgb::runDownloadJob(config, job, *progress, cancel);
+                    });
+                break;
+            }
+        }
+
         if (!pendingInstall.valid() &&
+            !pendingDownload.valid() &&
             !pendingNetworkBenchmark.valid()) {
             for (
                 size_t i = 0;
