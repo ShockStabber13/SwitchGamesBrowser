@@ -1477,6 +1477,9 @@ static std::vector<InstallQueueRow> loadInstallQueue(
                 row.sdWriteMs = row.httpWaitMs = row.bufferWaitMs = 0;
                 row.hasTimings = false;
             }
+            // Legacy Queued jobs came from the old automatic installer.
+            if (row.state == "Queued" && row.job.savedPath.empty())
+                row.state = "QueuedDownload";
 
             if (!row.job.file.name.empty())
                 out.push_back(std::move(row));
@@ -3952,11 +3955,13 @@ int main(int, char**) {
 
                     if (keys & HidNpadButton_Y) {
                         try {
+                            const size_t oldCount = installRows.size();
                             queueDebridManagerFiles(torrent);
-                            downloadManagerCursor = installRows.empty()
-                                ? 0 : installRows.size() - 1;
-                            downloadManagerReturnPage = Page::DebridManagerFiles;
-                            page = Page::DownloadManager;
+                            if (installRows.size() > oldCount) {
+                                downloadManagerCursor = installRows.size() - 1;
+                                downloadManagerReturnPage = Page::DebridManagerFiles;
+                                page = Page::DownloadManager;
+                            }
                         }
                         catch (const std::exception& e) {
                             status = e.what();
@@ -4025,7 +4030,22 @@ int main(int, char**) {
                         status = "Queued download";
                     }
                 }
-                if (keys & HidNpadButton_X) {
+                if (keys & HidNpadButton_Minus) {
+                    if (pendingDownload.valid() || pendingInstall.valid()) {
+                        status = "Wait for current transfer before removing an entry";
+                    } else if (!row.job.savedPath.empty()) {
+                        status = "Delete the saved file with X twice first";
+                    } else {
+                        installRows.erase(installRows.begin() +
+                            static_cast<std::ptrdiff_t>(downloadManagerCursor));
+                        downloadManagerCursor = installRows.empty()
+                            ? 0 : std::min(downloadManagerCursor,
+                                           installRows.size() - 1);
+                        persistInstallQueue();
+                        status = "Download entry removed";
+                    }
+                }
+                else if (keys & HidNpadButton_X) {
                     if (activeDownloadIndex &&
                         *activeDownloadIndex == downloadManagerCursor &&
                         pendingDownload.valid()) {
@@ -5023,7 +5043,7 @@ int main(int, char**) {
         } else if (page == Page::DownloadManager) {
             label(renderer, big, "DOWNLOAD MANAGER", 32,70,1200,green);
             label(renderer, small,
-                  "A Retry/Details  |  Y Install  |  X Cancel/Delete Saved (twice)  |  L/R Page  |  B Back",
+                  "A Retry  |  Y Install  |  X Cancel/Delete (twice)  |  - Remove Row  |  B Back",
                   32,112,1200,muted);
             if (installRows.empty()) {
                 label(renderer, big, "No downloads queued", 32,280,1200,muted);
