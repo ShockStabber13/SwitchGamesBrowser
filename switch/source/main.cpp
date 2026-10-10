@@ -5404,7 +5404,9 @@ int main(int, char**) {
                     if (pendingNotUltraNxCatalog.valid()) {
                         value = std::to_string(
                             notUltraNxCatalogProgress.shopsDone.load()) +
-                            " pages checked";
+                            "/" + std::to_string(
+                            notUltraNxCatalogProgress.shopsTotal.load()) +
+                            " checked";
                     } else {
                         std::ifstream downloaded(
                             root + "notultranx-catalog.json", std::ios::binary);
