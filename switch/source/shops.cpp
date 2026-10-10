@@ -461,6 +461,22 @@ std::string anchorGameId(const std::string& href) {
     const auto id = href.substr(p, 16);
     return validTitleId(id) ? id : "";
 }
+bool websiteTitleMatches(const std::string& title, const std::string& html) {
+    const auto beginTag = html.find("<h1");
+    const auto begin = beginTag == std::string::npos
+        ? std::string::npos : html.find('>', beginTag);
+    const auto end = begin == std::string::npos
+        ? std::string::npos : html.find("</h1>", begin);
+    if (end == std::string::npos) return false;
+    const auto actual = comparable(htmlText(
+        html.substr(begin + 1, end - begin - 1)));
+    const auto expected = comparable(title);
+    return !actual.empty() && !expected.empty() &&
+        (actual == expected ||
+         (expected.size() >= 8 &&
+          actual.find(expected) != std::string::npos &&
+          expected.size() * 5 >= actual.size() * 4));
+}
 
 } // namespace
 
@@ -507,18 +523,43 @@ ShopSearchResult searchNotUltraNxWebsite(
                             page == 1 ? searchUrl :
                             "https://not.ultranx.ru/en?p=" +
                                 std::to_string(page - 1), cancel.get());
+                        std::set<std::string> candidates;
+                        const auto pattern = wildcardPattern(title);
                         for (const auto& link : websiteAnchors(listing)) {
-                            if (found.load() || cancel->load()) break;
                             const std::string candidate = anchorGameId(link.href);
-                            if (candidate.empty()) continue;
                             const auto caption = comparable(link.caption);
-                            if (normalized.size() >= 3 &&
+                            if (!candidate.empty() && normalized.size() >= 3 &&
                                 (caption.find(normalized) != std::string::npos ||
-                                 wildcardMatches(caption, wildcardPattern(title)))) {
+                                 wildcardMatches(caption, pattern)))
+                                candidates.insert(candidate);
+                        }
+                        // Some card templates use a clickable container
+                        // instead of an <a>. Match the game path in those
+                        // HTML attributes too, then verify its h1 title.
+                        std::size_t pos = 0;
+                        while ((pos = listing.find("/game/", pos)) != std::string::npos) {
+                            const auto candidate = anchorGameId(listing.substr(pos, 22));
+                            const auto start = pos > 400 ? pos - 400 : 0;
+                            const auto end = std::min(listing.size(), pos + 600);
+                            const auto surrounding = comparable(htmlText(
+                                listing.substr(start, end - start)));
+                            if (!candidate.empty() && normalized.size() >= 3 &&
+                                (surrounding.find(normalized) != std::string::npos ||
+                                 wildcardMatches(surrounding, pattern)))
+                                candidates.insert(candidate);
+                            pos += 6;
+                        }
+                        for (const auto& candidate : candidates) {
+                            if (found.load() || cancel->load()) break;
+                            try {
+                                const auto gamePage = fetch(
+                                    "https://not.ultranx.ru/en/game/" + candidate,
+                                    cancel.get());
+                                if (!websiteTitleMatches(title, gamePage)) continue;
                                 std::lock_guard<std::mutex> lock(foundMutex);
                                 if (!found.exchange(true)) id = candidate;
                                 break;
-                            }
+                            } catch (...) {}
                         }
                     } catch (...) {
                         // A failed page should not hide the rest of the site.
@@ -542,25 +583,10 @@ ShopSearchResult searchNotUltraNxWebsite(
 
         const auto html = fetch(
             "https://not.ultranx.ru/en/game/" + id, cancel.get());
-        // Without an ID supplied by the catalog, refuse an ambiguous
-        // website hit rather than accidentally downloading another game.
-        if (!validTitleId(titleId)) {
-            const auto open = html.find("<h1");
-            const auto begin = open == std::string::npos
-                ? std::string::npos : html.find('>', open);
-            const auto end = begin == std::string::npos
-                ? std::string::npos : html.find("</h1>", begin);
-            const auto pageTitle = end == std::string::npos
-                ? "" : comparable(htmlText(html.substr(begin + 1, end - begin - 1)));
-            const auto expected = comparable(title);
-            if (pageTitle.empty() || expected.empty() ||
-                (pageTitle != expected &&
-                 (expected.size() < 8 ||
-                  pageTitle.find(expected) == std::string::npos ||
-                  expected.size() * 5 < pageTitle.size() * 4)))
-                throw std::runtime_error(
-                    "NotUltraNX result title does not match selected game");
-        }
+        // Never present a different game's packages after a name search.
+        if (!validTitleId(titleId) && !websiteTitleMatches(title, html))
+            throw std::runtime_error(
+                "NotUltraNX result title does not match selected game");
         const auto links = websiteAnchors(html);
         std::set<std::string> seen;
         std::vector<ShopEntry> matches;
