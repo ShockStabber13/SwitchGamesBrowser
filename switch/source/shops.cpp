@@ -414,21 +414,33 @@ std::vector<WebsiteAnchor> websiteAnchors(const std::string& markup) {
         const auto end = markup.find("</a>", tagEnd + 1);
         if (end == std::string::npos) break;
         const auto tag = markup.substr(p, tagEnd - p);
-        const auto key = tag.find("href");
         std::string href;
-        if (key != std::string::npos) {
-            auto eq = tag.find('=', key + 4);
-            if (eq != std::string::npos) {
+        // Match an actual href= attribute, not the CSS class
+        // "invisible-href". Only accept a token beginning after whitespace.
+        std::size_t search = 0;
+        while ((search = tag.find("href", search)) != std::string::npos) {
+            const auto key = search;
+            search += 4;
+            if (key == 0 ||
+                !std::isspace(static_cast<unsigned char>(tag[key - 1])))
+                continue;
+            auto eq = search;
+            while (eq < tag.size() &&
+                   std::isspace(static_cast<unsigned char>(tag[eq])))
                 ++eq;
-                while (eq < tag.size() && std::isspace(static_cast<unsigned char>(tag[eq])))
-                    ++eq;
-                if (eq < tag.size() && (tag[eq] == '\'' || tag[eq] == '"')) {
-                    const char quote = tag[eq++];
-                    const auto last = tag.find(quote, eq);
-                    if (last != std::string::npos)
-                        href = htmlDecode(tag.substr(eq, last - eq));
-                }
+            if (eq == tag.size() || tag[eq] != '=') continue;
+            ++eq;
+            while (eq < tag.size() &&
+                   std::isspace(static_cast<unsigned char>(tag[eq])))
+                ++eq;
+            if (eq < tag.size() &&
+                (tag[eq] == '\'' || tag[eq] == '"')) {
+                const char quote = tag[eq++];
+                const auto last = tag.find(quote, eq);
+                if (last != std::string::npos)
+                    href = htmlDecode(tag.substr(eq, last - eq));
             }
+            break;
         }
         if (!href.empty()) {
             WebsiteAnchor link;
