@@ -3965,6 +3965,96 @@ int main(int, char**) {
                 }
             }
 
+        } else if (page == Page::DownloadManager) {
+            if (keys & HidNpadButton_B) {
+                confirmDownloadDeleteId.clear();
+                settingsCursor = 6;
+                page = downloadManagerReturnPage;
+            }
+            if (!installRows.empty()) {
+                const size_t last = installRows.size() - 1;
+                if ((keys & HidNpadButton_Up) && downloadManagerCursor > 0) {
+                    --downloadManagerCursor;
+                    confirmDownloadDeleteId.clear();
+                }
+                if ((keys & HidNpadButton_Down) && downloadManagerCursor < last) {
+                    ++downloadManagerCursor;
+                    confirmDownloadDeleteId.clear();
+                }
+                if (keys & HidNpadButton_L) {
+                    downloadManagerCursor = downloadManagerCursor >= 8
+                        ? downloadManagerCursor - 8 : 0;
+                    confirmDownloadDeleteId.clear();
+                }
+                if (keys & HidNpadButton_R) {
+                    downloadManagerCursor = std::min(last, downloadManagerCursor + 8);
+                    confirmDownloadDeleteId.clear();
+                }
+                auto& row = installRows[downloadManagerCursor];
+                if (keys & HidNpadButton_Y) {
+                    if (row.job.savedPath.empty()) {
+                        status = "Download the game first (A to retry)";
+                    } else if (pendingDownload.valid()) {
+                        status = "Wait until current download finishes";
+                    } else if (row.state == "Installing" || row.state == "Queued") {
+                        status = "Already queued for installation";
+                    } else {
+                        row.state = "Queued";
+                        row.progress = 0;
+                        row.error.clear();
+                        persistInstallQueue();
+                        installManagerCursor = downloadManagerCursor;
+                        installManagerReturnPage = Page::DownloadManager;
+                        page = Page::InstallManager;
+                        status = "Queued offline install from sdmc:/Games";
+                    }
+                }
+                if (keys & HidNpadButton_A) {
+                    if (row.state == "Downloading" ||
+                        row.state == "QueuedDownload" ||
+                        row.state == "Installing") {
+                        status = row.state + ": " + row.job.file.name;
+                    } else if (!row.job.savedPath.empty()) {
+                        status = "Saved to " + row.job.savedPath +
+                                 " (Y to install, X twice to delete)";
+                    } else {
+                        row.state = "QueuedDownload";
+                        row.progress = 0;
+                        row.error.clear();
+                        persistInstallQueue();
+                        status = "Queued download";
+                    }
+                }
+                if (keys & HidNpadButton_X) {
+                    if (activeDownloadIndex &&
+                        *activeDownloadIndex == downloadManagerCursor &&
+                        pendingDownload.valid()) {
+                        if (downloadCancel) downloadCancel->store(true);
+                        status = "Cancelling download...";
+                    } else if (pendingDownload.valid() || pendingInstall.valid()) {
+                        status = "Wait until active transfer finishes before deleting";
+                    } else if (!row.job.savedPath.empty()) {
+                        if (confirmDownloadDeleteId != row.job.id) {
+                            confirmDownloadDeleteId = row.job.id;
+                            status = "Press X again to DELETE saved game file";
+                        } else {
+                            confirmDownloadDeleteId.clear();
+                            if (sgb::removeDownloadedGame(row.job)) {
+                                row.job.savedPath.clear();
+                                if (row.state == "Downloaded")
+                                    row.state = "Saved Removed";
+                                persistInstallQueue();
+                                status = "Saved file deleted; installed game unchanged";
+                            } else {
+                                status = "Could not delete saved game";
+                            }
+                        }
+                    } else {
+                        status = "No saved file to remove";
+                    }
+                }
+            }
+
         } else if (page == Page::InstallManager) {
             if (keys & HidNpadButton_B) {
                 confirmSavedDeletionId.clear();
