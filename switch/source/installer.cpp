@@ -1327,6 +1327,7 @@ private:
     std::mutex mutex_;
     std::condition_variable changed_;
     std::deque<Block> queue_;
+    std::vector<std::vector<u8>> recycled_;
     std::thread worker_;
     std::exception_ptr error_;
     std::atomic<bool> stopped_{false};
@@ -1376,11 +1377,18 @@ private:
         block.offset = pendingOffset_;
         block.data = std::move(pending_);
         queue_.emplace_back(std::move(block));
+        // Recycle the native writer's former 4 MiB buffer, as upstream
+        // Sphaira does with its ring-buffer swaps.
+        if (!recycled_.empty()) {
+            pending_ = std::move(recycled_.back());
+            recycled_.pop_back();
+        }
         lock.unlock();
         changed_.notify_all();
 
-        pending_ = std::vector<u8>{};
-        pending_.reserve(blockSize);
+        pending_.clear();
+        if (pending_.capacity() < blockSize)
+            pending_.reserve(blockSize);
     }
 
     void run() {
@@ -1420,6 +1428,12 @@ private:
                 // Exactly as in Sphaira's NCA write thread: a progress
                 // event is earned only after a successful native write.
                 progress_.addStorageWritten(block.data.size());
+                block.data.clear();
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    recycled_.push_back(std::move(block.data));
+                }
+                changed_.notify_all();
             }
         } catch (...) {
             {
@@ -3033,6 +3047,7 @@ void installEntry(
     std::mutex queueMutex;
     std::condition_variable queueChanged;
     std::deque<std::vector<u8>> queue;
+    std::vector<std::vector<u8>> recycledReadBuffers;
     std::exception_ptr downloadError;
     bool downloadDone = false;
     std::atomic<bool> stopDownload{false};
@@ -3064,11 +3079,16 @@ void installEntry(
                 }
 
                 queue.emplace_back(std::move(buffer));
+                if (!recycledReadBuffers.empty()) {
+                    buffer = std::move(recycledReadBuffers.back());
+                    recycledReadBuffers.pop_back();
+                }
                 lock.unlock();
                 queueChanged.notify_all();
 
-                buffer = std::vector<u8>{};
-                buffer.reserve(streamBufferSize);
+                buffer.clear();
+                if (buffer.capacity() < streamBufferSize)
+                    buffer.reserve(streamBufferSize);
             };
 
             package.source->streamExact(
@@ -3140,6 +3160,14 @@ void installEntry(
             // resulting bytes for an independent content-storage writer.
             output.write(chunk.data(), chunk.size());
             progress.addTransferBytes(static_cast<std::uint64_t>(chunk.size()));
+            // Return an intact allocation to the reader after the decoder
+            // has finished with its bytes; avoid malloc/free on every block.
+            chunk.clear();
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                recycledReadBuffers.push_back(std::move(chunk));
+            }
+            queueChanged.notify_all();
         }
 
         downloader.join();
