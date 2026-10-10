@@ -1829,7 +1829,10 @@ int main(int, char**) {
     }
     std::set<size_t> selectedFiles;
     std::future<Refresh> pending;
-    std::future<std::string> pendingLangegen; 
+    std::future<std::string> pendingLangegen;
+    std::future<std::string> pendingNotUltraNxCatalog;
+    sgb::ShopSearchProgress notUltraNxCatalogProgress;
+    auto notUltraNxCatalogCancel = std::make_shared<std::atomic<bool>>(false);
     std::future<DebridCheckResult> pendingDebridCheck;
     std::future<DebridAddResult> pendingDebridAdd;
     std::future<sgb::LiveSearchResult> pendingLiveSearch;
@@ -2020,13 +2023,14 @@ int main(int, char**) {
         const auto cancel = shopSearchCancel;
         const std::string title = games[gameIndex].title;
         const std::string titleId = games[gameIndex].titleId;
+        const std::string shopCatalogPath = root + "notultranx-catalog.json";
         page = Page::ShopResults;
         status = "Searching NotUltraNX website...";
         pendingShopSearch = std::async(
             std::launch::async,
-            [title, titleId, cancel, &shopSearchProgress]() {
+            [title, titleId, shopCatalogPath, cancel, &shopSearchProgress]() {
                 return sgb::searchNotUltraNxWebsite(
-                    title, titleId, shopSearchProgress, cancel);
+                    title, titleId, shopCatalogPath, shopSearchProgress, cancel);
             });
     };
 
@@ -2425,6 +2429,11 @@ int main(int, char**) {
             ) == std::future_status::ready
         ) {
             status = pendingLangegen.get();
+        }
+        if (pendingNotUltraNxCatalog.valid() &&
+            pendingNotUltraNxCatalog.wait_for(
+                std::chrono::milliseconds(0)) == std::future_status::ready) {
+            status = pendingNotUltraNxCatalog.get();
         }
         if (pendingDebridCheck.valid() && pendingDebridCheck.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto result = pendingDebridCheck.get();
@@ -3421,7 +3430,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 8)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 9)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -3643,6 +3652,22 @@ int main(int, char**) {
                     cpuClockDiagnosticLines = sgb::probeCpuClockReadOnly();
                     status = "Read-only CPU clock probe completed";
                     page = Page::CpuClockDiagnostics;
+                }
+                else if (settingsCursor == 9) {
+                    if (pendingNotUltraNxCatalog.valid()) {
+                        status = "NotUltraNX catalog download already running";
+                    } else {
+                        notUltraNxCatalogCancel->store(false);
+                        status = "Downloading NotUltraNX website catalog...";
+                        const auto catalogPath = root + "notultranx-catalog.json";
+                        const auto cancel = notUltraNxCatalogCancel;
+                        pendingNotUltraNxCatalog = std::async(
+                            std::launch::async,
+                            [catalogPath, cancel, &notUltraNxCatalogProgress]() {
+                                return sgb::downloadNotUltraNxCatalog(
+                                    catalogPath, notUltraNxCatalogProgress, cancel);
+                            });
+                    }
                 }
             }
 
@@ -5300,7 +5325,8 @@ int main(int, char**) {
                 "Added to Debrid",
                 "Download Manager",
                 "Install Manager",
-                "CPU Clock Settings"
+                "CPU Clock Settings",
+                "Download / Update NotUltraNX Catalog"
             };
 
             for (
@@ -5311,7 +5337,7 @@ int main(int, char**) {
                 const int y =
                     145 +
                     static_cast<int>(i) *
-                        58;
+                        54;
 
                 SDL_Rect box{
                     32,y,1216,50
@@ -5373,6 +5399,17 @@ int main(int, char**) {
                         catalogFile.good()
                             ? "Installed"
                             : "Not downloaded";
+                }
+                else if (i == 9) {
+                    if (pendingNotUltraNxCatalog.valid()) {
+                        value = std::to_string(
+                            notUltraNxCatalogProgress.shopsDone.load()) +
+                            " pages checked";
+                    } else {
+                        std::ifstream downloaded(
+                            root + "notultranx-catalog.json", std::ios::binary);
+                        value = downloaded.good() ? "Installed" : "Not downloaded";
+                    }
                 }
                 else if (i == 8) {
                     value = cpuClockBoostTrial.held()
@@ -6115,6 +6152,10 @@ int main(int, char**) {
 
     if (pending.valid()) pending.wait();
     if (pendingLangegen.valid()) pendingLangegen.wait();
+    if (pendingNotUltraNxCatalog.valid()) {
+        notUltraNxCatalogCancel->store(true);
+        pendingNotUltraNxCatalog.wait();
+    }
     if (pendingLiveSearch.valid()) pendingLiveSearch.wait();
     if (shopSearchCancel) shopSearchCancel->store(true);
     if (pendingShopSearch.valid()) pendingShopSearch.wait(); 
