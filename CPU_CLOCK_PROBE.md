@@ -68,3 +68,30 @@ The existing automatic FastLoad installation/benchmark boost is
 skipped while a saved clock is held, to avoid conflicting requests.
 RAM, GPU and voltage control are intentionally excluded. The highest
 offered user preset is 1581 MHz.
+
+## AllDebrid Sphaira-style single-connection buffering experiment
+
+On branch `experiment/alldebrid-sphaira-buffering` the AllDebrid
+installation pipeline collects **512 KiB** queue blocks (rather than
+4 MiB), and buffers up to eight queue blocks. The curl transfer remains
+a **single continuous HTTP/1.1 ranged request per NCA/NCZ** and
+continues overlapping download, content decoding and SD writing.
+
+Sphaira's HTTP VFS uses a producer/consumer queue, so smaller blocks
+allow the installer to start consuming data earlier and reduce stalls
+between download and content processing. This is a hypothesis to
+benchmark, **not a guarantee of Sphaira's throughput**. TorBox and shop
+installation queues remain unchanged.
+
+To distinguish CDN throughput from SD or installation bottlenecks,
+open **Install Manager**, highlight an **AllDebrid** item with at
+least 64 MiB and press **ZL**. This runs a *network-only*
+single-connection speed test on the same authorized AllDebrid download
+URL without installing or writing to SD. Wait for a result resembling
+`AllDebrid HTTP-only 1x: X.XX MiB/s`. Compare with the normal
+installation network rate and Sphaira's displayed speed on the same
+connection and content. This test does not start four connections
+on AllDebrid.
+
+AllDebrid URLs, debrid credentials, and torrent identifiers are not
+displayed by the benchmark.
