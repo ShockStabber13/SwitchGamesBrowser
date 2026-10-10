@@ -3225,10 +3225,10 @@ int main(int, char**) {
                     appendInstallJob(games[shopGameIndex].title, item.name,
                                      "", "NotUltraNX Relay", "", file);
                     persistInstallQueue();
-                    installManagerCursor = installRows.size() - 1;
-                    installManagerReturnPage = Page::ShopResults;
-                    page = Page::InstallManager;
-                    status = "Queued shop package in Install Manager";
+                    downloadManagerCursor = installRows.size() - 1;
+                    downloadManagerReturnPage = Page::ShopResults;
+                    page = Page::DownloadManager;
+                    status = "Queued shop package in Download Manager";
                 }
             }
 
@@ -3407,7 +3407,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 7)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 8)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -3609,25 +3609,23 @@ int main(int, char**) {
                     startDebridManagerRefresh();
                 }
                 else if (settingsCursor == 6) {
-                    if (
-                        installManagerCursor >=
-                            installRows.size()
-                    ) {
-                        installManagerCursor =
-                            installRows.empty()
-                                ? 0
-                                : installRows.size() - 1;
-                    }
-
-                    installManagerReturnPage = Page::Settings;
-                    page = Page::InstallManager;
-
-                    status =
-                        installRows.empty()
-                            ? "Install queue is empty"
-                            : "Install Manager";
+                    downloadManagerReturnPage = Page::Settings;
+                    downloadManagerCursor = std::min(
+                        downloadManagerCursor,
+                        installRows.empty() ? size_t(0) : installRows.size() - 1);
+                    page = Page::DownloadManager;
+                    status = "Download Manager";
                 }
                 else if (settingsCursor == 7) {
+                    installManagerCursor = std::min(
+                        installManagerCursor,
+                        installRows.empty() ? size_t(0) : installRows.size() - 1);
+                    installManagerReturnPage = Page::Settings;
+                    page = Page::InstallManager;
+                    status = installRows.empty()
+                        ? "Install queue is empty" : "Install Manager";
+                }
+                else if (settingsCursor == 8) {
                     cpuClockDiagnosticLines = sgb::probeCpuClockReadOnly();
                     status = "Read-only CPU clock probe completed";
                     page = Page::CpuClockDiagnostics;
@@ -3641,7 +3639,7 @@ int main(int, char**) {
                     !cpuClockBoostTrial.held()) {
                     cpuClockBoostLines = cpuClockBoostTrial.stop("B / back");
                 }
-                settingsCursor = 7;
+                settingsCursor = 8;
                 page = Page::Settings;
             }
             if ((keys & HidNpadButton_Left) ||
@@ -3954,8 +3952,11 @@ int main(int, char**) {
 
                     if (keys & HidNpadButton_Y) {
                         try {
-                            queueDebridManagerFiles(
-                                torrent);
+                            queueDebridManagerFiles(torrent);
+                            downloadManagerCursor = installRows.empty()
+                                ? 0 : installRows.size() - 1;
+                            downloadManagerReturnPage = Page::DebridManagerFiles;
+                            page = Page::DownloadManager;
                         }
                         catch (const std::exception& e) {
                             status = e.what();
@@ -3967,7 +3968,7 @@ int main(int, char**) {
         } else if (page == Page::InstallManager) {
             if (keys & HidNpadButton_B) {
                 confirmSavedDeletionId.clear();
-                settingsCursor = 6;
+                settingsCursor = 7;
                 page = installManagerReturnPage;
             }
 
@@ -4733,7 +4734,7 @@ int main(int, char**) {
         } else if (page == Page::DebridManager) {
             label(
                 renderer,big,
-                "DEBRID MANAGER",
+                "ADDED TO DEBRID",
                 32,70,1200,green
             );
 
@@ -4813,8 +4814,8 @@ int main(int, char**) {
 
                     const std::string downloadText =
                         torrent.complete
-                            ? "Download completed"
-                            : "Downloading: " +
+                            ? "Added to Debrid"
+                            : "Fetching to Debrid: " +
                                 std::to_string(
                                     torrent.progress) +
                                 "%";
@@ -4855,7 +4856,7 @@ int main(int, char**) {
                     renderer,small,
                     std::to_string(
                         debridManagerSelectedFiles.size()) +
-                    " selected  |  A Toggle  |  X Select All  |  Y Queue Install  |  B Back",
+                    " selected  |  A Toggle  |  X Select All  |  Y Download  |  B Back",
                     32,142,1216,muted
                 );
 
@@ -5105,7 +5106,8 @@ int main(int, char**) {
                 "Refresh Catalog Index",
                 "Scrape Providers",
                 "Download / Update Langegen Catalog",
-                "Debrid Manager",
+                "Added to Debrid",
+                "Download Manager",
                 "Install Manager",
                 "CPU Clock Settings"
             };
@@ -5181,7 +5183,7 @@ int main(int, char**) {
                             ? "Installed"
                             : "Not downloaded";
                 }
-                else if (i == 7) {
+                else if (i == 8) {
                     value = cpuClockBoostTrial.held()
                         ? std::to_string(
                             cpuClockBoostTrial.targetHz() / 1000000u) +
@@ -5189,6 +5191,13 @@ int main(int, char**) {
                         : "Off / manual";
                 }
                 else if (i == 6) {
+                    size_t pending = 0;
+                    for (const auto& row : installRows)
+                        if (row.state == "QueuedDownload" ||
+                            row.state == "Downloading") ++pending;
+                    value = std::to_string(pending) + " downloading/queued";
+                }
+                else if (i == 7) {
                     size_t active = 0;
 
                     for (
@@ -5197,7 +5206,6 @@ int main(int, char**) {
                     ) {
                         if (
                             row.state == "Queued" ||
-                            row.state == "Downloading" ||
                             row.state == "Installing"
                         ) {
                             ++active;
@@ -5933,6 +5941,10 @@ int main(int, char**) {
 
     if (pendingInstall.valid())
         pendingInstall.wait();
+    if (downloadCancel && pendingDownload.valid())
+        downloadCancel->store(true);
+    if (pendingDownload.valid())
+        pendingDownload.wait();
 
     if (networkBenchmarkCancel)
         networkBenchmarkCancel->store(true);
