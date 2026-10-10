@@ -21,6 +21,7 @@ struct InstallJob {
     std::string source;
     std::string remoteId;
     DebridFile file;
+    std::string savedPath; // Full NSP/NSZ/XCI/XCZ downloaded to sdmc:/Games.
 };
 
 struct InstallProgress {
@@ -95,6 +96,7 @@ struct InstallResult {
     bool success = false;
     bool cancelled = false;
     std::string message;
+    std::string savedPath; // Preserved after install failure/cancellation.
 };
 
 // Downloads sample TorBox ranges into RAM/discards them. Never opens
@@ -118,6 +120,10 @@ NetworkBenchmarkResult runDownloadFirstBenchmark(
     const std::string& tempDirectory,
     const std::shared_ptr<std::atomic<bool>>& cancelRequested
 );
+
+// Delete only this queue item's exact locally staged game file.
+// Returns false for invalid paths or deletion errors.
+bool removeDownloadedGame(const InstallJob& job);
 
 InstallResult runInstallJob(
     const DebridConfig& config,
