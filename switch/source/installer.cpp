@@ -2910,7 +2910,8 @@ void installEntry(
     InstallProgress& progress,
     const std::shared_ptr<std::atomic<bool>>& cancel,
     int basePercent,
-    int spanPercent)
+    int spanPercent,
+    bool sphairaStyleBuffering)
 {
     constexpr u64 largeEntryThreshold = 32ULL * 1024 * 1024;
     const bool largeEntry = entry.size >= largeEntryThreshold;
@@ -2930,8 +2931,13 @@ void installEntry(
     // Stage 2: ordered NCA/NCZ decoding on the installer thread.
     // Stage 3 (large entries): async content-storage writing, as before.
     // Small entries retain the existing synchronous storage path.
-    constexpr std::size_t streamBufferSize = 4 * 1024 * 1024;
-    constexpr std::size_t maxQueuedBlocks = 4;
+    // Sphaira's HTTP producer/consumer queue uses 512 KiB. The 4 MiB
+    // aggregate queue capacity keeps the HTTPS producer flowing while the
+    // NCA parser and SD writer process smaller pieces with lower latency.
+    // Restrict this experiment to AllDebrid; other providers stay unchanged.
+    const std::size_t streamBufferSize = sphairaStyleBuffering
+        ? 512 * 1024 : 4 * 1024 * 1024;
+    const std::size_t maxQueuedBlocks = sphairaStyleBuffering ? 8 : 4;
 
     if (largeEntry)
         progress.parallelEntryCount.fetch_add(1, std::memory_order_relaxed);
@@ -3087,7 +3093,8 @@ void installPackageCloud(
     const std::string& name,
     u64 knownSize,
     InstallProgress& progress,
-    const std::shared_ptr<std::atomic<bool>>& cancel)
+    const std::shared_ptr<std::atomic<bool>>& cancel,
+    bool sphairaStyleBuffering)
 {
     InstallServices services;
 
@@ -3205,7 +3212,8 @@ void installPackageCloud(
             progress,
             cancel,
             0,
-            10);
+            10,
+            sphairaStyleBuffering);
 
         auto cnmtBytes =
             readInstalledCnmt(
@@ -3303,7 +3311,8 @@ void installPackageCloud(
             progress,
             cancel,
             base,
-            std::max(span, 1));
+            std::max(span, 1),
+            sphairaStyleBuffering);
     }
 
     const auto tickets =
@@ -3758,7 +3767,9 @@ InstallResult runInstallJob(
             job.file.name,
             job.file.size,
             progress,
-            cancelRequested);
+            cancelRequested,
+            !localShop && !onlineShop &&
+                config.service == DebridService::AllDebrid);
 
         gInstallCancel = nullptr;
 
