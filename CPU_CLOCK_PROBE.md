@@ -42,3 +42,29 @@ Settings > CPU Clock Diagnostic. Press **X** to request 1224 MHz.
 - This test touches neither RAM, GPU nor voltages.
 - An app crash or hard power failure can prevent timed restoration, so this is
   an experiment, not a fail-safe overclock manager.
+
+## Saved CPU clock mode (experiment)
+
+In **Settings > CPU Clock Settings**, use **Left/Right** to select
+**Off / 1224 / 1326 / 1428 / 1581 MHz** and press **X** to apply/save it.
+Press **A** for the read-only diagnostic, **Y** for the original 10-second
+1224 MHz experiment (requires saved mode to be Off), **B** to return.
+
+The selection is saved at
+`sdmc:/switch/SwitchGamesBrowser/cpu-clock.json`, and is reapplied
+when SwitchGamesBrowser starts again. It is only saved if the CPU
+accepts and confirms the requested frequency. The available discrete
+frequency list is checked before applying a preset. If a clock is
+unavailable or a request fails, the existing saved preference is retained.
+
+The request remains active while SwitchGamesBrowser is running
+(including when leaving Settings), **without a 10-second timeout**.
+The app restores the original CPU clock on normal exit. There is **no
+background sysmodule**, so the CPU cannot be forced to retain this
+setting after the app exits, and crash/power-off restoration cannot
+be guaranteed.
+
+The existing automatic FastLoad installation/benchmark boost is
+skipped while a saved clock is held, to avoid conflicting requests.
+RAM, GPU and voltage control are intentionally excluded. The highest
+offered user preset is 1581 MHz.
