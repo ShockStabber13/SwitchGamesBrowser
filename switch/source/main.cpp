@@ -2832,6 +2832,10 @@ int main(int, char**) {
                 const auto result = pendingDownload.get();
                 if (valid) {
                     auto& row = installRows[*activeDownloadIndex];
+                    if (result.success && result.resolvedSize)
+                        row.job.file.size = result.resolvedSize;
+                    if (result.success && !result.resolvedName.empty())
+                        row.job.file.name = result.resolvedName;
                     if (!result.savedPath.empty())
                         row.job.savedPath = result.savedPath;
                     row.state = result.success ? "Downloaded"
