@@ -40,6 +40,14 @@ struct ShopSearchResult {
 ShopSearchResult searchNotUltraNxWebsite(
     const std::string& title,
     const std::string& titleId,
+    const std::string& catalogPath,
+    ShopSearchProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancel);
+
+// Download a local, offline-searchable website catalog into the app folder.
+// No download URLs or credentials are saved, only game names and title IDs.
+std::string downloadNotUltraNxCatalog(
+    const std::string& catalogPath,
     ShopSearchProgress& progress,
     const std::shared_ptr<std::atomic<bool>>& cancel);
 
