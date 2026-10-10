@@ -10,6 +10,7 @@
 #include "installer.hpp"
 
 #include <switch.h>
+#include <switch/runtime/devices/fs_dev.h>
 #include <curl/curl.h>
 #include <zstd.h>
 #include <netinet/in.h>
@@ -3996,39 +3997,60 @@ static std::string downloadFullGame(
     if (errno != ENOENT)
         throw std::runtime_error("Cannot check download destination");
 
+    // Sphaira uses libnx's native FS service for SD file transfers. This
+    // bypasses the newlib POSIX write layer and permits large direct writes.
+    FsFileSystem* sd = fsdevGetDeviceFileSystem("sdmc");
+    if (!sd)
+        throw std::runtime_error("SD card filesystem is not mounted");
+
     struct TempOutput {
         std::string path;
-        int fd{-1};
+        FsFile fd{};
+        bool opened{false};
         ~TempOutput() {
-            if (fd >= 0) ::close(fd);
+            if (opened) fsFileClose(&fd);
             if (!path.empty()) ::remove(path.c_str());
         }
     } output;
 
     output.path = finalPath + ".part";
-    // Stale .part files are never complete and must not be used as installs.
+    const std::string nativePartPath = output.path.substr(
+        std::strlen("sdmc:"));
+    // A leftover .part can never be passed to the installer.
     ::remove(output.path.c_str());
-    output.fd = ::open(output.path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
-    if (output.fd < 0)
-        throw std::runtime_error(std::string("Cannot create SD download: ") +
-                                 std::strerror(errno));
+    // Preallocate, just as Sphaira CopyFile does, avoiding repeated
+    // FAT allocation/metadata updates during the download itself.
+    Result fsResult = fsFsCreateFile(
+        sd, nativePartPath.c_str(), job.file.size, 0);
+    if (R_FAILED(fsResult))
+        throw std::runtime_error(
+            "Cannot allocate game file on microSD (FS " +
+            std::to_string(static_cast<unsigned>(fsResult)) + ")");
+    fsResult = fsFsOpenFile(
+        sd, nativePartPath.c_str(), FsOpenMode_Write, &output.fd);
+    if (R_FAILED(fsResult))
+        throw std::runtime_error(
+            "Cannot open microSD game file (FS " +
+            std::to_string(static_cast<unsigned>(fsResult)) + ")");
+    output.opened = true;
 
     progress.beginTransfer(job.file.size);
     progress.set("Downloading", 0, job.file.name);
 
-    // libcurl may call the receive callback with only ~16 KiB per call.
-    // Aggregate those callbacks into 1 MiB chunks before issuing SD writes.
-    // Sending each tiny HTTP callback straight to FAT can throttle the
-    // network producer to microSD metadata/write-call latency.
-    constexpr std::size_t blockSize = 1024 * 1024;
-    constexpr std::size_t maxBuffered = 8 * 1024 * 1024;
+    // Match Sphaira's 4 MiB multi-threaded file-copy buffers, with space
+    // for two pending chunks. The HTTP producer accumulates incoming curl
+    // callbacks and the SD writer runs on a separate worker thread.
+    constexpr std::size_t blockSize = 4 * 1024 * 1024;
+    constexpr std::size_t maxBuffered = 2 * blockSize;
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::vector<u8>> pending;
+    std::vector<std::vector<u8>> recycled;
     std::size_t pendingBytes = 0;
     bool networkDone = false;
     std::exception_ptr writeError;
     std::exception_ptr networkError;
+    std::atomic<bool> networkSucceeded{false};
 
     std::thread writer([&]() {
         try {
@@ -4051,23 +4073,35 @@ static std::string downloadFullGame(
                     pendingBytes -= chunk.size();
                     cv.notify_all();
                 }
-                std::size_t offset = 0;
-                while (offset < chunk.size()) {
-                    if (cancel && cancel->load())
-                        throw std::runtime_error("Download cancelled");
-                    const ssize_t n = ::write(output.fd, chunk.data() + offset,
-                                              chunk.size() - offset);
-                    if (n <= 0)
-                        throw std::runtime_error(std::string("microSD write failed: ") +
-                                                 std::strerror(errno));
-                    offset += static_cast<std::size_t>(n);
-                }
+                if (cancel && cancel->load())
+                    throw std::runtime_error("Download cancelled");
+                const Result rc = fsFileWrite(
+                    &output.fd, progress.bytesDone.load(),
+                    chunk.data(), chunk.size(), FsWriteOption_None);
+                if (R_FAILED(rc))
+                    throw std::runtime_error(
+                        "microSD native write failed (FS " +
+                        std::to_string(static_cast<unsigned>(rc)) + ")");
                 progress.addTransferBytes(chunk.size());
+                // This is the number of bytes safely handed to the SD writer;
+                // do not use HTTP-only counters as evidence of saved data.
                 progress.addNetworkBytes(chunk.size());
+                // Return the 4 MiB allocation to the producer, similar to
+                // Sphaira's buffer-swap ring instead of reallocating chunks.
+                chunk.clear();
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    recycled.emplace_back(std::move(chunk));
+                    cv.notify_all();
+                }
             }
-            if (!networkError && ::fsync(output.fd) != 0)
-                throw std::runtime_error(std::string("microSD sync failed: ") +
-                                         std::strerror(errno));
+            if (networkSucceeded.load()) {
+                const Result rc = fsFileFlush(&output.fd);
+                if (R_FAILED(rc))
+                    throw std::runtime_error(
+                        "microSD flush failed (FS " +
+                        std::to_string(static_cast<unsigned>(rc)) + ")");
+            }
         } catch (...) {
             std::lock_guard<std::mutex> lock(mutex);
             writeError = std::current_exception();
@@ -4095,10 +4129,16 @@ static std::string downloadFullGame(
                     throw std::runtime_error("Download cancelled");
                 pendingBytes += n;
                 pending.emplace_back(std::move(staging));
+                // Reuse a previously written buffer whenever available.
+                if (!recycled.empty()) {
+                    staging = std::move(recycled.back());
+                    recycled.pop_back();
+                }
                 cv.notify_all();
             }
-            staging = std::vector<u8>{};
-            staging.reserve(blockSize);
+            staging.clear();
+            if (staging.capacity() < blockSize)
+                staging.reserve(blockSize);
         };
         HttpPackageSource source(url, cancel, job.file.size, sphairaStyleBuffering);
         source.streamExact(0, job.file.size,
@@ -4116,6 +4156,7 @@ static std::string downloadFullGame(
         // Flush the final partial block only after the complete HTTP Range
         // was verified; the renamed output must always be a full package.
         enqueue();
+        networkSucceeded.store(true);
     } catch (...) {
         networkError = std::current_exception();
     }
@@ -4130,9 +4171,8 @@ static std::string downloadFullGame(
     if (cancel && cancel->load())
         throw std::runtime_error("Download cancelled");
 
-    if (::close(output.fd) != 0)
-        throw std::runtime_error("Closing saved game failed");
-    output.fd = -1;
+    fsFileClose(&output.fd);
+    output.opened = false;
 
     if (!completeSavedGame(output.path, job.file.size))
         throw std::runtime_error("Downloaded package size mismatch");
