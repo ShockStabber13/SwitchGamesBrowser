@@ -3524,19 +3524,95 @@ int main(int, char**) {
 
         } else if (page == Page::CpuClockDiagnostics) {
             if (keys & HidNpadButton_B) {
-                if (cpuClockBoostTrial.active()) {
+                // An indefinite saved preset must survive leaving the menu.
+                if (cpuClockBoostTrial.active() &&
+                    !cpuClockBoostTrial.held()) {
                     cpuClockBoostLines = cpuClockBoostTrial.stop("B / back");
                 }
                 settingsCursor = 7;
                 page = Page::Settings;
-            } else if (keys & HidNpadButton_X) {
-                cpuClockBoostLines = cpuClockBoostTrial.begin();
-                status = cpuClockBoostTrial.active()
-                    ? "10-second CPU boost test running"
-                    : "CPU clock write test finished / rejected";
-            } else if (keys & HidNpadButton_A) {
-                if (cpuClockBoostTrial.active()) {
-                    status = "Wait for the clock to restore before re-testing";
+            }
+            if ((keys & HidNpadButton_Left) ||
+                (keys & HidNpadButton_Right)) {
+                int index = 0;
+                for (int i = 0; i < 5; ++i) {
+                    if (kCpuPresetsMHz[i] == cpuClockChoiceMHz)
+                        index = i;
+                }
+                if (keys & HidNpadButton_Left)
+                    index = (index + 4) % 5;
+                else
+                    index = (index + 1) % 5;
+                cpuClockChoiceMHz = kCpuPresetsMHz[index];
+                status = "CPU preset selected; press X to apply and save";
+            }
+            if (keys & HidNpadButton_X) {
+                if (pendingInstall.valid() ||
+                    pendingNetworkBenchmark.valid() || installCpuBoosted) {
+                    cpuClockBoostLines = {
+                        "Finish the install / benchmark before changing CPU"
+                    };
+                } else {
+                    bool applied = false;
+                    if (cpuClockChoiceMHz == 0) {
+                        if (cpuClockBoostTrial.active())
+                            cpuClockBoostLines = cpuClockBoostTrial.stop(
+                                "Saved preset: Off");
+                        else
+                            cpuClockBoostLines = {
+                                "CPU override disabled; stock clock active"
+                            };
+                        applied = true;
+                    } else if (cpuClockBoostTrial.held() &&
+                               cpuClockBoostTrial.targetHz() ==
+                                  static_cast<u32>(cpuClockChoiceMHz) * 1000000u) {
+                        cpuClockBoostLines = {"Selected clock already active."};
+                        applied = true;
+                    } else {
+                        if (cpuClockBoostTrial.active())
+                            cpuClockBoostTrial.stop("Changing CPU preset");
+                        cpuClockBoostLines = cpuClockBoostTrial.begin(
+                            static_cast<u32>(cpuClockChoiceMHz) * 1000000u,
+                            true);
+                        applied = cpuClockBoostTrial.held();
+                    }
+                    // Never persist a newly requested clock that the device
+                    // could not verify. Keep the prior saved choice instead.
+                    if (applied) {
+                        try {
+                            atomicWrite(root + "cpu-clock.json",
+                                sgb::Json{{"cpuClockMHz",
+                                           cpuClockChoiceMHz}}.dump(2));
+                            status = "CPU preset applied and saved";
+                        } catch (const std::exception& e) {
+                            status = std::string("CPU preset save failed: ") +
+                                     e.what();
+                        }
+                    } else {
+                        status = "CPU clock rejected; old saved preset retained";
+                    }
+                }
+            }
+            if (keys & HidNpadButton_Y) {
+                if (cpuClockBoostTrial.held() ||
+                    pendingInstall.valid() ||
+                    pendingNetworkBenchmark.valid()) {
+                    cpuClockBoostLines = {
+                        "Turn saved CPU preset Off before 10-second test"
+                    };
+                } else {
+                    if (cpuClockBoostTrial.active())
+                        cpuClockBoostTrial.stop("Restart 10-second test");
+                    cpuClockBoostLines = cpuClockBoostTrial.begin();
+                    status = cpuClockBoostTrial.active()
+                        ? "10-second CPU clock test running"
+                        : "CPU clock test rejected";
+                }
+            }
+            if (keys & HidNpadButton_A) {
+                if (cpuClockBoostTrial.active() &&
+                    !cpuClockBoostTrial.held()) {
+                    status = "Wait for the 10-second test to finish";
                 } else {
                     cpuClockDiagnosticLines = sgb::probeCpuClockReadOnly();
                     status = "CPU clock probe refreshed";
@@ -4869,7 +4945,7 @@ int main(int, char**) {
                 "Download / Update Langegen Catalog",
                 "Debrid Manager",
                 "Install Manager",
-                "CPU Clock Diagnostic (read-only)"
+                "CPU Clock Settings"
             };
 
             for (
@@ -4942,6 +5018,13 @@ int main(int, char**) {
                         catalogFile.good()
                             ? "Installed"
                             : "Not downloaded";
+                }
+                else if (i == 7) {
+                    value = cpuClockBoostTrial.held()
+                        ? std::to_string(
+                            cpuClockBoostTrial.targetHz() / 1000000u) +
+                            " MHz held"
+                        : "Off / manual";
                 }
                 else if (i == 6) {
                     size_t active = 0;
@@ -5017,33 +5100,50 @@ int main(int, char**) {
             }
 
         } else if (page == Page::CpuClockDiagnostics) {
-            label(renderer, big, "CPU CLOCK DIAGNOSTIC",
+            label(renderer, big, "CPU CLOCK SETTINGS",
                   32, 70, 1216, green);
             label(renderer, small,
-                  "A Read-only probe  |  X Boost 10s  |  B Restore / Back",
+                  "LEFT/RIGHT Preset  |  X Apply + Save  |  Y Test 10s",
                   32, 112, 1216, muted);
+            label(renderer, small,
+                  "A Read Clocks  |  B Back (keeps saved clock)",
+                  32, 140, 1216, muted);
             for (size_t i = 0;
-                 i < cpuClockDiagnosticLines.size() && i < 7;
+                 i < cpuClockDiagnosticLines.size() && i < 5;
                  ++i) {
                 label(renderer, small, cpuClockDiagnosticLines[i],
-                      48, 148 + static_cast<int>(i) * 32,
+                      48, 179 + static_cast<int>(i) * 31,
                       1160, i == 0 ? green : white);
             }
-            label(renderer, small, "1224 MHz CPU WRITE EXPERIMENT",
-                  32, 390, 1216, green);
+            label(renderer, small,
+                  "SELECTED CPU: " + std::string(cpuClockChoiceMHz == 0
+                      ? "OFF" : std::to_string(cpuClockChoiceMHz) + " MHz"),
+                  32, 350, 1216, green);
+            label(renderer, small,
+                  cpuClockBoostTrial.held()
+                      ? "HELD: " + std::to_string(
+                          cpuClockBoostTrial.targetHz() / 1000000u) +
+                          " MHz (until changed or app exit)"
+                      : "CURRENT MODE: stock / no saved override",
+                  32, 384, 1216, white);
             for (size_t i = 0;
-                 i < cpuClockBoostLines.size() && i < 7;
+                 i < cpuClockBoostLines.size() && i < 6;
                  ++i) {
                 label(renderer, small, cpuClockBoostLines[i],
-                      48, 423 + static_cast<int>(i) * 29,
+                      48, 426 + static_cast<int>(i) * 28,
                       1160, white);
             }
-            if (cpuClockBoostTrial.active()) {
+            if (cpuClockBoostTrial.active() &&
+                !cpuClockBoostTrial.held()) {
                 label(renderer, small,
-                      "AUTOMATIC RESTORE IN " +
+                      "TEST RESTORES IN " +
                       std::to_string(cpuClockBoostTrial.secondsRemaining()) +
                       " SECONDS",
-                      32, 636, 1216, green);
+                      32, 618, 1216, green);
+            } else {
+                label(renderer, small,
+                      "Saved in cpu-clock.json; auto-applies next launch.",
+                      32, 618, 1216, muted);
             }
 
         } else if (page == Page::ScrapeChoice) {
