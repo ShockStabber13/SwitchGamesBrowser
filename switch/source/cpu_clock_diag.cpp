@@ -96,6 +96,9 @@ std::vector<std::string> probeCpuClockReadOnly() {
 
 namespace {
 constexpr u32 kBoostHz = 1224000000u;
+constexpr std::array<u32, 4> kAllowedCpuPresets{{
+    1224000000u, 1326000000u, 1428000000u, 1581000000u
+}};
 constexpr auto kTrialDuration = std::chrono::seconds(10);
 
 std::string mhz(u32 hz) {
@@ -116,6 +119,8 @@ void CpuClockBoostTrial::close() {
         initialized_ = false;
     }
     active_ = false;
+    holdUntilChanged_ = false;
+    targetHz_ = 0;
 }
 
 CpuClockBoostTrial::~CpuClockBoostTrial() {
@@ -127,13 +132,18 @@ CpuClockBoostTrial::~CpuClockBoostTrial() {
     }
 }
 
-std::vector<std::string> CpuClockBoostTrial::begin() {
+std::vector<std::string> CpuClockBoostTrial::begin(u32 requestedHz, bool holdUntilChanged) {
     if (active_) {
         return {"Test already running: please wait for auto-restore."};
     }
 
+    if (std::find(kAllowedCpuPresets.begin(), kAllowedCpuPresets.end(),
+                  requestedHz) == kAllowedCpuPresets.end()) {
+        return {"Unsupported CPU preset. No change applied."};
+    }
     std::vector<std::string> result{
-        "CPU boost experiment: target 1224 MHz for 10 seconds"
+        std::string("CPU target: ") + mhz(requestedHz) +
+        (holdUntilChanged ? " (saved app-session mode)" : " (10-second test)")
     };
 
     const Result initialized = clkrstInitialize();
@@ -162,8 +172,8 @@ std::vector<std::string> CpuClockBoostTrial::begin() {
     result.emplace_back("Original clock: " + mhz(originalHz_));
 
     // Do not downclock an already boosted CPU for this test.
-    if (originalHz_ >= kBoostHz) {
-        result.emplace_back("Already at/above 1224 MHz; no change made.");
+    if (!holdUntilChanged && originalHz_ >= requestedHz) {
+        result.emplace_back("Already at/above requested CPU rate; no change made.");
         close();
         return result;
     }
@@ -182,15 +192,15 @@ std::vector<std::string> CpuClockBoostTrial::begin() {
     }
     if (count < 0 || static_cast<size_t>(count) > rates.size() ||
         listType != PcvClockRatesListType_Discrete ||
-        std::find(rates.begin(), rates.begin() + count, kBoostHz) ==
+        std::find(rates.begin(), rates.begin() + count, requestedHz) ==
             rates.begin() + count) {
-        result.emplace_back("1224 MHz absent from discrete CPU clock list.");
+        result.emplace_back("Requested MHz absent from discrete CPU clock list.");
         result.emplace_back("Not applied. No CPU settings changed.");
         close();
         return result;
     }
 
-    const Result set = clkrstSetClockRate(&session_, kBoostHz);
+    const Result set = clkrstSetClockRate(&session_, requestedHz);
     u32 actualHz = 0;
     const Result verify = clkrstGetClockRate(&session_, &actualHz);
     if (R_FAILED(set)) {
@@ -212,20 +222,24 @@ std::vector<std::string> CpuClockBoostTrial::begin() {
     // Even if a readback fails, an accepted write must be restored.
     active_ = true;
     deadline_ = std::chrono::steady_clock::now() + kTrialDuration;
+    targetHz_ = requestedHz;
+    holdUntilChanged_ = holdUntilChanged;
     result.emplace_back("Set CPU clock: accepted by service.");
     if (R_SUCCEEDED(verify)) {
         result.emplace_back("CPU clock readback: " + mhz(actualHz));
-        if (actualHz != kBoostHz)
+        if (actualHz != requestedHz)
             result.emplace_back("Warning: requested and actual clocks differ.");
     } else {
         result.push_back(resultLine("Clock readback failed", verify));
     }
-    result.emplace_back("Auto-restore in 10s; B/+/exit restores early.");
+    result.emplace_back(holdUntilChanged
+        ? "Held while app runs; restores on exit or next change."
+        : "Auto-restore in 10s; B/+/exit restores early.");
     return result;
 }
 
 unsigned CpuClockBoostTrial::secondsRemaining() const {
-    if (!active_) return 0;
+    if (!active_ || holdUntilChanged_) return 0;
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline_) return 0;
     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -234,7 +248,7 @@ unsigned CpuClockBoostTrial::secondsRemaining() const {
 }
 
 std::vector<std::string> CpuClockBoostTrial::tick() {
-    if (!active_ || std::chrono::steady_clock::now() < deadline_)
+    if (!active_ || holdUntilChanged_ || std::chrono::steady_clock::now() < deadline_)
         return {};
     return stop("10-second timer finished");
 }
