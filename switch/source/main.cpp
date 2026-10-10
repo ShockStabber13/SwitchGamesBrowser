@@ -3859,8 +3859,9 @@ int main(int, char**) {
             }
 
             if (!installRows.empty()) {
-                // ZL benchmarks existing TorBox queue entry over HTTP only.
-                // A second press cancels the diagnostic; no install is started.
+                // ZL measures the selected debrid file without writing to SD.
+                // AllDebrid uses one continuous HTTP stream; TorBox retains
+                // its separate 1x/4x comparison. No installation is started.
                 if (keys & HidNpadButton_ZL) {
                     if (pendingNetworkBenchmark.valid()) {
                         if (networkBenchmarkCancel)
@@ -3876,8 +3877,12 @@ int main(int, char**) {
                             std::make_shared<std::atomic<bool>>(false);
                         auto cancel = networkBenchmarkCancel;
                         installRows[installManagerCursor].benchmarkResult =
-                            "HTTP-only test running (1x then 4x)...";
-                        status = "Benchmarking TorBox HTTP with no SD writes...";
+                            config.service == sgb::DebridService::AllDebrid
+                                ? "AllDebrid HTTP-only 1x test running..."
+                                : "TorBox HTTP-only test running (1x then 4x)...";
+                        status = config.service == sgb::DebridService::AllDebrid
+                            ? "Measuring AllDebrid CDN: 1 connection, no SD..."
+                            : "Benchmarking TorBox HTTP with no SD writes...";
                         // Apply the same CPU boost as a real install.
                         if (!installCpuBoosted && !cpuClockBoostTrial.held()) {
                             appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
