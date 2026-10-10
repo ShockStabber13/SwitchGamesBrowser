@@ -3581,8 +3581,9 @@ NetworkBenchmarkResult runNetworkBenchmark(
 
         if (config.service == DebridService::None || config.apiKey.empty())
             throw std::runtime_error("Authorize your debrid account first");
-        if (job.remoteId.empty() || job.file.id.empty())
-            throw std::runtime_error("Benchmark requires a TorBox file in the install queue");
+        if (job.remoteId.empty() ||
+            (config.service == DebridService::TorBox && job.file.id.empty()))
+            throw std::runtime_error("Benchmark requires a debrid file in the install queue");
         if (job.file.size < 16 * kChunk)
             throw std::runtime_error("Benchmark requires a file of at least 64 MiB");
         if (cancelRequested && cancelRequested->load())
@@ -3595,11 +3596,34 @@ NetworkBenchmarkResult runNetworkBenchmark(
         if (url.empty())
             throw std::runtime_error("Debrid did not return a download URL");
 
-        // The same HTTP implementation as install, with no NCM writes,
-        // NCA processing or SD file creation. Prime the TorBox -> CDN
-        // redirect outside the timed samples to measure CDN throughput.
+        // Same verified HTTP Range path as installs, but no NCM/SD writes.
+        // Use one connection for AllDebrid (matching its install path)
+        // so it can be compared directly against the observed install rate.
         HttpPackageSource source(url, cancelRequested, job.file.size);
         source.streamExact(0, kChunk, [](const u8*, std::size_t) {});
+
+        if (config.service == DebridService::AllDebrid) {
+            // Keep a single continuous HTTP request and avoid issuing a
+            // second parallel test after the warm-up.
+            const u64 sampleBytes = std::min<u64>(
+                job.file.size - kChunk, 64ULL * 1024 * 1024);
+            const auto started = std::chrono::steady_clock::now();
+            source.streamExact(kChunk, sampleBytes,
+                [](const u8*, std::size_t) {});
+            const double seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            if (seconds <= 0)
+                throw std::runtime_error("Invalid HTTP test duration");
+            const double mib = static_cast<double>(sampleBytes) /
+                               (1024.0 * 1024.0);
+            char report[180]{};
+            std::snprintf(report, sizeof(report),
+                "AllDebrid HTTP-only 1x: %.2f MiB/s (%.0f MiB, no SD)",
+                mib / seconds, mib);
+            result.success = true;
+            result.message = report;
+            return result;
+        }
 
         const u64 wholeChunks = job.file.size / kChunk;
         const u64 singleChunks = std::min<u64>(8, (wholeChunks - 1) / 3);
