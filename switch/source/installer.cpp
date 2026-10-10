@@ -3903,6 +3903,222 @@ NetworkBenchmarkResult runDownloadFirstBenchmark(
     return result;
 }
 
+// Each queued item owns one stable, collision-resistant file name.
+// Never use an untrusted remote filename as a directory path.
+static std::string downloadedGamePath(const InstallJob& job)
+{
+    const std::string& name = job.file.name;
+    const std::size_t dot = name.rfind('.');
+    if (dot == std::string::npos)
+        throw std::runtime_error("Package filename needs an extension");
+    const std::string extension = name.substr(dot);
+    if (!endsWithInsensitive(extension, ".nsp") &&
+        !endsWithInsensitive(extension, ".nsz") &&
+        !endsWithInsensitive(extension, ".xci") &&
+        !endsWithInsensitive(extension, ".xcz"))
+        throw std::runtime_error("Unsupported downloaded package type");
+
+    std::string stem;
+    for (const unsigned char c : name.substr(0, dot)) {
+        if (stem.size() >= 90) break;
+        if (c == '/' || c == '\\' || c == ':' || c == '<' || c == '>' ||
+            c == '?' || c == '*' || c == '|' || c < 32)
+            stem.push_back('_');
+        else
+            stem.push_back(static_cast<char>(c));
+    }
+    if (stem.empty() || stem == "." || stem == "..")
+        stem = "Game";
+
+    // Stable queue-id suffix prevents similarly named games from clobbering.
+    u64 hash = 14695981039346656037ULL;
+    for (unsigned char c : job.id + "|" + job.source + "|" + job.remoteId +
+                           "|" + job.file.id) {
+        hash ^= static_cast<u64>(c);
+        hash *= 1099511628211ULL;
+    }
+    char suffix[24]{};
+    std::snprintf(suffix, sizeof(suffix), "-%016" PRIx64, static_cast<std::uint64_t>(hash));
+    return "sdmc:/Games/" + stem + suffix + extension;
+}
+
+static bool completeSavedGame(const std::string& path, u64 size)
+{
+    struct stat st{};
+    return size > 0 && ::stat(path.c_str(), &st) == 0 &&
+           S_ISREG(st.st_mode) && st.st_size >= 0 &&
+           static_cast<u64>(st.st_size) == size;
+}
+
+bool removeDownloadedGame(const InstallJob& job)
+{
+    if (job.savedPath.empty()) return false;
+    try {
+        // A tampered queue file must never authorize arbitrary SD deletion.
+        if (job.savedPath != downloadedGamePath(job))
+            return false;
+        return ::remove(job.savedPath.c_str()) == 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Bounded HTTP producer -> RAM queue -> microSD consumer. No entire game in
+// memory. The temporary file is renamed only after verified download + fsync.
+static std::string downloadFullGame(
+    const std::string& url,
+    const InstallJob& job,
+    bool sphairaStyleBuffering,
+    InstallProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancel)
+{
+    if (!job.file.size)
+        throw std::runtime_error("Download First requires a known file size");
+    const std::string finalPath = downloadedGamePath(job);
+
+    // Only reuse a download previously recorded for this exact queue item.
+    if (job.savedPath == finalPath && completeSavedGame(finalPath, job.file.size))
+        return finalPath;
+    if (::mkdir("sdmc:/Games", 0777) != 0 && errno != EEXIST)
+        throw std::runtime_error("Cannot create sdmc:/Games");
+
+    struct stat existing{};
+    if (::stat(finalPath.c_str(), &existing) == 0)
+        throw std::runtime_error("Saved game path already exists; refusing to overwrite");
+    if (errno != ENOENT)
+        throw std::runtime_error("Cannot check download destination");
+
+    struct TempOutput {
+        std::string path;
+        int fd{-1};
+        ~TempOutput() {
+            if (fd >= 0) ::close(fd);
+            if (!path.empty()) ::remove(path.c_str());
+        }
+    } output;
+
+    output.path = finalPath + ".part";
+    // Stale .part files are never complete and must not be used as installs.
+    ::remove(output.path.c_str());
+    output.fd = ::open(output.path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (output.fd < 0)
+        throw std::runtime_error(std::string("Cannot create SD download: ") +
+                                 std::strerror(errno));
+
+    progress.beginTransfer(job.file.size);
+    progress.set("Downloading", 0, job.file.name);
+
+    constexpr std::size_t blockSize = 512 * 1024;
+    constexpr std::size_t maxBuffered = 8 * 1024 * 1024;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::vector<u8>> pending;
+    std::size_t pendingBytes = 0;
+    bool networkDone = false;
+    std::exception_ptr writeError;
+    std::exception_ptr networkError;
+
+    std::thread writer([&]() {
+        try {
+            for (;;) {
+                std::vector<u8> chunk;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [&] {
+                        return !pending.empty() || networkDone ||
+                               (cancel && cancel->load());
+                    });
+                    if (cancel && cancel->load())
+                        throw std::runtime_error("Download cancelled");
+                    if (pending.empty()) {
+                        if (networkDone) break;
+                        continue;
+                    }
+                    chunk = std::move(pending.front());
+                    pending.pop_front();
+                    pendingBytes -= chunk.size();
+                    cv.notify_all();
+                }
+                std::size_t offset = 0;
+                while (offset < chunk.size()) {
+                    if (cancel && cancel->load())
+                        throw std::runtime_error("Download cancelled");
+                    const ssize_t n = ::write(output.fd, chunk.data() + offset,
+                                              chunk.size() - offset);
+                    if (n <= 0)
+                        throw std::runtime_error(std::string("microSD write failed: ") +
+                                                 std::strerror(errno));
+                    offset += static_cast<std::size_t>(n);
+                }
+                progress.addTransferBytes(chunk.size());
+                progress.addNetworkBytes(chunk.size());
+            }
+            if (!networkError && ::fsync(output.fd) != 0)
+                throw std::runtime_error(std::string("microSD sync failed: ") +
+                                         std::strerror(errno));
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex);
+            writeError = std::current_exception();
+            cv.notify_all();
+        }
+    });
+
+    try {
+        HttpPackageSource source(url, cancel, job.file.size, sphairaStyleBuffering);
+        source.streamExact(0, job.file.size,
+            [&](const u8* data, std::size_t size) {
+                while (size) {
+                    const std::size_t n = std::min(blockSize, size);
+                    std::vector<u8> chunk(data, data + n);
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        cv.wait(lock, [&] {
+                            return pendingBytes + n <= maxBuffered ||
+                                   writeError || (cancel && cancel->load());
+                        });
+                        if (writeError)
+                            std::rethrow_exception(writeError);
+                        if (cancel && cancel->load())
+                            throw std::runtime_error("Download cancelled");
+                        pendingBytes += n;
+                        pending.emplace_back(std::move(chunk));
+                        cv.notify_all();
+                    }
+                    data += n;
+                    size -= n;
+                }
+            });
+    } catch (...) {
+        networkError = std::current_exception();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        networkDone = true;
+        cv.notify_all();
+    }
+    writer.join();
+    if (networkError) std::rethrow_exception(networkError);
+    if (writeError) std::rethrow_exception(writeError);
+    if (cancel && cancel->load())
+        throw std::runtime_error("Download cancelled");
+
+    if (::close(output.fd) != 0)
+        throw std::runtime_error("Closing saved game failed");
+    output.fd = -1;
+
+    if (!completeSavedGame(output.path, job.file.size))
+        throw std::runtime_error("Downloaded package size mismatch");
+    // Do not overwrite another file created while downloading.
+    if (::stat(finalPath.c_str(), &existing) == 0)
+        throw std::runtime_error("Another game file already exists at destination");
+    if (::rename(output.path.c_str(), finalPath.c_str()) != 0)
+        throw std::runtime_error(std::string("Could not finalize download: ") +
+                                 std::strerror(errno));
+    output.path.clear();
+    progress.set("Downloading", 100, job.file.name);
+    return finalPath;
+}
+
 InstallResult runInstallJob(
     const DebridConfig& config,
     const InstallJob& job,
