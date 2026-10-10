@@ -1780,7 +1780,7 @@ int main(int, char**) {
 
     Page page = Page::Browse; bool dirty = false;
     std::vector<std::string> cpuClockDiagnosticLines;
-    std::vector<std::string> cpuClockBoostLines{"Press X for 10s / 1224 MHz CPU boost experiment."};
+    std::vector<std::string> cpuClockBoostLines{"LEFT/RIGHT select a CPU clock, X applies and saves it."};
     sgb::CpuClockBoostTrial cpuClockBoostTrial;
     // CPU frequency preference is stored separately from debrid credentials.
     // It only applies while SwitchGamesBrowser is running.

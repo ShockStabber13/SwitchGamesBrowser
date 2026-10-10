@@ -95,7 +95,6 @@ std::vector<std::string> probeCpuClockReadOnly() {
 
 
 namespace {
-constexpr u32 kBoostHz = 1224000000u;
 constexpr std::array<u32, 4> kAllowedCpuPresets{{
     1224000000u, 1326000000u, 1428000000u, 1581000000u
 }};

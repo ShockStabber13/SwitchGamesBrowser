@@ -7,9 +7,8 @@
 namespace sgb {
 std::vector<std::string> probeCpuClockReadOnly();
 
-// Controlled experiment: only CPU, only a listed rate, 10 seconds maximum
-// while the applet event loop is running. Restores the captured original rate
-// on timeout, B/back, and normal application exit. No RAM/GPU/voltage writes.
+// Controlled CPU-only clock experiment: 10-second mode or app-session mode.
+// Both restore the original rate on normal exit. No RAM/GPU/voltage writes.
 class CpuClockBoostTrial {
 public:
     ~CpuClockBoostTrial();
