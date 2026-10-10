@@ -35,6 +35,8 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace sgb {
 namespace {
@@ -3722,6 +3724,131 @@ NetworkBenchmarkResult runNetworkBenchmark(
             static_cast<unsigned long long>(4 * singleChunks),
             4.0 * static_cast<double>(parallelChunks) / parallelSeconds,
             static_cast<unsigned long long>(4 * parallelChunks));
+        result.success = true;
+        result.message = report;
+    } catch (const std::exception& e) {
+        result.message = e.what();
+    }
+    return result;
+}
+
+// Measures the practical "download first" path without modifying installed
+// content. Only a bounded 64 MiB sample is written, then read and deleted.
+NetworkBenchmarkResult runDownloadFirstBenchmark(
+    const DebridConfig& config,
+    const InstallJob& job,
+    const std::string& tempDirectory,
+    const std::shared_ptr<std::atomic<bool>>& cancelRequested)
+{
+    NetworkBenchmarkResult result;
+
+    // RAII is important: cancellation or an HTTP/SD failure must never leave
+    // an open file handle or an incomplete benchmark file behind.
+    struct ScopedSample {
+        std::string path;
+        int fd{-1};
+        ~ScopedSample() {
+            if (fd >= 0) ::close(fd);
+            if (!path.empty()) std::remove(path.c_str());
+        }
+    } sample;
+
+    try {
+        constexpr u64 kWarmup = 4ULL * 1024 * 1024;
+        constexpr u64 kMaxSample = 64ULL * 1024 * 1024;
+        if (config.service == DebridService::None || config.apiKey.empty())
+            throw std::runtime_error("Authorize your debrid account first");
+        if (job.remoteId.empty() ||
+            (config.service == DebridService::TorBox && job.file.id.empty()))
+            throw std::runtime_error("Select a debrid file in the install queue");
+        if (job.file.size <= kWarmup + 16ULL * 1024 * 1024)
+            throw std::runtime_error("SD speed test needs a file over 20 MiB");
+        if (cancelRequested && cancelRequested->load())
+            throw std::runtime_error("SD speed test cancelled");
+
+        auto backend = createDebridBackend(config);
+        if (!backend)
+            throw std::runtime_error("Unable to initialize debrid service");
+        const std::string url = backend->downloadUrl(job.remoteId, job.file);
+        if (url.empty())
+            throw std::runtime_error("Debrid did not return a download URL");
+
+        // Reuse the direct install's HTTP transport options and bounded,
+        // verified Range reads. Warm up the CDN without writing to SD.
+        HttpPackageSource source(url, cancelRequested, job.file.size,
+                                 config.service == DebridService::AllDebrid);
+        source.streamExact(0, kWarmup, [](const u8*, std::size_t) {});
+        const u64 sampleBytes = std::min<u64>(kMaxSample, job.file.size - kWarmup);
+
+        // Avoid clobbering any user file, including one left by a crash.
+        std::string base = tempDirectory;
+        if (!base.empty() && base.back() != '/') base += '/';
+        const auto nonce = std::chrono::steady_clock::now()
+            .time_since_epoch().count();
+        for (unsigned i = 0; i < 16; ++i) {
+            const std::string candidate = base + ".download-first-test-" +
+                std::to_string(nonce) + "-" + std::to_string(i) + ".tmp";
+            const int fd = ::open(candidate.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+            if (fd >= 0) {
+                sample.fd = fd;
+                sample.path = candidate;
+                break;
+            }
+            if (errno != EEXIST) {
+                throw std::runtime_error(std::string("Cannot open microSD test file: ") +
+                                         std::strerror(errno));
+            }
+        }
+        if (sample.fd < 0)
+            throw std::runtime_error("Could not reserve a unique SD test file");
+
+        const auto downloadStart = std::chrono::steady_clock::now();
+        source.streamExact(kWarmup, sampleBytes,
+            [&](const u8* data, std::size_t length) {
+                while (length) {
+                    if (cancelRequested && cancelRequested->load())
+                        throw std::runtime_error("SD speed test cancelled");
+                    const ssize_t written = ::write(sample.fd, data, length);
+                    if (written <= 0)
+                        throw std::runtime_error(std::string("microSD write failed: ") +
+                                                 std::strerror(errno));
+                    data += written;
+                    length -= static_cast<std::size_t>(written);
+                }
+            });
+        // Include the cost of flushing the staged file to physical storage.
+        if (::fsync(sample.fd) != 0)
+            throw std::runtime_error(std::string("microSD sync failed: ") +
+                                     std::strerror(errno));
+        const double downloadSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - downloadStart).count();
+
+        if (::lseek(sample.fd, 0, SEEK_SET) < 0)
+            throw std::runtime_error("Could not reopen SD test sample for reading");
+        std::vector<u8> readBuffer(1024 * 1024);
+        u64 readBytes = 0;
+        const auto readStart = std::chrono::steady_clock::now();
+        while (readBytes < sampleBytes) {
+            if (cancelRequested && cancelRequested->load())
+                throw std::runtime_error("SD speed test cancelled");
+            const auto count = std::min<u64>(readBuffer.size(), sampleBytes - readBytes);
+            const ssize_t received = ::read(sample.fd, readBuffer.data(), count);
+            if (received <= 0)
+                throw std::runtime_error("microSD sample read failed");
+            readBytes += static_cast<u64>(received);
+        }
+        const double readSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - readStart).count();
+        if (downloadSeconds <= 0 || readSeconds <= 0)
+            throw std::runtime_error("Invalid SD benchmark duration");
+
+        // The first rate includes HTTP+SD writes (and fsync), not just HTTP.
+        // This is a partial-file speed test, not a full download or install.
+        const double mib = static_cast<double>(sampleBytes) / (1024.0 * 1024.0);
+        char report[220]{};
+        std::snprintf(report, sizeof(report),
+            "Download First: HTTP+SD %.2f MiB/s | SD read %.2f MiB/s (%.0f MiB sample; no install)",
+            mib / downloadSeconds, mib / readSeconds, mib);
         result.success = true;
         result.message = report;
     } catch (const std::exception& e) {
