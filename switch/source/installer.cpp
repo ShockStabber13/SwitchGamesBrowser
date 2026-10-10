@@ -3985,7 +3985,9 @@ static std::string downloadedGamePath(const InstallJob& job)
     if (!endsWithInsensitive(extension, ".nsp") &&
         !endsWithInsensitive(extension, ".nsz") &&
         !endsWithInsensitive(extension, ".xci") &&
-        !endsWithInsensitive(extension, ".xcz"))
+        !endsWithInsensitive(extension, ".xcz") &&
+        !(job.source == "NotUltraNX Website" &&
+          endsWithInsensitive(extension, ".zip")))
         throw std::runtime_error("Unsupported downloaded package type");
 
     std::string stem;
@@ -4441,24 +4443,54 @@ InstallResult runDownloadJob(
         // Reuse only our own deterministic Games pathname, after checking
         // the exact expected size. A fully staged file survives app restarts
         // and failed installs, so retries do not need debrid again.
-        const std::string path = downloadedGamePath(job);
+        InstallJob resolvedJob = job;
         std::string saved;
-        if (completeSavedGame(path, job.file.size)) {
-            saved = path;
+        if (completeSavedGame(downloadedGamePath(resolvedJob),
+                              resolvedJob.file.size)) {
+            saved = downloadedGamePath(resolvedJob);
         } else {
             progress.set("Downloading", 0, job.file.name);
             const bool localShop = job.source == "NotUltraNX Relay";
             const bool onlineShop = job.source == "OpenNX Shop";
+            const bool websiteShop = job.source == "NotUltraNX Website";
             std::string url;
-            if (localShop || onlineShop) {
+            if (localShop || onlineShop || websiteShop) {
                 if (job.file.link.find('\n') != std::string::npos ||
                     job.file.link.find('\r') != std::string::npos)
                     throw std::runtime_error("Invalid shop package URL");
                 url = job.file.link.substr(0, job.file.link.find('#'));
                 if ((localShop &&
                      url.rfind("http://127.0.0.1:8080/raw?u=", 0) != 0) ||
-                    (onlineShop && url.rfind("https://", 0) != 0))
+                    (onlineShop && url.rfind("https://", 0) != 0) ||
+                    (websiteShop &&
+                        (url.rfind("https://api.ultranx.ru/games/download/", 0) != 0 &&
+                         url.rfind("https://api.ultranx.ru/download/", 0) != 0)))
                     throw std::runtime_error("Shop URL is not an allowed source");
+                if (websiteShop) {
+                    const auto data = probeUltraNxPackage(url, cancelRequested);
+                    resolvedJob.file.size = data.size;
+                    // The website labels may say NSZ, but DLC bundles can
+                    // be ZIP archives. Keep a safe display basename while
+                    // using the actual response's extension.
+                    const auto name = data.filename;
+                    const auto dot = name.rfind('.');
+                    if (dot != std::string::npos) {
+                        const auto ext = name.substr(dot);
+                        if (endsWithInsensitive(ext, ".nsp") ||
+                            endsWithInsensitive(ext, ".nsz") ||
+                            endsWithInsensitive(ext, ".xci") ||
+                            endsWithInsensitive(ext, ".xcz") ||
+                            endsWithInsensitive(ext, ".zip")) {
+                            const auto oldDot = resolvedJob.file.name.rfind('.');
+                            if (oldDot != std::string::npos)
+                                resolvedJob.file.name.erase(oldDot);
+                            resolvedJob.file.name += ext;
+                        } else {
+                            throw std::runtime_error(
+                                "NotUltraNX returned an unsupported download file type");
+                        }
+                    }
+                }
             } else {
                 if (config.service == DebridService::None ||
                     config.apiKey.empty())
@@ -4473,12 +4505,19 @@ InstallResult runDownloadJob(
                     throw std::runtime_error("Debrid did not return a download URL");
             }
 
-            saved = downloadFullGame(url, job,
-                !localShop && !onlineShop &&
-                    config.service == DebridService::AllDebrid,
-                progress, cancelRequested);
+            if (completeSavedGame(downloadedGamePath(resolvedJob),
+                                  resolvedJob.file.size)) {
+                saved = downloadedGamePath(resolvedJob);
+            } else {
+                saved = downloadFullGame(url, resolvedJob,
+                    !localShop && !onlineShop && !websiteShop &&
+                        config.service == DebridService::AllDebrid,
+                    progress, cancelRequested);
+            }
         }
         result.savedPath = saved;
+        result.resolvedSize = resolvedJob.file.size;
+        result.resolvedName = resolvedJob.file.name;
         if (cancelRequested && cancelRequested->load())
             throw std::runtime_error("Download cancelled");
 
