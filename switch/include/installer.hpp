@@ -111,6 +111,8 @@ struct InstallResult {
     bool cancelled = false;
     std::string message;
     std::string savedPath; // Preserved after install failure/cancellation.
+    std::uint64_t resolvedSize = 0; // Probed exact HTTPS content size.
+    std::string resolvedName;       // Final download filename if changed.
 };
 
 // Downloads sample TorBox ranges into RAM/discards them. Never opens
