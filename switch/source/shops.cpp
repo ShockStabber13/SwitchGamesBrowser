@@ -857,6 +857,7 @@ ShopSearchResult searchNotUltraNxWebsite(
         const auto links = websiteAnchors(html);
         std::set<std::string> seen;
         std::vector<ShopEntry> matches;
+        std::size_t apiDownloadCandidates = 0;
         for (const auto& a : links) {
             const auto url = urlResolve(
                 "https://not.ultranx.ru/en/game/" + id, a.href);
@@ -865,6 +866,7 @@ ShopSearchResult searchNotUltraNxWebsite(
             // Do not accept third-party mirrors, game images or other links.
             if (url.rfind("https://api.ultranx.ru/", 0) != 0)
                 continue;
+            ++apiDownloadCandidates;
             const auto label = comparable(a.caption);
             const auto path = lower(stripQuery(url));
             const bool downloadPath =
@@ -890,7 +892,10 @@ ShopSearchResult searchNotUltraNxWebsite(
         }
         if (matches.empty())
             throw std::runtime_error(
-                "Website game found but no Base/Update/DLC download buttons");
+                "Website found, but no Base/Update/DLC buttons (" +
+                std::to_string(links.size()) + " page links, " +
+                std::to_string(apiDownloadCandidates) +
+                " NotUltraNX API links).");
         {
             std::lock_guard<std::mutex> guard(progress.mutex);
             progress.matches = matches;
