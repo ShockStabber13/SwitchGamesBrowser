@@ -800,6 +800,39 @@ ShopSearchResult searchNotUltraNxWebsite(
                 if (cancel->load()) break;
             }
         }
+        // Searching NotUltraNX public listing for games without named catalog entries.
+        // Older catalogs have valid IDs but only file-size text. Search the
+        // website on demand, then verify the game page title before using it.
+        if (id.empty()) {
+            std::vector<std::string> queries;
+            const auto firstEnd = title.find_first_of(" :\t");
+            if (firstEnd != std::string::npos && firstEnd >= 4)
+                queries.push_back(title.substr(0, firstEnd));
+            queries.push_back(title);
+            std::set<std::string> triedIds;
+            for (const auto& query : queries) {
+                if (cancel->load()) break;
+                try {
+                    const auto searchHtml = fetch(
+                        "https://not.ultranx.ru/en?s=" +
+                        websiteQueryEncode(query), cancel.get());
+                    for (const auto& candidate : catalogRowsFromHtml(searchHtml)) {
+                        if (cancel->load() || triedIds.size() >= 48) break;
+                        if (!triedIds.insert(candidate.id).second) continue;
+                        try {
+                            const auto page = fetch(
+                                "https://not.ultranx.ru/en/game/" +
+                                candidate.id, cancel.get());
+                            if (websiteTitleMatches(title, page)) {
+                                id = candidate.id;
+                                break;
+                            }
+                        } catch (const std::exception&) {}
+                    }
+                } catch (const std::exception&) {}
+                if (!id.empty() || triedIds.size() >= 48) break;
+            }
+        }
         if (id.empty()) {
             const auto cached = loadWebsiteCatalog(catalogPath);
             if (cached.empty())
