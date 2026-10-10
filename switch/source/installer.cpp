@@ -4025,14 +4025,43 @@ static std::string downloadFullGame(
         std::strlen("sdmc:"));
     // A leftover .part can never be passed to the installer.
     ::remove(output.path.c_str());
-    // Preallocate, just as Sphaira CopyFile does, avoiding repeated
-    // FAT allocation/metadata updates during the download itself.
-    Result fsResult = fsFsCreateFile(
-        sd, nativePartPath.c_str(), job.file.size, 0);
-    if (R_FAILED(fsResult))
+    // Original NaGaa95/sphaira uses FsCreateOption_BigFile for files
+    // >= 4 GiB. Without it, FAT32 cannot allocate a large game package.
+    // HOS represents a BigFile as an archive-bit concatenation file, but
+    // fsFileWrite/fsFileRead expose it as a single logical file.
+    constexpr u64 kFourGiB = 4ULL * 1024 * 1024 * 1024;
+    const bool bigFile = job.file.size >= kFourGiB;
+    const u32 createOptions = bigFile ? FsCreateOption_BigFile : 0;
+
+    // Reject insufficient space before expensive preallocation. This
+    // applies to both FAT32 and exFAT, with or without split-file mode.
+    s64 freeBytes = -1;
+    const Result freeResult = fsFsGetFreeSpace(sd, "/Games", &freeBytes);
+    if (R_SUCCEEDED(freeResult) && freeBytes >= 0 &&
+        job.file.size > static_cast<u64>(freeBytes)) {
         throw std::runtime_error(
-            "Cannot allocate game file on microSD (FS " +
-            std::to_string(static_cast<unsigned>(fsResult)) + ")");
+            "Not enough free microSD space: need " +
+            std::to_string(job.file.size / (1024 * 1024)) +
+            " MiB, have " +
+            std::to_string(static_cast<u64>(freeBytes) / (1024 * 1024)) +
+            " MiB");
+    }
+
+    // Preallocate the complete logical file before downloading. For files
+    // >= 4 GiB use the native split-file representation automatically.
+    Result fsResult = fsFsCreateFile(
+        sd, nativePartPath.c_str(), static_cast<s64>(job.file.size),
+        createOptions);
+    if (R_FAILED(fsResult)) {
+        throw std::runtime_error(
+            "Cannot allocate " +
+            std::to_string(job.file.size / (1024 * 1024)) +
+            " MiB on microSD" +
+            (bigFile ? " (BigFile enabled)" : "") +
+            " (FS " + std::to_string(static_cast<unsigned>(fsResult)) + ")");
+    }
+    // Same commit step used by upstream Sphaira after file creation.
+    fsFsCommit(sd);
     fsResult = fsFsOpenFile(
         sd, nativePartPath.c_str(), FsOpenMode_Write, &output.fd);
     if (R_FAILED(fsResult))
