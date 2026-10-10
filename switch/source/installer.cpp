@@ -4290,6 +4290,143 @@ static std::string downloadFullGame(
     return finalPath;
 }
 
+// Resolve the official NotUltraNX button's short redirect chain with a
+// ONE-BYTE range request. The API is used as a redirect endpoint, never
+// for catalog discovery, and signed Yandex URLs are never persisted.
+struct UltraNxProbe {
+    u64 size = 0;
+    std::string filename;
+    std::string contentRange;
+    std::string disposition;
+    std::size_t received = 0;
+};
+static std::size_t ultraNxProbeBody(char*, std::size_t size,
+                                    std::size_t nmemb, void* data) {
+    if (size && nmemb > SIZE_MAX / size) return 0;
+    const auto n = size * nmemb;
+    auto& probe = *static_cast<UltraNxProbe*>(data);
+    if (n > 4096 - std::min<std::size_t>(probe.received, 4096))
+        return 0; // Never download a full game while probing.
+    probe.received += n;
+    return n;
+}
+static std::size_t ultraNxProbeHeader(char* data, std::size_t size,
+                                      std::size_t nmemb, void* user) {
+    if (size && nmemb > SIZE_MAX / size) return 0;
+    const auto n = size * nmemb;
+    if (n > 8192) return 0;
+    auto& probe = *static_cast<UltraNxProbe*>(user);
+    const std::string value(data, n);
+    std::string key = value;
+    std::transform(key.begin(), key.end(), key.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (key.rfind("http/", 0) == 0) {
+        // Redirected response overrides the preceding 302 headers.
+        probe.contentRange.clear();
+        probe.disposition.clear();
+    } else if (key.rfind("content-range:", 0) == 0) {
+        probe.contentRange = value.substr(sizeof("content-range:") - 1);
+    } else if (key.rfind("content-disposition:", 0) == 0) {
+        probe.disposition = value.substr(sizeof("content-disposition:") - 1);
+    }
+    return n;
+}
+static std::string ultraNxPercentDecode(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    const auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '%' && i + 2 < value.size() &&
+            hex(value[i+1]) >= 0 && hex(value[i+2]) >= 0) {
+            out.push_back(static_cast<char>(
+                hex(value[i+1]) * 16 + hex(value[i+2])));
+            i += 2;
+        } else out.push_back(value[i]);
+    }
+    return out;
+}
+static UltraNxProbe probeUltraNxPackage(
+    const std::string& url,
+    const std::shared_ptr<std::atomic<bool>>& cancel)
+{
+    CURL* curl = curl_easy_init();
+    if (!curl) throw std::runtime_error("NotUltraNX HTTPS unavailable");
+    UltraNxProbe probe;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 12L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 45L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 SwitchGamesBrowser/0.4");
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+#ifdef __SWITCH__
+    curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
+#endif
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ultraNxProbeBody);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &probe);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ultraNxProbeHeader);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &probe);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+        +[](void* ctx, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+            const auto* cancelled = static_cast<std::atomic<bool>*>(ctx);
+            return cancelled && cancelled->load() ? 1 : 0;
+        });
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel.get());
+    const CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    if (cancel && cancel->load())
+        throw std::runtime_error("Download cancelled");
+    if (status == 401 || status == 403)
+        throw std::runtime_error(
+            "NotUltraNX Download Base requires authorization (HTTP " +
+            std::to_string(status) + ")");
+    if (rc != CURLE_OK || status != 206)
+        throw std::runtime_error(
+            "NotUltraNX server did not provide a 1-byte ranged download (HTTP " +
+            std::to_string(status) + ", CURL " +
+            std::to_string(static_cast<int>(rc)) + ")");
+    // Final Yandex response is "Content-Range: bytes 0-0/<exact size>".
+    const auto slash = probe.contentRange.rfind('/');
+    if (slash == std::string::npos ||
+        probe.contentRange.find("bytes") == std::string::npos)
+        throw std::runtime_error("NotUltraNX download has no exact file size");
+    const std::string digits = probe.contentRange.substr(slash + 1);
+    try {
+        probe.size = std::stoull(digits);
+    } catch (...) {
+        throw std::runtime_error("NotUltraNX download returned invalid size");
+    }
+    if (!probe.size || probe.size > 128ULL * 1024 * 1024 * 1024)
+        throw std::runtime_error("NotUltraNX download file size is invalid");
+    // Yandex uses Content-Disposition: attachment; filename*=UTF-8''... .
+    const auto key = probe.disposition.find("filename*=");
+    if (key != std::string::npos) {
+        auto start = probe.disposition.find("''", key);
+        if (start != std::string::npos) {
+            start += 2;
+            const auto end = probe.disposition.find_first_of(";\r\n", start);
+            probe.filename = ultraNxPercentDecode(
+                probe.disposition.substr(start, end - start));
+        }
+    }
+    return probe;
+}
+
 // Download Manager: save a verified complete package but DO NOT install it.
 InstallResult runDownloadJob(
     const DebridConfig& config,
