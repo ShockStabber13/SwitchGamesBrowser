@@ -4010,6 +4010,10 @@ int main(int, char**) {
                 if (keys & HidNpadButton_Y) {
                     if (row.job.savedPath.empty()) {
                         status = "Download the game first (A to retry)";
+                    } else if (row.job.file.name.size() >= 4 &&
+                               sgb::lower(row.job.file.name).compare(
+                                   row.job.file.name.size() - 4, 4, ".zip") == 0) {
+                        status = "DLC ZIP saved; extract its packages before installing";
                     } else if (pendingDownload.valid()) {
                         status = "Wait until current download finishes";
                     } else if (row.state == "Installing" || row.state == "Queued") {
