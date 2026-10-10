@@ -3619,6 +3619,13 @@ void InstallProgress::snapshotTransfer(
     // A rolling rate recalculated on each UI frame, including idle periods.
     {
         std::lock_guard<std::mutex> lock(mutex);
+        if (stage == "Installing") {
+            // Offline installation reports content-storage writes, not
+            // network traffic. The network counter correctly stays zero.
+            outDone = bytesDone.load();
+            outNetworkBytesPerSecond = outBytesPerSecond;
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         constexpr auto window = std::chrono::milliseconds(1500);
         const auto total = networkBytesDone.load();
