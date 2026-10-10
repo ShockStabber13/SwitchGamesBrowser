@@ -238,11 +238,15 @@ int httpRangeProgress(
 // Tune the TCP receive window on every newly connected CDN socket.
 // pipensx uses this for its TorBox HTTP transfers; CURLOPT_BUFFERSIZE
 // alone configures libcurl's user-space buffer, not SO_RCVBUF.
-int tuneCloudDownloadSocket(void*, curl_socket_t socket,
+int tuneCloudDownloadSocket(void* opaque, curl_socket_t socket,
                             curlsocktype purpose)
 {
     if (purpose == CURLSOCKTYPE_IPCXN) {
-        int receiveBytes = 256 * 1024;
+        // Sphaira allows a 4 MiB socket maximum in application mode.
+        // Keep the previous 256 KiB request for all non-AllDebrid sources.
+        const bool sphairaBuffer = opaque &&
+            *static_cast<const bool*>(opaque);
+        int receiveBytes = sphairaBuffer ? 1024 * 1024 : 256 * 1024;
         setsockopt(socket, SOL_SOCKET, SO_RCVBUF,
                    &receiveBytes, sizeof(receiveBytes));
         int noDelay = 1;
@@ -259,11 +263,13 @@ public:
         std::string url,
         std::shared_ptr<std::atomic<bool>>
             cancel,
-        u64 knownSize)
+        u64 knownSize,
+        bool sphairaStyleBuffering = false)
         : url_(std::move(url)),
           initialUrl_(url_),
           cancel_(std::move(cancel)),
-          knownSize_(knownSize)
+          knownSize_(knownSize),
+          sphairaStyleBuffering_(sphairaStyleBuffering)
     {
         curl_ =
             curl_easy_init();
@@ -334,6 +340,10 @@ public:
             curl_,
             CURLOPT_SOCKOPTFUNCTION,
             tuneCloudDownloadSocket);
+        curl_easy_setopt(
+            curl_,
+            CURLOPT_SOCKOPTDATA,
+            &sphairaStyleBuffering_);
 
         // Match pipensx's tested TorBox CDN transport options. Switch's
         // older libcurl uses HTTP/1.1 for these independent range handles.
@@ -543,7 +553,8 @@ public:
 
     // Separate easy handles are required for concurrent HTTP ranges.
     std::unique_ptr<HttpPackageSource> clone() const {
-        return std::make_unique<HttpPackageSource>(url_, cancel_, knownSize_);
+        return std::make_unique<HttpPackageSource>(
+            url_, cancel_, knownSize_, sphairaStyleBuffering_);
     }
 
     void readExact(
@@ -585,6 +596,7 @@ private:
         cancel_;
 
     u64 knownSize_ = 0;
+    bool sphairaStyleBuffering_ = false;
 
     CURL* curl_ = nullptr;
 };
@@ -937,14 +949,16 @@ Package openPackage(
     const std::string& name,
     const std::shared_ptr<
         std::atomic<bool>>& cancel,
-    u64 knownSize)
+    u64 knownSize,
+    bool sphairaStyleBuffering)
 {
     auto source =
         std::make_shared<
             HttpPackageSource>(
                 url,
                 cancel,
-                knownSize);
+                knownSize,
+                sphairaStyleBuffering);
 
     if (
         endsWithInsensitive(name, ".nsp") ||
@@ -3108,7 +3122,8 @@ void installPackageCloud(
             url,
             name,
             cancel,
-            knownSize);
+            knownSize,
+            sphairaStyleBuffering);
 
     if (package.entries.empty())
         throw std::runtime_error(
@@ -3599,7 +3614,8 @@ NetworkBenchmarkResult runNetworkBenchmark(
         // Same verified HTTP Range path as installs, but no NCM/SD writes.
         // Use one connection for AllDebrid (matching its install path)
         // so it can be compared directly against the observed install rate.
-        HttpPackageSource source(url, cancelRequested, job.file.size);
+        HttpPackageSource source(url, cancelRequested, job.file.size,
+                                 config.service == DebridService::AllDebrid);
         source.streamExact(0, kChunk, [](const u8*, std::size_t) {});
 
         if (config.service == DebridService::AllDebrid) {
