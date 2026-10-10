@@ -195,8 +195,8 @@ std::vector<std::string> CpuClockBoostTrial::begin() {
     const Result verify = clkrstGetClockRate(&session_, &actualHz);
     if (R_FAILED(set)) {
         result.push_back(resultLine("Set CPU clock failed", set));
-        if (R_SUCCEEDED(verify) && actualHz != originalHz_) {
-            result.emplace_back("Clock changed unexpectedly; restoring now.");
+        if (R_FAILED(verify) || actualHz != originalHz_) {
+            result.emplace_back("Clock unverified / changed; restoring now.");
             const Result restore = clkrstSetClockRate(
                 &session_, originalHz_);
             result.emplace_back(R_SUCCEEDED(restore)
