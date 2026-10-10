@@ -5192,18 +5192,26 @@ int main(int, char**) {
                                 row.progress) +
                             "%";
 
-                        if (row.bytesTotal > 0) {
-                            stateText +=
-                                "  " +
-                                formatTransferBytes(
-                                    row.bytesDone) +
-                                " / " +
-                                formatTransferBytes(
-                                    row.bytesTotal);
+                        if (row.state == "Installing") {
+                            // Display committed NCA write throughput (not
+                            // HTTP download speed) using the 5 s rolling
+                            // average from original Sphaira-style writes.
+                            // A full-sized NCA block may still be buffering
+                            // before the first native storage write.
+                            stateText += row.networkBytesPerSecond
+                                ? "  SD write: " +
+                                    formatTransferBytes(row.networkBytesPerSecond) + "/s"
+                                : "  SD writer buffering / finalizing...";
+                        } else {
+                            if (row.bytesTotal > 0) {
+                                stateText += "  " +
+                                    formatTransferBytes(row.bytesDone) +
+                                    " / " +
+                                    formatTransferBytes(row.bytesTotal);
+                            }
+                            stateText += "  " +
+                                formatTransferBytes(row.networkBytesPerSecond) + "/s";
                         }
-
-                        stateText += "  " +
-                            formatTransferBytes(row.networkBytesPerSecond) + "/s";
                     }
 
                     if (!row.job.savedPath.empty() &&
