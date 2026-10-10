@@ -500,18 +500,30 @@ std::vector<WebsiteCatalogRow> catalogRowsFromHtml(
     const std::string& html)
 {
     std::map<std::string, std::string> rows;
-    // Site cards may be anchors OR onclick containers. Index the path
-    // wherever it appears; do not assume one specific card template.
+    // Site cards may be anchors OR onclick containers. Image tags
+    // often contain long URLs before the actual title, so the old 520-byte
+    // context silently dropped the visible game name. Keep wider text on
+    // both sides of each game-ID occurrence. Matching is only a shortlist:
+    // the actual game page's <h1> is checked before showing downloads.
     std::size_t pos = 0;
     while ((pos = html.find("/game/", pos)) != std::string::npos) {
         const auto id = anchorGameId(html.substr(pos, 24));
         if (!id.empty()) {
-            const auto start = pos > 220 ? pos - 220 : 0;
-            const auto stop = std::min(html.size(), pos + 520);
+            const auto start = pos > 1300 ? pos - 1300 : 0;
+            const auto stop = std::min(html.size(), pos + 2600);
             const auto nearby = comparable(
                 htmlText(html.substr(start, stop - start)));
-            if (!nearby.empty())
-                rows.emplace(id, nearby.substr(0, 800));
+            if (!nearby.empty()) {
+                auto& entry = rows[id];
+                if (entry.empty()) entry = nearby.substr(0, 2400);
+                else if (entry.find(nearby.substr(0, std::min<std::size_t>(80, nearby.size()))) ==
+                         std::string::npos) {
+                    // Another occurrence of this ID may be in an image or
+                    // a link well away from its card title.
+                    entry.append(nearby.substr(0, 1000));
+                    if (entry.size() > 3400) entry.resize(3400);
+                }
+            }
         }
         pos += 6;
     }
@@ -526,7 +538,7 @@ std::vector<WebsiteCatalogRow> loadWebsiteCatalog(
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input) return {};
     const auto size = input.tellg();
-    if (size <= 0 || size > 5 * 1024 * 1024)
+    if (size <= 0 || size > 20 * 1024 * 1024)
         return {};
     input.seekg(0);
     const std::string bytes(
@@ -541,7 +553,7 @@ std::vector<WebsiteCatalogRow> loadWebsiteCatalog(
         if (!game.is_object()) continue;
         const auto id = stringField(game, "id");
         const auto text = stringField(game, "cardText");
-        if (validTitleId(id) && !text.empty() && text.size() <= 800)
+        if (validTitleId(id) && !text.empty() && text.size() <= 3400)
             rows.push_back({id, text});
         if (rows.size() >= 10000) break;
     }
