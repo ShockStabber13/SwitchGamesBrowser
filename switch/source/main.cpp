@@ -1646,7 +1646,28 @@ int main(int, char**) {
     while (appletMainLoop()) { padUpdate(&p); if (padGetButtonsDown(&p) & HidNpadButton_Plus) break; consoleUpdate(nullptr); }
         consoleExit(nullptr); return 0;
     }
-    socketInitializeDefault(); romfsInit(); curl_global_init(CURL_GLOBAL_DEFAULT);
+    // Match Sphaira's tested application-mode BSD socket buffers.
+    // SwitchGamesBrowser requires application mode above, so the larger
+    // network pool is appropriate and doesn't burden applet memory.
+    const SocketInitConfig sphairaSocketConfig = {
+        .tcp_tx_buf_size = 1024 * 64,
+        .tcp_rx_buf_size = 1024 * 64,
+        .tcp_tx_buf_max_size = 1024 * 1024 * 4,
+        .tcp_rx_buf_max_size = 1024 * 1024 * 4,
+        .udp_tx_buf_size = 0x2400,
+        .udp_rx_buf_size = 0xA500,
+        .sb_efficiency = 8,
+        .num_bsd_sessions = 3,
+        .bsd_service_type = BsdServiceType_Auto,
+    };
+    // Fall back to the previously working defaults if the larger buffers
+    // cannot be allocated on this console / CFW configuration.
+    Result socketResult = socketInitialize(&sphairaSocketConfig);
+    if (R_FAILED(socketResult))
+        socketResult = socketInitializeDefault();
+    if (R_FAILED(socketResult)) return 1;
+    romfsInit();
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     mkdir(root.c_str(), 0777); mkdir((root + "covers").c_str(), 0777);
     if (R_FAILED(plInitialize(PlServiceType_User))) return 1;
     PlFontData fontData{};
