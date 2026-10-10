@@ -3957,6 +3957,10 @@ bool removeDownloadedGame(const InstallJob& job)
         // A tampered queue file must never authorize arbitrary SD deletion.
         if (job.savedPath != downloadedGamePath(job))
             return false;
+        struct stat st{};
+        if (::stat(job.savedPath.c_str(), &st) != 0)
+            return errno == ENOENT; // Already deleted outside the app.
+        if (!S_ISREG(st.st_mode)) return false;
         return ::remove(job.savedPath.c_str()) == 0;
     } catch (...) {
         return false;
