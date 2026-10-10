@@ -1417,6 +1417,9 @@ private:
 
                 if (R_FAILED(rc))
                     throw std::runtime_error("Failed writing NCA content");
+                // Exactly as in Sphaira's NCA write thread: a progress
+                // event is earned only after a successful native write.
+                progress_.addStorageWritten(block.data.size());
             }
         } catch (...) {
             {
@@ -1604,6 +1607,7 @@ private:
             storage_, &placeholderId_, offset, data, size);
         if (R_FAILED(rc))
             throw std::runtime_error("Failed writing NCA content");
+        progress_.addStorageWritten(size);
     }
 
     std::array<u8,0x20> headerKey_{};
@@ -3508,6 +3512,7 @@ void InstallProgress::beginTransfer(
     bytesPerSecond.store(0);
     networkBytesPerSecond.store(0);
     networkBytesDone.store(0);
+    storageBytesWritten.store(0);
 
     std::lock_guard<std::mutex>
         lock(mutex);
@@ -3520,6 +3525,8 @@ void InstallProgress::beginTransfer(
     networkSampleBytes_ = 0;
     liveSpeedSamples_.clear();
     liveSpeedSamples_.emplace_back(transferSampleStarted_, 0);
+    storageSpeedSamples_.clear();
+    storageSpeedSamples_.emplace_back(transferSampleStarted_, 0);
 }
 
 void InstallProgress::addTransferBytes(
@@ -3535,7 +3542,13 @@ void InstallProgress::addTransferBytes(
     const std::uint64_t total =
         bytesTotal.load();
 
-    if (total) {
+    std::lock_guard<std::mutex>
+        lock(mutex);
+
+    // Download progress is based on saved file bytes. Installation
+    // percentage is independently driven by NcaOutput::updateProgress,
+    // as in Sphaira, so source-read callbacks cannot overwrite it.
+    if (total && stage != "Installing") {
         percent.store(
             std::clamp(
                 static_cast<int>(
@@ -3544,9 +3557,6 @@ void InstallProgress::addTransferBytes(
                 0,
                 99));
     }
-
-    std::lock_guard<std::mutex>
-        lock(mutex);
 
     const auto now =
         std::chrono::steady_clock::now();
@@ -3585,6 +3595,12 @@ void InstallProgress::addNetworkBytes(std::uint64_t bytes)
     networkBytesDone.fetch_add(bytes, std::memory_order_relaxed);
 }
 
+void InstallProgress::addStorageWritten(std::uint64_t bytes)
+{
+    if (bytes)
+        storageBytesWritten.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 void InstallProgress::snapshot(
     std::string& outStage,
     int& outPercent,
@@ -3606,27 +3622,38 @@ void InstallProgress::snapshotTransfer(
     std::uint64_t& outBytesPerSecond,
     std::uint64_t& outNetworkBytesPerSecond) const
 {
-    // Display received HTTP bytes immediately, not bytes only after
-    // a complete SD write. This counter advances from libcurl callbacks.
-    outDone =
-        networkBytesDone.load();
-
-    outTotal =
-        bytesTotal.load();
-
-    outBytesPerSecond =
-        bytesPerSecond.load();
+    outTotal = bytesTotal.load();
+    outBytesPerSecond = bytesPerSecond.load();
     // A rolling rate recalculated on each UI frame, including idle periods.
     {
         std::lock_guard<std::mutex> lock(mutex);
+        const auto now = std::chrono::steady_clock::now();
         if (stage == "Installing") {
-            // Offline installation reports content-storage writes, not
-            // network traffic. The network counter correctly stays zero.
+            // The original Sphaira installer signals progress AFTER
+            // ncmContentStorageWritePlaceHolder succeeds. Use exactly
+            // that committed-byte counter for offline installation speed.
+            // A 5-second window tolerates normal NCA buffering and
+            // registration pauses without falsely displaying 0 B/s.
             outDone = bytesDone.load();
-            outNetworkBytesPerSecond = outBytesPerSecond;
+            const auto committed = storageBytesWritten.load();
+            storageSpeedSamples_.emplace_back(now, committed);
+            constexpr auto storageWindow = std::chrono::seconds(5);
+            while (storageSpeedSamples_.size() > 2 &&
+                   now - storageSpeedSamples_[1].first >= storageWindow)
+                storageSpeedSamples_.pop_front();
+            const auto& oldest = storageSpeedSamples_.front();
+            const auto elapsedMs = std::chrono::duration_cast<
+                std::chrono::milliseconds>(now - oldest.first).count();
+            const auto rate = elapsedMs > 0 && committed >= oldest.second
+                ? (committed - oldest.second) * 1000 /
+                    static_cast<std::uint64_t>(elapsedMs)
+                : 0;
+            outBytesPerSecond = rate;
+            outNetworkBytesPerSecond = rate;
             return;
         }
-        const auto now = std::chrono::steady_clock::now();
+        // Downloads retain the original network-only throughput display.
+        outDone = networkBytesDone.load();
         constexpr auto window = std::chrono::milliseconds(1500);
         const auto total = networkBytesDone.load();
         liveSpeedSamples_.emplace_back(now, total);
