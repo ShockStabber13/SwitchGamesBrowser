@@ -479,8 +479,12 @@ public:
         }
 
         if (localFile_) {
-            // pread does not change the shared file position, which also
-            // makes this compatible with optional parallel NCA reads.
+            // devkitPro's newlib declares pread but does not link it.
+            // Each cloned source owns an independent descriptor; serialize
+            // the seek/read pair for accesses on the same source instance.
+            std::lock_guard<std::mutex> localReadLock(localReadMutex_);
+            if (::lseek(localFd_, static_cast<off_t>(offset), SEEK_SET) < 0)
+                throw std::runtime_error("Saved game seek failed");
             std::vector<u8> block(512 * 1024);
             u64 done = 0;
             while (done < size) {
@@ -488,8 +492,7 @@ public:
                     throw std::runtime_error("Install cancelled");
                 const std::size_t count = static_cast<std::size_t>(
                     std::min<u64>(block.size(), size - done));
-                const ssize_t n = ::pread(localFd_, block.data(), count,
-                                          static_cast<off_t>(offset + done));
+                const ssize_t n = ::read(localFd_, block.data(), count);
                 if (n <= 0)
                     throw std::runtime_error("Saved game read failed");
                 consume(block.data(), static_cast<std::size_t>(n));
@@ -641,6 +644,7 @@ private:
     bool sphairaStyleBuffering_ = false;
     bool localFile_ = false;
     int localFd_ = -1;
+    std::mutex localReadMutex_;
 
     CURL* curl_ = nullptr;
 };
