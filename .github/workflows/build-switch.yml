@@ -5,6 +5,7 @@ on:
     branches:
       - performance/parallel-http-install-pipeline
       - experiment/native-cpu-clock-probe
+      - experiment/native-cpu-clock-boost-10s
 permissions:
   contents: read
 jobs:

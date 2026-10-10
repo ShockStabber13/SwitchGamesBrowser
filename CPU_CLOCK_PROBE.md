@@ -25,3 +25,20 @@ change that behavior.
 Do not interpret a successful read as proof that clock **writes** are allowed.
 The service may restrict writes. This branch never calls `clkrstSetClockRate`,
 and it does not change RAM/GPU frequencies or voltage.
+
+## 1224 MHz CPU write test (10 seconds)
+
+On the `experiment/native-cpu-clock-boost-10s` branch, open
+Settings > CPU Clock Diagnostic. Press **X** to request 1224 MHz.
+
+- A successful read-only diagnostic **does not** imply a clock write is authorized.
+- The app checks for 1224 MHz in the CPU's enumerated discrete clock list.
+- The original clock is read before writing; the requested clock is read back.
+- The app attempts restoration after 10 seconds, when pressing B, or on
+  normal app exit (+ included).
+- If service denies a write, the rejection code appears on the diagnostic page.
+- A restoration request and readback are shown; never assume restoration
+  succeeded if the readback differs or fails.
+- This test touches neither RAM, GPU nor voltages.
+- An app crash or hard power failure can prevent timed restoration, so this is
+  an experiment, not a fail-safe overclock manager.

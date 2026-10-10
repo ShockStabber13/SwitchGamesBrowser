@@ -1,8 +1,35 @@
 #pragma once
+#include <switch.h>
+#include <chrono>
 #include <string>
 #include <vector>
 
 namespace sgb {
-// Read-only diagnostic: never calls SetClockRate or changes voltages.
 std::vector<std::string> probeCpuClockReadOnly();
-}
+
+// Controlled experiment: only CPU, only a listed rate, 10 seconds maximum
+// while the applet event loop is running. Restores the captured original rate
+// on timeout, B/back, and normal application exit. No RAM/GPU/voltage writes.
+class CpuClockBoostTrial {
+public:
+    ~CpuClockBoostTrial();
+    CpuClockBoostTrial(const CpuClockBoostTrial&) = delete;
+    CpuClockBoostTrial& operator=(const CpuClockBoostTrial&) = delete;
+    CpuClockBoostTrial() = default;
+
+    std::vector<std::string> begin();
+    std::vector<std::string> tick();
+    std::vector<std::string> stop(const char* reason);
+    bool active() const { return active_; }
+    unsigned secondsRemaining() const;
+
+private:
+    void close();
+    ClkrstSession session_{};
+    bool initialized_ = false;
+    bool sessionOpen_ = false;
+    bool active_ = false;
+    u32 originalHz_ = 0;
+    std::chrono::steady_clock::time_point deadline_{};
+};
+} // namespace sgb

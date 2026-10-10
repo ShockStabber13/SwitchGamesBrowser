@@ -1780,6 +1780,8 @@ int main(int, char**) {
 
     Page page = Page::Browse; bool dirty = false;
     std::vector<std::string> cpuClockDiagnosticLines;
+    std::vector<std::string> cpuClockBoostLines{"Press X for 10s / 1224 MHz CPU boost experiment."};
+    sgb::CpuClockBoostTrial cpuClockBoostTrial;
     std::set<size_t> selectedFiles;
     std::future<Refresh> pending;
     std::future<std::string> pendingLangegen; 
@@ -2333,6 +2335,12 @@ int main(int, char**) {
     while (appletMainLoop()) {
         SDL_Event event; while (SDL_PollEvent(&event)) {} // libnx handles controller input below.
         padUpdate(&pad); u64 keys = padGetButtonsDown(&pad);
+        // Restore on timeout even when the user does not press a button.
+        const auto cpuClockTimedResult = cpuClockBoostTrial.tick();
+        if (!cpuClockTimedResult.empty()) {
+            cpuClockBoostLines = cpuClockTimedResult;
+            status = "CPU boost test ended; see restoration readback";
+        }
         if (keys & HidNpadButton_Plus) break;
         if (pending.valid() && pending.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto result = pending.get();
@@ -3497,11 +3505,23 @@ int main(int, char**) {
 
         } else if (page == Page::CpuClockDiagnostics) {
             if (keys & HidNpadButton_B) {
+                if (cpuClockBoostTrial.active()) {
+                    cpuClockBoostLines = cpuClockBoostTrial.stop("B / back");
+                }
                 settingsCursor = 7;
                 page = Page::Settings;
+            } else if (keys & HidNpadButton_X) {
+                cpuClockBoostLines = cpuClockBoostTrial.begin();
+                status = cpuClockBoostTrial.active()
+                    ? "10-second CPU boost test running"
+                    : "CPU clock write test finished / rejected";
             } else if (keys & HidNpadButton_A) {
-                cpuClockDiagnosticLines = sgb::probeCpuClockReadOnly();
-                status = "CPU clock probe refreshed";
+                if (cpuClockBoostTrial.active()) {
+                    status = "Wait for the clock to restore before re-testing";
+                } else {
+                    cpuClockDiagnosticLines = sgb::probeCpuClockReadOnly();
+                    status = "CPU clock probe refreshed";
+                }
             }
 
         } else if (page == Page::DebridManager) {
@@ -4981,14 +5001,30 @@ int main(int, char**) {
             label(renderer, big, "CPU CLOCK DIAGNOSTIC",
                   32, 70, 1216, green);
             label(renderer, small,
-                  "A Re-test  |  B Back  |  No clocks or voltages are changed",
+                  "A Read-only probe  |  X Boost 10s  |  B Restore / Back",
                   32, 112, 1216, muted);
             for (size_t i = 0;
-                 i < cpuClockDiagnosticLines.size() && i < 12;
+                 i < cpuClockDiagnosticLines.size() && i < 7;
                  ++i) {
                 label(renderer, small, cpuClockDiagnosticLines[i],
-                      48, 164 + static_cast<int>(i) * 39,
+                      48, 148 + static_cast<int>(i) * 32,
                       1160, i == 0 ? green : white);
+            }
+            label(renderer, small, "1224 MHz CPU WRITE EXPERIMENT",
+                  32, 390, 1216, green);
+            for (size_t i = 0;
+                 i < cpuClockBoostLines.size() && i < 7;
+                 ++i) {
+                label(renderer, small, cpuClockBoostLines[i],
+                      48, 423 + static_cast<int>(i) * 29,
+                      1160, white);
+            }
+            if (cpuClockBoostTrial.active()) {
+                label(renderer, small,
+                      "AUTOMATIC RESTORE IN " +
+                      std::to_string(cpuClockBoostTrial.secondsRemaining()) +
+                      " SECONDS",
+                      32, 636, 1216, green);
             }
 
         } else if (page == Page::ScrapeChoice) {
@@ -5584,6 +5620,10 @@ int main(int, char**) {
         SDL_RenderPresent(renderer);
     }
     stopping = true;
+    // Always attempt restoration before closing applet services.
+    if (cpuClockBoostTrial.active()) {
+        cpuClockBoostLines = cpuClockBoostTrial.stop("Application exit");
+    }
 
     if (
         liveSearchCancel &&
