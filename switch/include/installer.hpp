@@ -110,6 +110,15 @@ NetworkBenchmarkResult runNetworkBenchmark(
     const std::shared_ptr<std::atomic<bool>>& cancelRequested
 );
 
+// A bounded download-to-SD test; deletes its temporary sample afterwards.
+// Does not install content or store a complete game package.
+NetworkBenchmarkResult runDownloadFirstBenchmark(
+    const DebridConfig& config,
+    const InstallJob& job,
+    const std::string& tempDirectory,
+    const std::shared_ptr<std::atomic<bool>>& cancelRequested
+);
+
 InstallResult runInstallJob(
     const DebridConfig& config,
     const InstallJob& job,
