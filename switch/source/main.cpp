@@ -5714,8 +5714,8 @@ int main(int, char**) {
             }
             if (shopRows.empty()) {
                 label(renderer, big,
-                      pendingShopSearch.valid() ? "Reading NotUltraNX catalog..." :
-                      "No matching NotUltraNX base games",
+                      pendingShopSearch.valid() ? "Reading NotUltraNX website..." :
+                      "No matching NotUltraNX packages",
                       32, 300, 1200, muted);
             }
             const size_t visibleStart = (shopCursor / 7) * 7;
@@ -5734,7 +5734,7 @@ int main(int, char**) {
                       item.shop + "  |  " +
                       (item.size ? formatTransferBytes(item.size) :
                        std::string("Size unknown")) +
-                      "  |  Relay HTTP",
+                      "  |  HTTPS direct",
                       48, y+33, 1160, muted);
             }
 
