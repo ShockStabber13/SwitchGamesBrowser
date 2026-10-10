@@ -4154,8 +4154,8 @@ InstallResult runInstallJob(
             const bool onlineShop = job.source == "OpenNX Shop";
             std::string url;
             if (localShop || onlineShop) {
-                if (job.file.link.find('\\n') != std::string::npos ||
-                    job.file.link.find('\\r') != std::string::npos)
+                if (job.file.link.find('\n') != std::string::npos ||
+                    job.file.link.find('\r') != std::string::npos)
                     throw std::runtime_error("Invalid shop package URL");
                 url = job.file.link.substr(0, job.file.link.find('#'));
                 if ((localShop &&
