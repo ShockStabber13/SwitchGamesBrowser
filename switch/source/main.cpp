@@ -4117,8 +4117,8 @@ int main(int, char**) {
                         if (networkBenchmarkCancel)
                             networkBenchmarkCancel->store(true);
                         status = "Cancelling speed benchmark...";
-                    } else if (pendingInstall.valid()) {
-                        status = "Finish the installation before benchmarking";
+                    } else if (pendingInstall.valid() || pendingDownload.valid()) {
+                        status = "Finish the current transfer before benchmarking";
                     } else {
                         const auto job = installRows[installManagerCursor].job;
                         const auto config = debridConfig;
@@ -4208,6 +4208,9 @@ int main(int, char**) {
                         row.state == "Failed" ||
                         row.state == "Cancelled"
                     ) {
+                        if (row.job.savedPath.empty()) {
+                            status = "Use Download Manager to download this game first";
+                        } else {
                         row.state = "Queued";
                         row.progress = 0;
                         row.error.clear();
@@ -4219,6 +4222,7 @@ int main(int, char**) {
 
                         status =
                             "Install queued again";
+                        }
                     }
                 }
 
@@ -4234,6 +4238,9 @@ int main(int, char**) {
 
                         status =
                             "Cancelling install...";
+                    }
+                    else if (pendingDownload.valid()) {
+                        status = "Wait until the current download finishes";
                     }
                     else {
                         const size_t removedIndex =
