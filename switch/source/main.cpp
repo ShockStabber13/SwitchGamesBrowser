@@ -3880,16 +3880,17 @@ int main(int, char**) {
             }
 
             if (!installRows.empty()) {
-                // ZL measures the selected debrid file without writing to SD.
-                // AllDebrid uses one continuous HTTP stream; TorBox retains
-                // its separate 1x/4x comparison. No installation is started.
-                if (keys & HidNpadButton_ZL) {
+                // ZL: existing network-only test (1x/4x).
+                // ZR: download a bounded 64 MiB sample to SD, measure
+                // download+write and read-back, then delete the sample.
+                if (keys & (HidNpadButton_ZL | HidNpadButton_ZR)) {
+                    const bool toSd = (keys & HidNpadButton_ZR) != 0;
                     if (pendingNetworkBenchmark.valid()) {
                         if (networkBenchmarkCancel)
                             networkBenchmarkCancel->store(true);
-                        status = "Cancelling network benchmark...";
+                        status = "Cancelling speed benchmark...";
                     } else if (pendingInstall.valid()) {
-                        status = "Finish the installation before testing HTTP";
+                        status = "Finish the installation before benchmarking";
                     } else {
                         const auto job = installRows[installManagerCursor].job;
                         const auto config = debridConfig;
@@ -3898,12 +3899,14 @@ int main(int, char**) {
                             std::make_shared<std::atomic<bool>>(false);
                         auto cancel = networkBenchmarkCancel;
                         installRows[installManagerCursor].benchmarkResult =
-                            config.service == sgb::DebridService::AllDebrid
+                            toSd ? "Download First: 64 MiB to SD speed test running..."
+                            : config.service == sgb::DebridService::AllDebrid
                                 ? "AllDebrid HTTP-only 1x test running..."
                                 : "TorBox HTTP-only test running (1x then 4x)...";
-                        status = config.service == sgb::DebridService::AllDebrid
-                            ? "Measuring AllDebrid CDN: 1 connection, no SD..."
-                            : "Benchmarking TorBox HTTP with no SD writes...";
+                        status = toSd ? "Measuring Download First to microSD (no install)..."
+                            : config.service == sgb::DebridService::AllDebrid
+                                ? "Measuring AllDebrid CDN: 1 connection, no SD..."
+                                : "Benchmarking TorBox HTTP with no SD writes...";
                         // Apply the same CPU boost as a real install.
                         if (!installCpuBoosted && !cpuClockBoostTrial.held()) {
                             appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
@@ -3911,7 +3914,11 @@ int main(int, char**) {
                         }
                         pendingNetworkBenchmark = std::async(
                             std::launch::async,
-                            [config, job, cancel]() {
+                            [config, job, cancel, toSd]() {
+                                if (toSd) {
+                                    return sgb::runDownloadFirstBenchmark(
+                                        config, job, root, cancel);
+                                }
                                 return sgb::runNetworkBenchmark(
                                     config, job, cancel);
                             });
@@ -4812,7 +4819,7 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "ZL HTTP Test | A Details | X Cancel/Remove | Y Retry | L/R Page | B Back",
+                "ZL HTTP Test | ZR Download First Test | A Details | X Cancel/Remove | Y Retry | B Back",
                 32,112,1200,muted
             );
 
