@@ -34,7 +34,16 @@ struct ShopSearchResult {
 // Read OpenNX's Tinfoil index plus linked public JSON shop indexes.
 // Private credentials, Tinfoil-specific protocols, and custom headers
 // are not transferred automatically.
-// Search the locally running CyberFoil Stage4A relay, primed through DBI.
+// Shop option #3: scrape the NotUltraNX public website for Base,
+// Update and DLC download options. The API is used ONLY for the official
+// short-lived download redirect, never for catalog search.
+ShopSearchResult searchNotUltraNxWebsite(
+    const std::string& title,
+    const std::string& titleId,
+    ShopSearchProgress& progress,
+    const std::shared_ptr<std::atomic<bool>>& cancel);
+
+// Legacy relay entry point, retained for source compatibility.
 ShopSearchResult searchNotUltraNxRelay(
     const std::string& title,
     ShopSearchProgress& progress,
