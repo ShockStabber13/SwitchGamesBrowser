@@ -1,0 +1,52 @@
+name: Generate NotUltraNX offline catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_site:
+        description: "Scan public NotUltraNX listing pages too? Leave unchecked if rate-limited."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate catalog from saved IDs and public TitleDB names
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.scan_site }}" == "true" ]]; then
+            python3 tools/build_notultranx_catalog.py --scan-site
+          else
+            python3 tools/build_notultranx_catalog.py
+          fi
+
+      - name: Upload microSD-ready catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: notultranx-catalog
+          path: data/notultranx-catalog.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Commit generated catalog for direct download
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/notultranx-catalog.json
+          if git diff --cached --quiet; then
+            echo "Catalog already up to date."
+          else
+            git commit -m "Update downloadable NotUltraNX offline catalog [skip ci]"
+            git push origin HEAD:main
+          fi
