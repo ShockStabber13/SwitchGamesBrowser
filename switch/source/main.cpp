@@ -1851,6 +1851,10 @@ int main(int, char**) {
             config.value("notUltraNxConnections", 8u);
         debridConfig.notUltraNxConnections =
             shopConnections == 4u ? 4u : 8u;
+        const unsigned int debridConnections =
+            config.value("debridDownloadConnections", 8u);
+        debridConfig.debridDownloadConnections =
+            debridConnections == 4u ? 4u : 8u;
 
         if (
             config.contains("enabledProviders") &&
@@ -1901,6 +1905,7 @@ int main(int, char**) {
                     {"debridApiKey", debridConfig.apiKey},
                     {"notUltraNxToken", debridConfig.notUltraNxToken},
                     {"notUltraNxConnections", debridConfig.notUltraNxConnections},
+                    {"debridDownloadConnections", debridConfig.debridDownloadConnections},
                     {"enabledProviders", providerArray}
                 }.dump(2)
             );
@@ -2949,7 +2954,8 @@ int main(int, char**) {
                 row.bytesTotal = total;
                 row.bytesPerSecond = speed;
                 row.networkBytesPerSecond = netSpeed;
-                if (row.job.source == "NotUltraNX Website") {
+                if (row.job.source == "NotUltraNX Website" ||
+                    !row.job.remoteId.empty()) {
                     constexpr std::uint64_t nsPerMs = 1000000;
                     row.sdWriteMs = activeDownloadProgress->
                         writerActiveNanoseconds.load() / nsPerMs;
@@ -3556,7 +3562,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 12)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 13)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -3844,6 +3850,14 @@ int main(int, char**) {
                     saveConfig();
                     status = "NotUltraNX: " +
                         std::to_string(debridConfig.notUltraNxConnections) +
+                        " HTTP streams on next download";
+                }
+                else if (settingsCursor == 13) {
+                    debridConfig.debridDownloadConnections =
+                        debridConfig.debridDownloadConnections == 4u ? 8u : 4u;
+                    saveConfig();
+                    status = "TorBox / AllDebrid: " +
+                        std::to_string(debridConfig.debridDownloadConnections) +
                         " HTTP streams on next download";
                 }
             }
@@ -5312,7 +5326,8 @@ int main(int, char**) {
                     std::min(downloadManagerCursor, installRows.size()-1)];
                 if (selected.state == "Downloading" && selected.hasTimings) {
                     label(renderer, small,
-                          "NotUltraNX " +
+                          (selected.job.source == "NotUltraNX Website"
+                               ? "NotUltraNX " : "Debrid ") +
                           std::to_string(selected.downloadConnections) +
                           " streams | SD writing " +
                           std::to_string(selected.sdWriteMs) +
@@ -5517,7 +5532,8 @@ int main(int, char**) {
                 "Download / Update NotUltraNX Catalog",
                 "NotUltraNX Sign In / Sign Out",
                 "Check NotUltraNX Authorization",
-                "NotUltraNX Download Connections"
+                "NotUltraNX Download Connections",
+                "Debrid Download Connections"
             };
 
             for (
@@ -5528,10 +5544,10 @@ int main(int, char**) {
                 const int y =
                     145 +
                     static_cast<int>(i) *
-                        38;
+                        34;
 
                 SDL_Rect box{
-                    32,y,1216,35
+                    32,y,1216,32
                 };
 
                 rect(
@@ -5605,6 +5621,10 @@ int main(int, char**) {
                 else if (i == 12) {
                     value = std::to_string(
                         debridConfig.notUltraNxConnections) + " streams";
+                }
+                else if (i == 13) {
+                    value = std::to_string(
+                        debridConfig.debridDownloadConnections) + " streams";
                 }
                 else if (i == 9) {
                     if (pendingNotUltraNxCatalog.valid()) {
