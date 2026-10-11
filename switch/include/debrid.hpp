@@ -19,6 +19,8 @@ enum class DebridService {
 struct DebridConfig {
     DebridService service = DebridService::None;
     std::string apiKey;
+    // NotUltraNX website session. Password is never persisted.
+    std::string notUltraNxToken;
 };
 
 struct DebridCandidate {
