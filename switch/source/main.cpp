@@ -3484,83 +3484,80 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Down) && optionsCursor < 7)
                 ++optionsCursor;
 
-            if (keys & HidNpadButton_B) {
+            if (keys & HidNpadButton_B)
                 page = Page::Browse;
+
+            // Filter values respond to Left/Right as well as A. Left walks
+            // backwards (including genres), Right/A forwards. Search uses
+            // the keyboard, while Reset/Back are action-only menu items.
+            auto adjustFilter = [&](bool forward) {
+                if (optionsCursor == 1) {
+                    const int current = static_cast<int>(filter.sort);
+                    filter.sort = static_cast<sgb::Sort>(
+                        (current + (forward ? 1 : 2)) % 3);
+                } else if (optionsCursor == 2) {
+                    std::set<std::string> genres;
+                    for (const auto& game : games)
+                        for (const auto& genre : game.genres)
+                            if (!genre.empty()) genres.insert(genre);
+                    std::vector<std::string> choices{""};
+                    choices.insert(choices.end(), genres.begin(), genres.end());
+                    auto found = std::find(
+                        choices.begin(), choices.end(), filter.genre);
+                    const size_t index = found == choices.end()
+                        ? 0 : static_cast<size_t>(found - choices.begin());
+                    const size_t count = choices.size();
+                    filter.genre = choices[forward
+                        ? (index + 1) % count
+                        : (index + count - 1) % count];
+                } else if (optionsCursor == 3) {
+                    constexpr double levels[]{0, 70, 80, 90};
+                    size_t index = 0;
+                    for (size_t i = 0; i < 4; ++i)
+                        if (filter.minRating == levels[i]) index = i;
+                    filter.minRating = levels[forward
+                        ? (index + 1) % 4 : (index + 3) % 4];
+                } else if (optionsCursor == 4) {
+                    constexpr int levels[]{0, 10, 50, 100};
+                    size_t index = 0;
+                    for (size_t i = 0; i < 4; ++i)
+                        if (filter.minReviews == levels[i]) index = i;
+                    filter.minReviews = levels[forward
+                        ? (index + 1) % 4 : (index + 3) % 4];
+                } else if (optionsCursor == 5) {
+                    filter.favouritesOnly = !filter.favouritesOnly;
+                } else {
+                    return;
+                }
+                cursor = 0;
+                rebuild();
+            };
+
+            if (optionsCursor >= 1 && optionsCursor <= 5) {
+                if (keys & HidNpadButton_Left)
+                    adjustFilter(false);
+                else if (keys & HidNpadButton_Right)
+                    adjustFilter(true);
             }
 
             if (keys & HidNpadButton_A) {
                 if (optionsCursor == 0) {
                     filter.search = keyboard(
-                        "Search Switch games",
-                        filter.search
-                    );
+                        "Search Switch games", filter.search);
                     cursor = 0;
                     rebuild();
-                }
-                else if (optionsCursor == 1) {
-                    filter.sort = static_cast<sgb::Sort>(
-                        (static_cast<int>(filter.sort) + 1) % 3
-                    );
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 2) {
-                    std::set<std::string> genres;
-                    for (const auto& game : games) {
-                        for (const auto& genre : game.genres)
-                            genres.insert(genre);
-                    }
-
-                    if (filter.genre.empty()) {
-                        if (!genres.empty())
-                            filter.genre = *genres.begin();
-                    }
-                    else {
-                        auto next = genres.upper_bound(filter.genre);
-                        filter.genre =
-                            next == genres.end()
-                                ? ""
-                                : *next;
-                    }
-
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 3) {
-                    filter.minRating =
-                        filter.minRating == 0 ? 70 :
-                        filter.minRating == 70 ? 80 :
-                        filter.minRating == 80 ? 90 : 0;
-
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 4) {
-                    filter.minReviews =
-                        filter.minReviews == 0 ? 10 :
-                        filter.minReviews == 10 ? 50 :
-                        filter.minReviews == 50 ? 100 : 0;
-
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 5) {
-                    filter.favouritesOnly =
-                        !filter.favouritesOnly;
-
-                    cursor = 0;
-                    rebuild();
-                }
-                else if (optionsCursor == 6) {
+                } else if (optionsCursor >= 1 && optionsCursor <= 5) {
+                    adjustFilter(true);
+                } else if (optionsCursor == 6) {
                     filter = {};
                     cursor = 0;
                     rebuild();
                     status = "Filters reset";
-                }
-                else {
+                } else {
                     page = Page::Browse;
                 }
-            }        } else if (page == Page::Settings) {
+            }
+        } else if (page == Page::Settings) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
@@ -4747,7 +4744,7 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "A Change / Select  |  B Back",
+                "Left/Right Change  |  A Edit / Select  |  B Back",
                 32,112,1200,muted
             );
 
