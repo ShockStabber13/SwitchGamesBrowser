@@ -13,6 +13,8 @@
 #include "provider_diagnostics.hpp"
 #include "cpu_clock_diag.hpp"
 #include <atomic>
+#include <algorithm>
+#include <stdexcept>
 #include <chrono>
 #include <cstdio>
 #include <future>
@@ -707,14 +709,116 @@ static std::string downloadLangegenCatalog(
         return e.what();
     }
 }
-static std::string keyboard(const char* label, const std::string& initial) {
+static std::string keyboard(const char* label, const std::string& initial,
+                            bool password = false) {
     SwkbdConfig config; char out[256]{};
     if (R_FAILED(swkbdCreate(&config, 0))) return initial;
-    swkbdConfigMakePresetDefault(&config);
-    swkbdConfigSetHeaderText(&config, label); swkbdConfigSetInitialText(&config, initial.c_str());
+    if (password) swkbdConfigMakePresetPassword(&config);
+    else swkbdConfigMakePresetDefault(&config);
+    swkbdConfigSetHeaderText(&config, label);
+    if (!password) swkbdConfigSetInitialText(&config, initial.c_str());
     swkbdConfigSetStringLenMax(&config, sizeof(out)-1);
     auto result = swkbdShow(&config, out, sizeof(out)); swkbdClose(&config);
-    return R_SUCCEEDED(result) ? std::string(out) : initial;
+    const std::string typed = R_SUCCEEDED(result) ? std::string(out) : initial;
+    std::fill(std::begin(out), std::end(out), '\0');
+    return typed;
+}
+// Only the HTTPS NotUltraNX API receives credentials. It must never redirect
+// an authenticated request or disclose passwords/tokens in status text.
+static std::pair<long, std::string> ultraNxAuthRequest(
+    const std::string& endpoint,
+    const std::string& form,
+    const std::string& token)
+{
+    if (endpoint != "/auth/login" && endpoint != "/auth/users/me")
+        throw std::runtime_error("Unexpected NotUltraNX auth endpoint");
+    if (token.find_first_of("\r\n") != std::string::npos)
+        throw std::runtime_error("Invalid NotUltraNX token");
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>
+        curl(curl_easy_init(), curl_easy_cleanup);
+    if (!curl) throw std::runtime_error("NotUltraNX HTTPS initialization failed");
+    const std::string url = "https://api.ultranx.ru" + endpoint;
+    Download body{{}, 16 * 1024};
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "SwitchGamesBrowser/0.4");
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT, 12L);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 25L);
+    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+    curl_easy_setopt(curl.get(), CURLOPT_CAINFO, "romfs:/cacert.pem");
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, receive);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &body);
+    curl_slist* headers = nullptr;
+    if (endpoint == "/auth/login") {
+        headers = curl_slist_append(
+            headers, "Content-Type: application/x-www-form-urlencoded");
+        curl_easy_setopt(curl.get(), CURLOPT_POST, 1L);
+        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS, form.c_str());
+        curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE,
+                         static_cast<long>(form.size()));
+    } else {
+        const std::string bearer = "Authorization: Bearer " + token;
+        headers = curl_slist_append(headers, bearer.c_str());
+    }
+    if (!headers)
+        throw std::runtime_error("NotUltraNX auth headers unavailable");
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers);
+    const CURLcode rc = curl_easy_perform(curl.get());
+    long status = 0;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
+    curl_slist_free_all(headers);
+    if (rc != CURLE_OK)
+        throw std::runtime_error("NotUltraNX authentication network error");
+    return {status, body.bytes};
+}
+static std::string ultraNxLogin(const std::string& username,
+                                const std::string& password)
+{
+    CURL* encode = curl_easy_init();
+    if (!encode) throw std::runtime_error("NotUltraNX login unavailable");
+    char* user = curl_easy_escape(encode, username.c_str(),
+                                  static_cast<int>(username.size()));
+    char* pass = curl_easy_escape(encode, password.c_str(),
+                                  static_cast<int>(password.size()));
+    if (!user || !pass) {
+        if (user) curl_free(user);
+        if (pass) curl_free(pass);
+        curl_easy_cleanup(encode);
+        throw std::runtime_error("Cannot encode NotUltraNX credentials");
+    }
+    std::string form = std::string("username=") + user +
+                       "&password=" + pass;
+    curl_free(user); curl_free(pass); curl_easy_cleanup(encode);
+    std::pair<long, std::string> reply;
+    try { reply = ultraNxAuthRequest("/auth/login", form, ""); }
+    catch (...) {
+        std::fill(form.begin(), form.end(), '\0');
+        throw;
+    }
+    std::fill(form.begin(), form.end(), '\0');
+    if (reply.first != 200)
+        throw std::runtime_error(
+            "NotUltraNX login failed (HTTP " + std::to_string(reply.first) + ")");
+    const auto json = sgb::Json::parse(reply.second, nullptr, false);
+    if (!json.is_object() ||
+        !json.contains("access_token") ||
+        !json["access_token"].is_string())
+        throw std::runtime_error("NotUltraNX login did not return a session");
+    std::string token = json["access_token"].get<std::string>();
+    if (token.empty() ||
+        token.find_first_of("\r\n") != std::string::npos)
+        throw std::runtime_error("NotUltraNX returned invalid credentials");
+    return token;
+}
+static bool ultraNxLoginValid(const std::string& token) {
+    if (token.empty()) return false;
+    const auto response = ultraNxAuthRequest(
+        "/auth/users/me", "", token);
+    return response.first == 200;
 }
 static void rect(SDL_Renderer* r, SDL_Rect box, SDL_Color colour, bool outline = false) {
     SDL_SetRenderDrawColor(r, colour.r, colour.g, colour.b, colour.a);
@@ -1739,6 +1843,8 @@ int main(int, char**) {
 
         debridConfig.apiKey =
             config.value("debridApiKey", "");
+        debridConfig.notUltraNxToken =
+            config.value("notUltraNxToken", "");
 
         if (
             config.contains("enabledProviders") &&
@@ -1787,6 +1893,7 @@ int main(int, char**) {
                     {"indexUrl", url},
                     {"debridService", service},
                     {"debridApiKey", debridConfig.apiKey},
+                    {"notUltraNxToken", debridConfig.notUltraNxToken},
                     {"enabledProviders", providerArray}
                 }.dump(2)
             );
@@ -3430,7 +3537,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 9)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 11)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -3667,6 +3774,49 @@ int main(int, char**) {
                                 return sgb::downloadNotUltraNxCatalog(
                                     catalogPath, notUltraNxCatalogProgress, cancel);
                             });
+                    }
+                }
+                else if (settingsCursor == 10) {
+                    if (!debridConfig.notUltraNxToken.empty()) {
+                        debridConfig.notUltraNxToken.clear();
+                        saveConfig();
+                        status = "NotUltraNX signed out";
+                    } else {
+                        const std::string username = keyboard(
+                            "NotUltraNX username", "");
+                        if (username.size() < 4) {
+                            status = "NotUltraNX login cancelled / username too short";
+                        } else {
+                            std::string password = keyboard(
+                                "NotUltraNX password", "", true);
+                            if (password.size() < 8) {
+                                status = "NotUltraNX login cancelled / password too short";
+                            } else {
+                                try {
+                                    const std::string token = ultraNxLogin(
+                                        username, password);
+                                    std::fill(password.begin(), password.end(), '\0');
+                                    if (!ultraNxLoginValid(token))
+                                        throw std::runtime_error(
+                                            "NotUltraNX token could not be verified");
+                                    debridConfig.notUltraNxToken = token;
+                                    saveConfig();
+                                    status = "NotUltraNX signed in";
+                                } catch (const std::exception& e) {
+                                    status = e.what();
+                                }
+                            }
+                            std::fill(password.begin(), password.end(), '\0');
+                        }
+                    }
+                }
+                else if (settingsCursor == 11) {
+                    try {
+                        status = ultraNxLoginValid(debridConfig.notUltraNxToken)
+                            ? "NotUltraNX session is valid"
+                            : "NotUltraNX session missing or expired. Sign in.";
+                    } catch (const std::exception& e) {
+                        status = e.what();
                     }
                 }
             }
@@ -5326,7 +5476,9 @@ int main(int, char**) {
                 "Download Manager",
                 "Install Manager",
                 "CPU Clock Settings",
-                "Download / Update NotUltraNX Catalog"
+                "Download / Update NotUltraNX Catalog",
+                "NotUltraNX Sign In / Sign Out",
+                "Check NotUltraNX Authorization"
             };
 
             for (
@@ -5337,10 +5489,10 @@ int main(int, char**) {
                 const int y =
                     145 +
                     static_cast<int>(i) *
-                        54;
+                        43;
 
                 SDL_Rect box{
-                    32,y,1216,50
+                    32,y,1216,40
                 };
 
                 rect(
@@ -5399,6 +5551,17 @@ int main(int, char**) {
                         catalogFile.good()
                             ? "Installed"
                             : "Not downloaded";
+                }
+                else if (i == 10) {
+                    labels[i] = debridConfig.notUltraNxToken.empty()
+                        ? "Sign In to NotUltraNX"
+                        : "Sign Out of NotUltraNX";
+                    value = debridConfig.notUltraNxToken.empty()
+                        ? "Not signed in" : "Session saved";
+                }
+                else if (i == 11) {
+                    value = debridConfig.notUltraNxToken.empty()
+                        ? "Sign in first" : "A to verify";
                 }
                 else if (i == 9) {
                     if (pendingNotUltraNxCatalog.valid()) {
