@@ -4297,6 +4297,7 @@ static std::string downloadFullGame(
 // for catalog discovery, and signed Yandex URLs are never persisted.
 struct UltraNxProbe {
     u64 size = 0;
+    std::string downloadUrl;
     std::string filename;
     std::string contentRange;
     std::string disposition;
@@ -4311,6 +4312,79 @@ static std::size_t ultraNxProbeBody(char*, std::size_t size,
         return 0; // Never download a full game while probing.
     probe.received += n;
     return n;
+}
+// Authenticate only against the exact NotUltraNX API host. Never send the
+// session token or cookie to Yandex, mirrors, or any redirected host.
+static std::string resolveUltraNxAuthenticatedLink(
+    const std::string& originalUrl,
+    const std::string& token,
+    const std::shared_ptr<std::atomic<bool>>& cancel)
+{
+    if (token.empty())
+        throw std::runtime_error(
+            "NotUltraNX login required. Sign in from Settings.");
+    if (token.find_first_of("\r\n") != std::string::npos)
+        throw std::runtime_error("Invalid NotUltraNX session");
+    std::string next = originalUrl;
+    for (int hop = 0; hop < 5; ++hop) {
+        if (next.rfind("https://api.ultranx.ru/", 0) != 0)
+            return next;
+        if (cancel && cancel->load())
+            throw std::runtime_error("Download cancelled");
+        CURL* curl = curl_easy_init();
+        if (!curl)
+            throw std::runtime_error("NotUltraNX HTTPS unavailable");
+        curl_slist* auth = nullptr;
+        const std::string header = "Authorization: Bearer " + token;
+        const std::string cookie = "auth_token=" + token;
+        auth = curl_slist_append(auth, header.c_str());
+        if (!auth) {
+            curl_easy_cleanup(curl);
+            throw std::runtime_error("NotUltraNX auth initialization failed");
+        }
+        UltraNxProbe probe;
+        curl_easy_setopt(curl, CURLOPT_URL, next.c_str());
+        curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 12L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 45L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 SwitchGamesBrowser/0.4");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, auth);
+        curl_easy_setopt(curl, CURLOPT_COOKIE, cookie.c_str());
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+#ifdef __SWITCH__
+        curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
+#endif
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ultraNxProbeBody);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &probe);
+        const CURLcode rc = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        char* redirect = nullptr;
+        curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &redirect);
+        const std::string location = redirect ? redirect : "";
+        curl_slist_free_all(auth);
+        curl_easy_cleanup(curl);
+        if (status == 401 || status == 403)
+            throw std::runtime_error(
+                "NotUltraNX login expired or download not permitted (HTTP " +
+                std::to_string(status) + "). Check login in Settings.");
+        if (rc != CURLE_OK && status < 300)
+            throw std::runtime_error("NotUltraNX download authorization failed");
+        if (status < 300 || status >= 400 || location.empty())
+            throw std::runtime_error(
+                "NotUltraNX did not return an authorized download redirect (HTTP " +
+                std::to_string(status) + ")");
+        if (location.rfind("https://", 0) != 0 ||
+            location.find_first_of("\r\n") != std::string::npos)
+            throw std::runtime_error("NotUltraNX returned an unsafe download redirect");
+        next = location;
+    }
+    throw std::runtime_error("Too many NotUltraNX API redirects");
 }
 static std::size_t ultraNxProbeHeader(char* data, std::size_t size,
                                       std::size_t nmemb, void* user) {
@@ -4390,6 +4464,9 @@ static UltraNxProbe probeUltraNxPackage(
     const CURLcode rc = curl_easy_perform(curl);
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    char* finalUrl = nullptr;
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &finalUrl);
+    if (finalUrl) probe.downloadUrl = finalUrl;
     curl_easy_cleanup(curl);
     if (cancel && cancel->load())
         throw std::runtime_error("Download cancelled");
@@ -4467,7 +4544,13 @@ InstallResult runDownloadJob(
                          url.rfind("https://api.ultranx.ru/download/", 0) != 0)))
                     throw std::runtime_error("Shop URL is not an allowed source");
                 if (websiteShop) {
+                    // Resolve the authenticated API redirect once. Probe and
+                    // download the signed file URL without any credentials.
+                    url = resolveUltraNxAuthenticatedLink(
+                        url, config.notUltraNxToken, cancelRequested);
                     const auto data = probeUltraNxPackage(url, cancelRequested);
+                    if (!data.downloadUrl.empty())
+                        url = data.downloadUrl;
                     resolvedJob.file.size = data.size;
                     // The website labels may say NSZ, but DLC bundles can
                     // be ZIP archives. Keep a safe display basename while
