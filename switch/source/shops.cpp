@@ -549,7 +549,9 @@ std::vector<WebsiteCatalogRow> loadWebsiteCatalog(
     std::ifstream input(path, std::ios::binary | std::ios::ate);
     if (!input) return {};
     const auto size = input.tellg();
-    if (size <= 0 || size > 20 * 1024 * 1024)
+    // Older catalogs retain substantial cardText around each ID.
+    // A complete merged catalog can exceed 20 MiB without being corrupt.
+    if (size <= 0 || size > 48LL * 1024 * 1024)
         return {};
     input.seekg(0);
     const std::string bytes(
