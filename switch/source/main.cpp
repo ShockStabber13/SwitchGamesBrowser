@@ -1436,6 +1436,7 @@ struct InstallQueueRow {
     std::uint64_t sdWriteMs = 0;
     std::uint64_t httpWaitMs = 0;
     std::uint64_t bufferWaitMs = 0;
+    std::uint64_t downloadConnections = 0;
     bool hasTimings = false;
     std::string benchmarkResult;
     std::string error;
@@ -2943,6 +2944,16 @@ int main(int, char**) {
                 row.bytesTotal = total;
                 row.bytesPerSecond = speed;
                 row.networkBytesPerSecond = netSpeed;
+                if (row.job.source == "NotUltraNX Website") {
+                    constexpr std::uint64_t nsPerMs = 1000000;
+                    row.sdWriteMs = activeDownloadProgress->
+                        writerActiveNanoseconds.load() / nsPerMs;
+                    row.bufferWaitMs = activeDownloadProgress->
+                        producerBackpressureNanoseconds.load() / nsPerMs;
+                    row.downloadConnections = activeDownloadProgress->
+                        parallelEntryCount.load();
+                    row.hasTimings = row.downloadConnections > 0;
+                }
             }
             if (pendingDownload.wait_for(std::chrono::milliseconds(0)) ==
                 std::future_status::ready) {
@@ -2994,6 +3005,8 @@ int main(int, char**) {
                 row.progress = 0;
                 row.bytesDone = row.bytesTotal = 0;
                 row.bytesPerSecond = row.networkBytesPerSecond = 0;
+                row.sdWriteMs = row.bufferWaitMs = row.downloadConnections = 0;
+                row.hasTimings = false;
                 row.error.clear();
                 persistInstallQueue();
                 if (!installCpuBoosted && !cpuClockBoostTrial.held()) {
@@ -5284,9 +5297,20 @@ int main(int, char**) {
                 }
                 const auto& selected = installRows[
                     std::min(downloadManagerCursor, installRows.size()-1)];
-                if (!selected.job.savedPath.empty())
+                if (selected.state == "Downloading" && selected.hasTimings) {
+                    label(renderer, small,
+                          "NotUltraNX " +
+                          std::to_string(selected.downloadConnections) +
+                          " streams | SD writing " +
+                          std::to_string(selected.sdWriteMs) +
+                          " ms | queue blocked " +
+                          std::to_string(selected.bufferWaitMs) +
+                          " ms (sum across workers)",
+                          32,647,1216,green);
+                } else if (!selected.job.savedPath.empty()) {
                     label(renderer,small,"Saved to " + selected.job.savedPath,
                           32,647,1216,green);
+                }
             }
 
         } else if (page == Page::InstallManager) {
