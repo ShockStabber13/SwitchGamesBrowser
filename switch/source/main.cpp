@@ -14,6 +14,7 @@
 #include "cpu_clock_diag.hpp"
 #include <atomic>
 #include <algorithm>
+#include <iterator>
 #include <stdexcept>
 #include <chrono>
 #include <cstdio>
