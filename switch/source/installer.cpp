@@ -4045,6 +4045,7 @@ static std::string downloadFullGame(
     const std::string& url,
     const InstallJob& job,
     bool sphairaStyleBuffering,
+    unsigned int requestedConnections,
     InstallProgress& progress,
     const std::shared_ptr<std::atomic<bool>>& cancel)
 {
@@ -4133,138 +4134,172 @@ static std::string downloadFullGame(
     progress.beginTransfer(job.file.size);
     progress.set("Downloading", 0, job.file.name);
 
-    // Match Sphaira's 4 MiB multi-threaded file-copy buffers, with space
-    // for two pending chunks. The HTTP producer accumulates incoming curl
-    // callbacks and the SD writer runs on a separate worker thread.
+    // Four independent HTTP/1.1 byte ranges for NotUltraNX's signed
+    // file URL. Other providers retain the original single connection.
+    // One SD writer serializes all writes to the preallocated file while
+    // accepting out-of-order ranges at their exact offsets.
     constexpr std::size_t blockSize = 4 * 1024 * 1024;
     constexpr std::size_t maxBuffered = 2 * blockSize;
+    const unsigned int connections =
+        requestedConnections >= 4 &&
+        job.file.size >= 4ULL * blockSize ? 4u : 1u;
+    struct PendingChunk {
+        u64 offset = 0;
+        std::vector<u8> bytes;
+    };
     std::mutex mutex;
     std::condition_variable cv;
-    std::deque<std::vector<u8>> pending;
+    std::deque<PendingChunk> pending;
     std::vector<std::vector<u8>> recycled;
     std::size_t pendingBytes = 0;
     bool networkDone = false;
     std::exception_ptr writeError;
     std::exception_ptr networkError;
-    std::atomic<bool> networkSucceeded{false};
+    std::atomic<bool> stopWorkers{false};
+    u64 writtenBytes = 0;
 
     std::thread writer([&]() {
         try {
-            // Keep the real file position independent of UI counters, like
-            // upstream Sphaira's dedicated write_offset.
-            u64 writeOffset = 0;
             for (;;) {
-                std::vector<u8> chunk;
+                PendingChunk chunk;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
                     cv.wait(lock, [&] {
                         return !pending.empty() || networkDone ||
+                               stopWorkers.load() ||
                                (cancel && cancel->load());
                     });
                     if (cancel && cancel->load())
                         throw std::runtime_error("Download cancelled");
+                    if (stopWorkers.load())
+                        throw std::runtime_error("HTTP range worker stopped");
                     if (pending.empty()) {
                         if (networkDone) break;
                         continue;
                     }
                     chunk = std::move(pending.front());
                     pending.pop_front();
-                    pendingBytes -= chunk.size();
+                    pendingBytes -= chunk.bytes.size();
                     cv.notify_all();
                 }
-                if (cancel && cancel->load())
-                    throw std::runtime_error("Download cancelled");
-                if (writeOffset > job.file.size ||
-                    chunk.size() > job.file.size - writeOffset)
-                    throw std::runtime_error("Download wrote beyond expected package size");
+                if (chunk.offset > job.file.size ||
+                    chunk.bytes.size() > job.file.size - chunk.offset)
+                    throw std::runtime_error(
+                        "Download chunk lies outside expected file");
                 const Result rc = fsFileWrite(
-                    &output.fd, writeOffset,
-                    chunk.data(), chunk.size(), FsWriteOption_None);
+                    &output.fd, chunk.offset,
+                    chunk.bytes.data(), chunk.bytes.size(), FsWriteOption_None);
                 if (R_FAILED(rc))
                     throw std::runtime_error(
                         "microSD native write failed (FS " +
                         std::to_string(static_cast<unsigned>(rc)) + ")");
-                writeOffset += chunk.size();
-                progress.addTransferBytes(chunk.size());
-                // This is the number of bytes safely handed to the SD writer;
-                // do not use HTTP-only counters as evidence of saved data.
-                progress.addNetworkBytes(chunk.size());
-                // Return the 4 MiB allocation to the producer, similar to
-                // Sphaira's buffer-swap ring instead of reallocating chunks.
-                chunk.clear();
+                writtenBytes += chunk.bytes.size();
+                progress.addTransferBytes(chunk.bytes.size());
+                progress.addNetworkBytes(chunk.bytes.size());
+                chunk.bytes.clear();
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    recycled.emplace_back(std::move(chunk));
+                    recycled.emplace_back(std::move(chunk.bytes));
                     cv.notify_all();
                 }
             }
-            if (networkSucceeded.load()) {
-                if (writeOffset != job.file.size)
-                    throw std::runtime_error("Incomplete SD download after writer finished");
-                const Result rc = fsFileFlush(&output.fd);
-                if (R_FAILED(rc))
-                    throw std::runtime_error(
-                        "microSD flush failed (FS " +
-                        std::to_string(static_cast<unsigned>(rc)) + ")");
-            }
+            // Every range worker validates its exact HTTP 206 byte count.
+            // Nonoverlapping segments plus this total ensure complete output.
+            if (writtenBytes != job.file.size)
+                throw std::runtime_error("Incomplete SD download");
+            const Result rc = fsFileFlush(&output.fd);
+            if (R_FAILED(rc))
+                throw std::runtime_error(
+                    "microSD flush failed (FS " +
+                    std::to_string(static_cast<unsigned>(rc)) + ")");
         } catch (...) {
             std::lock_guard<std::mutex> lock(mutex);
             writeError = std::current_exception();
+            stopWorkers.store(true);
             cv.notify_all();
         }
     });
 
+    const auto producer = [&](u64 segmentOffset, u64 segmentSize) {
+        try {
+            std::vector<u8> staging;
+            staging.reserve(blockSize);
+            u64 nextOffset = segmentOffset;
+            const auto enqueue = [&]() {
+                if (staging.empty()) return;
+                const std::size_t n = staging.size();
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [&] {
+                        return pendingBytes + n <= maxBuffered ||
+                               writeError || stopWorkers.load() ||
+                               (cancel && cancel->load());
+                    });
+                    if (writeError)
+                        std::rethrow_exception(writeError);
+                    if (cancel && cancel->load())
+                        throw std::runtime_error("Download cancelled");
+                    if (stopWorkers.load())
+                        throw std::runtime_error("Download range interrupted");
+                    pendingBytes += n;
+                    pending.push_back({nextOffset, std::move(staging)});
+                    nextOffset += n;
+                    if (!recycled.empty()) {
+                        staging = std::move(recycled.back());
+                        recycled.pop_back();
+                    }
+                    cv.notify_all();
+                }
+                staging.clear();
+                if (staging.capacity() < blockSize)
+                    staging.reserve(blockSize);
+            };
+            // Independent curl handle and TCP connection for each segment.
+            HttpPackageSource source(
+                url, cancel, job.file.size, sphairaStyleBuffering);
+            source.streamExact(segmentOffset, segmentSize,
+                [&](const u8* data, std::size_t size) {
+                    while (size) {
+                        if (stopWorkers.load())
+                            throw std::runtime_error("Download range interrupted");
+                        const std::size_t n = std::min(
+                            blockSize - staging.size(), size);
+                        staging.insert(staging.end(), data, data + n);
+                        if (staging.size() == blockSize)
+                            enqueue();
+                        data += n;
+                        size -= n;
+                    }
+                }, &stopWorkers);
+            enqueue();
+            if (nextOffset != segmentOffset + segmentSize)
+                throw std::runtime_error(
+                    "HTTP segment finished with incorrect byte count");
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!networkError) networkError = std::current_exception();
+            stopWorkers.store(true);
+            cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(connections);
     try {
-        // Staging is local to the HTTP producer. No per-callback allocation
-        // or SD write is performed until a complete 1 MiB block is ready.
-        std::vector<u8> staging;
-        staging.reserve(blockSize);
-        const auto enqueue = [&]() {
-            if (staging.empty()) return;
-            const std::size_t n = staging.size();
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [&] {
-                    return pendingBytes + n <= maxBuffered ||
-                           writeError || (cancel && cancel->load());
-                });
-                if (writeError)
-                    std::rethrow_exception(writeError);
-                if (cancel && cancel->load())
-                    throw std::runtime_error("Download cancelled");
-                pendingBytes += n;
-                pending.emplace_back(std::move(staging));
-                // Reuse a previously written buffer whenever available.
-                if (!recycled.empty()) {
-                    staging = std::move(recycled.back());
-                    recycled.pop_back();
-                }
-                cv.notify_all();
-            }
-            staging.clear();
-            if (staging.capacity() < blockSize)
-                staging.reserve(blockSize);
-        };
-        HttpPackageSource source(url, cancel, job.file.size, sphairaStyleBuffering);
-        source.streamExact(0, job.file.size,
-            [&](const u8* data, std::size_t size) {
-                while (size) {
-                    const std::size_t n = std::min(
-                        blockSize - staging.size(), size);
-                    staging.insert(staging.end(), data, data + n);
-                    if (staging.size() == blockSize)
-                        enqueue();
-                    data += n;
-                    size -= n;
-                }
-            });
-        // Flush the final partial block only after the complete HTTP Range
-        // was verified; the renamed output must always be a full package.
-        enqueue();
-        networkSucceeded.store(true);
+        const u64 base = job.file.size / connections;
+        const u64 extra = job.file.size % connections;
+        for (unsigned int idx = 0; idx < connections; ++idx) {
+            const u64 start = base * idx + std::min<u64>(idx, extra);
+            const u64 count = base + (idx < extra ? 1 : 0);
+            workers.emplace_back(producer, start, count);
+        }
     } catch (...) {
-        networkError = std::current_exception();
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!networkError) networkError = std::current_exception();
+        stopWorkers.store(true);
+        cv.notify_all();
     }
+    for (auto& worker : workers) worker.join();
     {
         std::lock_guard<std::mutex> lock(mutex);
         networkDone = true;
@@ -4593,8 +4628,10 @@ InstallResult runDownloadJob(
                 saved = downloadedGamePath(resolvedJob);
             } else {
                 saved = downloadFullGame(url, resolvedJob,
-                    !localShop && !onlineShop && !websiteShop &&
-                        config.service == DebridService::AllDebrid,
+                    websiteShop ||
+                        (!localShop && !onlineShop &&
+                         config.service == DebridService::AllDebrid),
+                    websiteShop ? 4u : 1u,
                     progress, cancelRequested);
             }
         }
