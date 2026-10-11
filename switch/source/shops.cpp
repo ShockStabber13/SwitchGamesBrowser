@@ -650,20 +650,26 @@ std::string downloadNotUltraNxCatalog(
                 "Only " + std::to_string(found.size()) +
                 " game IDs found in website pages; catalog not replaced");
 
-        // Reuse names from any prior successfully enriched catalog.
-        // Nlib's documented /nx/<title-id>?fields=name endpoint provides
-        // authoritative ID->name metadata; it is not a title-search API.
+        // Merge the refreshed IDs with the previous catalog rather than
+        // replacing it with a partial site scrape. Retain old names and
+        // entries that temporarily disappear from listing pages.
+        // Nlib's /nx/<title-id>?fields=name endpoint names new IDs.
         const auto previouslyNamed = loadWebsiteCatalog(catalogPath);
-        std::map<std::string, std::string> oldNames;
+        std::map<std::string, WebsiteCatalogRow> combined;
         for (const auto& entry : previouslyNamed)
-            oldNames.emplace(entry.id, entry.name);
-        std::vector<WebsiteCatalogRow> enriched;
-        enriched.reserve(found.size());
+            combined.emplace(entry.id, entry);
         for (const auto& entry : found) {
-            auto old = oldNames.find(entry.first);
-            enriched.push_back({entry.first,
-                old == oldNames.end() ? "" : old->second, entry.second});
+            auto existing = combined.find(entry.first);
+            if (existing != combined.end())
+                existing->second.cardText = entry.second;
+            else if (combined.size() < maxRows)
+                combined.emplace(entry.first,
+                    WebsiteCatalogRow{entry.first, "", entry.second});
         }
+        std::vector<WebsiteCatalogRow> enriched;
+        enriched.reserve(combined.size());
+        for (auto& pair : combined)
+            enriched.push_back(std::move(pair.second));
         std::atomic<std::size_t> nextName{0};
         std::atomic<std::size_t> checkedNames{0};
         std::atomic<std::size_t> lookupFailures{0};
@@ -759,8 +765,8 @@ std::string downloadNotUltraNxCatalog(
             throw std::runtime_error("Cannot replace NotUltraNX catalog");
         }
         message = "Saved " + std::to_string(lookupSuccess.load()) +
-            " named NotUltraNX games from " +
-            std::to_string(found.size()) + " title IDs";
+            " named NotUltraNX games across " +
+            std::to_string(enriched.size()) + " retained title IDs";
     } catch (const std::exception& e) {
         message = e.what();
     }
@@ -786,80 +792,77 @@ ShopSearchResult searchNotUltraNxWebsite(
     {
         std::lock_guard<std::mutex> guard(progress.mutex);
         progress.matches.clear();
-        progress.message = "Finding game on NotUltraNX website";
+        progress.message = "Searching saved NotUltraNX catalog";
     }
     try {
         if (!cancel || cancel->load())
             throw std::runtime_error("Shop search cancelled");
+        // Local-only title lookup. Never request listing/search pages or
+        // fetch dozens of candidate game pages during Shop search.
+        // One verified game page is needed to read the live download buttons.
         std::string id = validTitleId(titleId) ? titleId : "";
-        if (id.empty()) {
-            const auto cached = loadWebsiteCatalog(catalogPath);
-            const auto normalizedTitle = comparable(title);
-            for (const auto& entry : cached) {
-                if (normalizedTitle.size() < 3 ||
-                    comparable(entry.name).find(normalizedTitle) == std::string::npos)
-                    continue;
-                try {
-                    const auto page = fetch(
-                        "https://not.ultranx.ru/en/game/" + entry.id,
-                        cancel.get());
-                    if (websiteTitleMatches(title, page)) {
-                        id = entry.id;
-                        break;
-                    }
-                } catch (...) {}
-                if (cancel->load()) break;
-            }
-        }
-        // Searching NotUltraNX public listing for games without named catalog entries.
-        // Older catalogs have valid IDs but only file-size text. Search the
-        // website on demand, then verify the game page title before using it.
-        if (id.empty()) {
-            std::vector<std::string> queries;
-            const auto firstEnd = title.find_first_of(" :\t");
-            if (firstEnd != std::string::npos && firstEnd >= 4)
-                queries.push_back(title.substr(0, firstEnd));
-            queries.push_back(title);
-            std::set<std::string> triedIds;
-            for (const auto& query : queries) {
-                if (cancel->load()) break;
-                try {
-                    const auto searchHtml = fetch(
-                        "https://not.ultranx.ru/en?s=" +
-                        websiteQueryEncode(query), cancel.get());
-                    for (const auto& candidate : catalogRowsFromHtml(searchHtml)) {
-                        if (cancel->load() || triedIds.size() >= 48) break;
-                        if (!triedIds.insert(candidate.id).second) continue;
-                        try {
-                            const auto page = fetch(
-                                "https://not.ultranx.ru/en/game/" +
-                                candidate.id, cancel.get());
-                            if (websiteTitleMatches(title, page)) {
-                                id = candidate.id;
-                                break;
-                            }
-                        } catch (const std::exception&) {}
-                    }
-                } catch (const std::exception&) {}
-                if (!id.empty() || triedIds.size() >= 48) break;
-            }
-        }
         if (id.empty()) {
             const auto cached = loadWebsiteCatalog(catalogPath);
             if (cached.empty())
                 throw std::runtime_error(
                     "NotUltraNX catalog missing or invalid. Download it in Settings.");
-            throw std::runtime_error(
-                "Game name not matched in local NotUltraNX catalog (" +
-                std::to_string(cached.size()) +
-                " named entries). Update catalog in Settings.");
+
+            const auto expected = comparable(title);
+            if (expected.size() < 3)
+                throw std::runtime_error(
+                    "Game title is too short for an offline catalog match");
+
+            std::vector<std::string> exactIds;
+            std::vector<std::string> closeIds;
+            std::vector<std::string> fallbackIds;
+            for (const auto& entry : cached) {
+                if (cancel->load())
+                    throw std::runtime_error("Shop search cancelled");
+                const auto name = comparable(entry.name);
+                if (!name.empty()) {
+                    if (name == expected) {
+                        exactIds.push_back(entry.id);
+                    } else {
+                        // Permit a minor edition/subtitle difference, but
+                        // never choose a broad substring match such as
+                        // Mario Kart -> Mario Kart Deluxe.
+                        const auto small = std::min(name.size(), expected.size());
+                        const auto large = std::max(name.size(), expected.size());
+                        if (small >= 8 && small * 100 >= large * 85 &&
+                            (name.find(expected) != std::string::npos ||
+                             expected.find(name) != std::string::npos))
+                            closeIds.push_back(entry.id);
+                    }
+                } else if (entry.cardText.find(expected) != std::string::npos) {
+                    // Legacy catalogs may have blank names and noisy card
+                    // text. Only trust a card-text match if exactly one ID
+                    // contains the title; the page <h1> is checked below.
+                    fallbackIds.push_back(entry.id);
+                }
+            }
+            if (exactIds.size() == 1)
+                id = exactIds.front();
+            else if (exactIds.size() > 1)
+                throw std::runtime_error(
+                    "Duplicate title in local NotUltraNX catalog; use a title ID");
+            else if (closeIds.size() == 1)
+                id = closeIds.front();
+            else if (closeIds.size() > 1)
+                throw std::runtime_error(
+                    "Ambiguous local NotUltraNX titles; use a title ID");
+            else if (fallbackIds.size() == 1)
+                id = fallbackIds.front();
+            else if (fallbackIds.size() > 1)
+                throw std::runtime_error(
+                    "Catalog has unnamed, ambiguous entries. Refresh it in Settings.");
+            else
+                throw std::runtime_error(
+                    "Game not indexed in local NotUltraNX catalog (" +
+                    std::to_string(cached.size()) +
+                    " entries). Refresh catalog in Settings.");
         }
         if (cancel->load())
             throw std::runtime_error("Shop search cancelled");
-        if (id.empty())
-            throw std::runtime_error(
-                "Game not found on NotUltraNX website (try a title with an ID)");
-
         const auto html = fetch(
             "https://not.ultranx.ru/en/game/" + id, cancel.get());
         // Never present a different game's packages after a name search.
