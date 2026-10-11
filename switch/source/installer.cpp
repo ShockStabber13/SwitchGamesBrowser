@@ -4142,20 +4142,19 @@ static std::string downloadFullGame(
     progress.beginTransfer(job.file.size);
     progress.set("Downloading", 0, job.file.name);
 
-    // Up to eight independent HTTP/1.1 byte ranges for NotUltraNX and
-    // debrid CDN URLs. Local relay and OpenNX keep a single connection.
-    // One SD writer serializes all writes to the preallocated file while
-    // accepting out-of-order ranges at their exact offsets.
-    // Bounded queue with small batches keeps TCP streams active while the
-    // SD writer commits data. Run eight independent byte ranges on larger
-    // files, or four for the baseline option / shorter transfers.
+    // Between 1 and 16 verified HTTP ranges for NotUltraNX or debrid CDN
+    // downloads. The actual worker count is bounded by the file size so
+    // short transfers don't create unnecessary sockets and threads.
+    // One SD writer serializes writes to the preallocated file at their
+    // absolute offsets, with a bounded queue to absorb flash-write stalls.
     constexpr std::size_t blockSize = 1024 * 1024;
     constexpr std::size_t maxBuffered = 32 * blockSize;
-    const unsigned int connections =
-        requestedConnections >= 8 &&
-        job.file.size >= 8ULL * blockSize ? 8u :
-        requestedConnections >= 4 &&
-        job.file.size >= 4ULL * blockSize ? 4u : 1u;
+    const u64 maxByFileSize = std::max<u64>(1u, job.file.size / blockSize);
+    const unsigned int connections = static_cast<unsigned int>(
+        std::min<u64>(
+            std::clamp(requestedConnections,
+                kMinDownloadConnections, kMaxDownloadConnections),
+            maxByFileSize));
     progress.writerActiveNanoseconds.store(0);
     progress.writerIdleNanoseconds.store(0);
     progress.producerBackpressureNanoseconds.store(0);
@@ -4662,10 +4661,10 @@ InstallResult runDownloadJob(
                 if (url.empty())
                     throw std::runtime_error("Debrid did not return a download URL");
                 if (config.service == DebridService::TorBox &&
-                    config.debridDownloadConnections >= 4u) {
+                    config.debridDownloadConnections > 1u) {
                     // Resolve TorBox requestdl only once. This 1-byte
-                    // verified range avoids sending the API token in the
-                    // eight concurrent download requests.
+                    // verified range avoids sending the API token in
+                    // multiple parallel download requests.
                     HttpPackageSource probe(
                         url, cancelRequested, resolvedJob.file.size, true);
                     probe.streamExact(0, 1, [](const u8*, std::size_t) {});
