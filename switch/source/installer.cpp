@@ -600,6 +600,11 @@ public:
         }
     }
 
+    // The first TorBox ranged request resolves the token-bearing API URL
+    // to a CDN URL. Subsequent concurrent workers use that final URL
+    // instead of repeatedly calling the API with the access token.
+    const std::string& resolvedUrl() const { return url_; }
+
     // Separate easy handles are required for concurrent HTTP ranges.
     std::unique_ptr<HttpPackageSource> clone() const {
         return std::make_unique<HttpPackageSource>(
@@ -4137,8 +4142,8 @@ static std::string downloadFullGame(
     progress.beginTransfer(job.file.size);
     progress.set("Downloading", 0, job.file.name);
 
-    // Up to eight independent HTTP/1.1 byte ranges for NotUltraNX's signed
-    // file URL. Other providers retain the original single connection.
+    // Up to eight independent HTTP/1.1 byte ranges for NotUltraNX and
+    // debrid CDN URLs. Local relay and OpenNX keep a single connection.
     // One SD writer serializes all writes to the preallocated file while
     // accepting out-of-order ranges at their exact offsets.
     // Bounded queue with small batches keeps TCP streams active while the
@@ -4656,6 +4661,19 @@ InstallResult runDownloadJob(
                 url = backend->downloadUrl(job.remoteId, job.file);
                 if (url.empty())
                     throw std::runtime_error("Debrid did not return a download URL");
+                if (config.service == DebridService::TorBox &&
+                    config.debridDownloadConnections >= 4u) {
+                    // Resolve TorBox requestdl only once. This 1-byte
+                    // verified range avoids sending the API token in the
+                    // eight concurrent download requests.
+                    HttpPackageSource probe(
+                        url, cancelRequested, resolvedJob.file.size, true);
+                    probe.streamExact(0, 1, [](const u8*, std::size_t) {});
+                    url = probe.resolvedUrl();
+                    if (url.rfind("https://api.torbox.app/", 0) == 0)
+                        throw std::runtime_error(
+                            "TorBox did not resolve a direct download URL");
+                }
             }
 
             if (completeSavedGame(downloadedGamePath(resolvedJob),
@@ -4665,8 +4683,10 @@ InstallResult runDownloadJob(
                 saved = downloadFullGame(url, resolvedJob,
                     websiteShop ||
                         (!localShop && !onlineShop &&
-                         config.service == DebridService::AllDebrid),
-                    websiteShop ? config.notUltraNxConnections : 1u,
+                         config.service != DebridService::None),
+                    websiteShop ? config.notUltraNxConnections :
+                    (!localShop && !onlineShop)
+                        ? config.debridDownloadConnections : 1u,
                     progress, cancelRequested);
             }
         }
