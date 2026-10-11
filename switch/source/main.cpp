@@ -1847,6 +1847,10 @@ int main(int, char**) {
             config.value("debridApiKey", "");
         debridConfig.notUltraNxToken =
             config.value("notUltraNxToken", "");
+        const unsigned int shopConnections =
+            config.value("notUltraNxConnections", 8u);
+        debridConfig.notUltraNxConnections =
+            shopConnections == 4u ? 4u : 8u;
 
         if (
             config.contains("enabledProviders") &&
@@ -1896,6 +1900,7 @@ int main(int, char**) {
                     {"debridService", service},
                     {"debridApiKey", debridConfig.apiKey},
                     {"notUltraNxToken", debridConfig.notUltraNxToken},
+                    {"notUltraNxConnections", debridConfig.notUltraNxConnections},
                     {"enabledProviders", providerArray}
                 }.dump(2)
             );
@@ -3551,7 +3556,7 @@ int main(int, char**) {
             if ((keys & HidNpadButton_Up) && settingsCursor > 0)
                 --settingsCursor;
 
-            if ((keys & HidNpadButton_Down) && settingsCursor < 11)
+            if ((keys & HidNpadButton_Down) && settingsCursor < 12)
                 ++settingsCursor;
 
             if (keys & HidNpadButton_B)
@@ -3832,6 +3837,14 @@ int main(int, char**) {
                     } catch (const std::exception& e) {
                         status = e.what();
                     }
+                }
+                else if (settingsCursor == 12) {
+                    debridConfig.notUltraNxConnections =
+                        debridConfig.notUltraNxConnections == 4u ? 8u : 4u;
+                    saveConfig();
+                    status = "NotUltraNX: " +
+                        std::to_string(debridConfig.notUltraNxConnections) +
+                        " HTTP streams on next download";
                 }
             }
 
@@ -5503,7 +5516,8 @@ int main(int, char**) {
                 "CPU Clock Settings",
                 "Download / Update NotUltraNX Catalog",
                 "NotUltraNX Sign In / Sign Out",
-                "Check NotUltraNX Authorization"
+                "Check NotUltraNX Authorization",
+                "NotUltraNX Download Connections"
             };
 
             for (
@@ -5514,10 +5528,10 @@ int main(int, char**) {
                 const int y =
                     145 +
                     static_cast<int>(i) *
-                        43;
+                        38;
 
                 SDL_Rect box{
-                    32,y,1216,40
+                    32,y,1216,35
                 };
 
                 rect(
@@ -5588,6 +5602,10 @@ int main(int, char**) {
                     value = debridConfig.notUltraNxToken.empty()
                         ? "Sign in first" : "A to verify";
                 }
+                else if (i == 12) {
+                    value = std::to_string(
+                        debridConfig.notUltraNxConnections) + " streams";
+                }
                 else if (i == 9) {
                     if (pendingNotUltraNxCatalog.valid()) {
                         value = std::to_string(
@@ -5642,7 +5660,7 @@ int main(int, char**) {
                     renderer,
                     small,
                     labels[i],
-                    52,y+14,780,
+                    52,y+8,780,
                     i == settingsCursor,
                     i == settingsCursor
                         ? green
@@ -5654,7 +5672,7 @@ int main(int, char**) {
                         renderer,
                         small,
                         value,
-                        860,y+14,350,
+                        860,y+8,350,
                         (
                             value == "Authorized" ||
                             value == "Installed"
@@ -5674,7 +5692,7 @@ int main(int, char**) {
                     " | " +
                     torBoxDeviceAuth
                         ->friendlyVerificationUrl,
-                    32,620,1216,green
+                    32,646,1216,green
                 );
             }
             else if (allDebridPin.has_value()) {
@@ -5683,7 +5701,7 @@ int main(int, char**) {
                     small,
                     "AllDebrid PIN: " +
                         allDebridPin->pin,
-                    32,620,1216,green
+                    32,646,1216,green
                 );
             }
 
