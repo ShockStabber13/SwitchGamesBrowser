@@ -573,6 +573,38 @@ std::vector<WebsiteCatalogRow> loadWebsiteCatalog(
     return rows;
 }
 
+// Where the local IGDB index has Nintendo title IDs, use those known
+// game names to enrich the NotUltraNX ID index without an extra web call.
+void addLocalIgdbNames(
+    const std::string& catalogPath,
+    std::map<std::string, WebsiteCatalogRow>& combined)
+{
+    const auto slash = catalogPath.find_last_of('/');
+    if (slash == std::string::npos) return;
+    const auto local = catalogPath.substr(0, slash + 1) +
+        "igdb-switch-games.json";
+    std::ifstream file(local, std::ios::binary | std::ios::ate);
+    if (!file) return;
+    const auto size = file.tellg();
+    if (size <= 0 || size > 48LL * 1024 * 1024) return;
+    file.seekg(0);
+    const std::string bytes(
+        (std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
+    const auto items = Json::parse(bytes, nullptr, false);
+    if (!items.is_array()) return;
+    for (const auto& game : items) {
+        if (!game.is_object()) continue;
+        const auto id = stringField(game, "titleId");
+        if (!validTitleId(id)) continue;
+        const auto name = stringField(game, "name");
+        if (name.empty() || name.size() > 512) continue;
+        const auto existing = combined.find(id);
+        if (existing != combined.end() && existing->second.name.empty())
+            existing->second.name = name;
+    }
+}
+
 } // namespace
 
 std::string downloadNotUltraNxCatalog(
@@ -666,6 +698,7 @@ std::string downloadNotUltraNxCatalog(
                 combined.emplace(entry.first,
                     WebsiteCatalogRow{entry.first, "", entry.second});
         }
+        addLocalIgdbNames(catalogPath, combined);
         std::vector<WebsiteCatalogRow> enriched;
         enriched.reserve(combined.size());
         for (auto& pair : combined)
