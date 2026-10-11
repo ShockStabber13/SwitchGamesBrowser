@@ -3683,9 +3683,12 @@ void InstallProgress::snapshotTransfer(
             outNetworkBytesPerSecond = rate;
             return;
         }
-        // Downloads retain the original network-only throughput display.
-        outDone = networkBytesDone.load();
-        constexpr auto window = std::chrono::milliseconds(1500);
+        // Keep progress tied to bytes safely written to SD, while using
+        // network receive callbacks for the download throughput readout.
+        outDone = bytesDone.load();
+        // A five-second average avoids displaying 0 between 4 MiB chunks
+        // or between the four parallel range requests.
+        constexpr auto window = std::chrono::seconds(5);
         const auto total = networkBytesDone.load();
         liveSpeedSamples_.emplace_back(now, total);
         while (liveSpeedSamples_.size() > 2 &&
@@ -4194,8 +4197,9 @@ static std::string downloadFullGame(
                         "microSD native write failed (FS " +
                         std::to_string(static_cast<unsigned>(rc)) + ")");
                 writtenBytes += chunk.bytes.size();
+                // Only completed SD writes advance saved-file progress.
+                // Network throughput is counted in each curl callback.
                 progress.addTransferBytes(chunk.bytes.size());
-                progress.addNetworkBytes(chunk.bytes.size());
                 chunk.bytes.clear();
                 {
                     std::lock_guard<std::mutex> lock(mutex);
@@ -4259,6 +4263,7 @@ static std::string downloadFullGame(
                 url, cancel, job.file.size, sphairaStyleBuffering);
             source.streamExact(segmentOffset, segmentSize,
                 [&](const u8* data, std::size_t size) {
+                    const std::size_t received = size;
                     while (size) {
                         if (stopWorkers.load())
                             throw std::runtime_error("Download range interrupted");
@@ -4270,6 +4275,9 @@ static std::string downloadFullGame(
                         data += n;
                         size -= n;
                     }
+                    // Count bytes when the network receives them, not
+                    // when the SD writer flushes its 4 MiB buffer.
+                    progress.addNetworkBytes(received);
                 }, &stopWorkers);
             enqueue();
             if (nextOffset != segmentOffset + segmentSize)
