@@ -1683,7 +1683,7 @@ enum class Page {
     Browse, Detail, Torrents, Files, Settings, Providers,
     SearchProgress, Options, ScrapeChoice, DebridManager,
     DebridManagerFiles, DownloadManager, InstallManager, ShopResults,
-    CpuClockDiagnostics
+    CpuClockDiagnostics, ConfirmNotUltraNxCatalog
 };
 
 static DebridCheckResult liveDebridCheck(
@@ -3814,16 +3814,8 @@ int main(int, char**) {
                     if (pendingNotUltraNxCatalog.valid()) {
                         status = "NotUltraNX catalog download already running";
                     } else {
-                        notUltraNxCatalogCancel->store(false);
-                        status = "Downloading NotUltraNX website catalog...";
-                        const auto catalogPath = root + "notultranx-catalog.json";
-                        const auto cancel = notUltraNxCatalogCancel;
-                        pendingNotUltraNxCatalog = std::async(
-                            std::launch::async,
-                            [catalogPath, cancel, &notUltraNxCatalogProgress]() {
-                                return sgb::downloadNotUltraNxCatalog(
-                                    catalogPath, notUltraNxCatalogProgress, cancel);
-                            });
+                        // Do not start work until the popup is confirmed.
+                        page = Page::ConfirmNotUltraNxCatalog;
                     }
                 }
                 else if (settingsCursor == 10) {
@@ -3871,6 +3863,28 @@ int main(int, char**) {
                 }
                 else if (settingsCursor == 12 || settingsCursor == 13) {
                     adjustDownloadConnections(true);
+                }
+            }
+
+        } else if (page == Page::ConfirmNotUltraNxCatalog) {
+            if (keys & HidNpadButton_B) {
+                page = Page::Settings;
+                status = "NotUltraNX catalog refresh cancelled";
+            } else if (keys & HidNpadButton_A) {
+                page = Page::Settings;
+                if (pendingNotUltraNxCatalog.valid()) {
+                    status = "NotUltraNX catalog download already running";
+                } else {
+                    notUltraNxCatalogCancel->store(false);
+                    status = "Downloading NotUltraNX website catalog...";
+                    const auto catalogPath = root + "notultranx-catalog.json";
+                    const auto cancel = notUltraNxCatalogCancel;
+                    pendingNotUltraNxCatalog = std::async(
+                        std::launch::async,
+                        [catalogPath, cancel, &notUltraNxCatalogProgress]() {
+                            return sgb::downloadNotUltraNxCatalog(
+                                catalogPath, notUltraNxCatalogProgress, cancel);
+                        });
                 }
             }
 
@@ -5518,7 +5532,8 @@ int main(int, char**) {
                 }
             }
 
-        } else if (page == Page::Settings) {
+        } else if (page == Page::Settings ||
+                   page == Page::ConfirmNotUltraNxCatalog) {
             label(
                 renderer,big,
                 "SETTINGS",
@@ -5537,7 +5552,7 @@ int main(int, char**) {
                 "Refresh Catalog Index",
                 "Scrape Providers",
                 "Download / Update Langegen Catalog",
-                "Added to Debrid",
+                "Debrid Manager",
                 "Download Manager",
                 "Install Manager",
                 "CPU Clock Settings",
@@ -6381,6 +6396,25 @@ int main(int, char**) {
         }
         label(renderer,small,status,32,
               page == Page::InstallManager ? 695 : 675,1216,green);
+
+        if (page == Page::ConfirmNotUltraNxCatalog) {
+            // Draw a modal over Settings. Other menu buttons are ignored
+            // until the player explicitly confirms with A or cancels with B.
+            const SDL_Rect panel{180,205,920,310};
+            rect(renderer, panel, SDL_Color{10,10,10,255});
+            rect(renderer, panel, green, true);
+            rect(renderer, {190,215,900,290}, green, true);
+            label(renderer, big, "REFRESH NOTULTRANX CATALOG?",
+                  225,245,830,green);
+            label(renderer, small,
+                  "Download and update the saved NotUltraNX game catalog?",
+                  225,315,830,white);
+            label(renderer, small,
+                  "This may take several minutes. Older entries are preserved.",
+                  225,355,830,muted);
+            label(renderer, small, "A Confirm   |   B Cancel",
+                  225,440,830,green);
+        }
         SDL_RenderPresent(renderer);
     }
     stopping = true;
