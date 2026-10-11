@@ -1850,11 +1850,13 @@ int main(int, char**) {
         const unsigned int shopConnections =
             config.value("notUltraNxConnections", 8u);
         debridConfig.notUltraNxConnections =
-            shopConnections == 4u ? 4u : 8u;
+            std::clamp(shopConnections,
+                sgb::kMinDownloadConnections, sgb::kMaxDownloadConnections);
         const unsigned int debridConnections =
             config.value("debridDownloadConnections", 8u);
         debridConfig.debridDownloadConnections =
-            debridConnections == 4u ? 4u : 8u;
+            std::clamp(debridConnections,
+                sgb::kMinDownloadConnections, sgb::kMaxDownloadConnections);
 
         if (
             config.contains("enabledProviders") &&
@@ -3568,6 +3570,32 @@ int main(int, char**) {
             if (keys & HidNpadButton_B)
                 page = Page::Browse;
 
+            // Left/Right change the selected transfer connection count
+            // one at a time; A can also increment it. Changes are saved
+            // and apply only to subsequent downloads.
+            auto adjustDownloadConnections = [&](bool increase) {
+                unsigned int& value = settingsCursor == 12
+                    ? debridConfig.notUltraNxConnections
+                    : debridConfig.debridDownloadConnections;
+                if (increase)
+                    value = value >= sgb::kMaxDownloadConnections
+                        ? sgb::kMinDownloadConnections : value + 1u;
+                else
+                    value = value <= sgb::kMinDownloadConnections
+                        ? sgb::kMaxDownloadConnections : value - 1u;
+                saveConfig();
+                status = std::string(settingsCursor == 12
+                    ? "NotUltraNX: " : "TorBox / AllDebrid: ") +
+                    std::to_string(value) +
+                    " streams (next download)";
+            };
+            if (settingsCursor == 12 || settingsCursor == 13) {
+                if (keys & HidNpadButton_Left)
+                    adjustDownloadConnections(false);
+                else if (keys & HidNpadButton_Right)
+                    adjustDownloadConnections(true);
+            }
+
             if (keys & HidNpadButton_A) {
                 if (settingsCursor == 0) {
                     debridConfig.service =
@@ -3844,21 +3872,8 @@ int main(int, char**) {
                         status = e.what();
                     }
                 }
-                else if (settingsCursor == 12) {
-                    debridConfig.notUltraNxConnections =
-                        debridConfig.notUltraNxConnections == 4u ? 8u : 4u;
-                    saveConfig();
-                    status = "NotUltraNX: " +
-                        std::to_string(debridConfig.notUltraNxConnections) +
-                        " HTTP streams on next download";
-                }
-                else if (settingsCursor == 13) {
-                    debridConfig.debridDownloadConnections =
-                        debridConfig.debridDownloadConnections == 4u ? 8u : 4u;
-                    saveConfig();
-                    status = "TorBox / AllDebrid: " +
-                        std::to_string(debridConfig.debridDownloadConnections) +
-                        " HTTP streams on next download";
+                else if (settingsCursor == 12 || settingsCursor == 13) {
+                    adjustDownloadConnections(true);
                 }
             }
 
@@ -5515,7 +5530,7 @@ int main(int, char**) {
 
             label(
                 renderer,small,
-                "A Select | B Back",
+                "A Select | Left/Right: 1-16 streams | B Back",
                 32,112,1200,muted
             );
 
