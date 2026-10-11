@@ -4141,11 +4141,18 @@ static std::string downloadFullGame(
     // file URL. Other providers retain the original single connection.
     // One SD writer serializes all writes to the preallocated file while
     // accepting out-of-order ranges at their exact offsets.
-    constexpr std::size_t blockSize = 4 * 1024 * 1024;
-    constexpr std::size_t maxBuffered = 2 * blockSize;
+    // Use smaller batches to keep four TCP streams active while the SD
+    // writer commits data. A 24 MiB queue absorbs short flash-write stalls
+    // without buffering an unbounded number of bytes.
+    constexpr std::size_t blockSize = 1024 * 1024;
+    constexpr std::size_t maxBuffered = 24 * blockSize;
     const unsigned int connections =
         requestedConnections >= 4 &&
         job.file.size >= 4ULL * blockSize ? 4u : 1u;
+    progress.writerActiveNanoseconds.store(0);
+    progress.writerIdleNanoseconds.store(0);
+    progress.producerBackpressureNanoseconds.store(0);
+    progress.parallelEntryCount.store(connections);
     struct PendingChunk {
         u64 offset = 0;
         std::vector<u8> bytes;
@@ -4167,11 +4174,16 @@ static std::string downloadFullGame(
                 PendingChunk chunk;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
+                    const auto waitStarted = std::chrono::steady_clock::now();
                     cv.wait(lock, [&] {
                         return !pending.empty() || networkDone ||
                                stopWorkers.load() ||
                                (cancel && cancel->load());
                     });
+                    const auto waited = std::chrono::steady_clock::now() - waitStarted;
+                    progress.writerIdleNanoseconds.fetch_add(
+                        static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()));
                     if (cancel && cancel->load())
                         throw std::runtime_error("Download cancelled");
                     if (stopWorkers.load())
@@ -4189,9 +4201,14 @@ static std::string downloadFullGame(
                     chunk.bytes.size() > job.file.size - chunk.offset)
                     throw std::runtime_error(
                         "Download chunk lies outside expected file");
+                const auto writeStarted = std::chrono::steady_clock::now();
                 const Result rc = fsFileWrite(
                     &output.fd, chunk.offset,
                     chunk.bytes.data(), chunk.bytes.size(), FsWriteOption_None);
+                const auto writeTime = std::chrono::steady_clock::now() - writeStarted;
+                progress.writerActiveNanoseconds.fetch_add(
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(writeTime).count()));
                 if (R_FAILED(rc))
                     throw std::runtime_error(
                         "microSD native write failed (FS " +
@@ -4234,11 +4251,19 @@ static std::string downloadFullGame(
                 const std::size_t n = staging.size();
                 {
                     std::unique_lock<std::mutex> lock(mutex);
+                    const bool bufferFull = pendingBytes + n > maxBuffered;
+                    const auto waitStarted = std::chrono::steady_clock::now();
                     cv.wait(lock, [&] {
                         return pendingBytes + n <= maxBuffered ||
                                writeError || stopWorkers.load() ||
                                (cancel && cancel->load());
                     });
+                    if (bufferFull) {
+                        const auto waited = std::chrono::steady_clock::now() - waitStarted;
+                        progress.producerBackpressureNanoseconds.fetch_add(
+                            static_cast<std::uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()));
+                    }
                     if (writeError)
                         std::rethrow_exception(writeError);
                     if (cancel && cancel->load())
@@ -4263,7 +4288,10 @@ static std::string downloadFullGame(
                 url, cancel, job.file.size, sphairaStyleBuffering);
             source.streamExact(segmentOffset, segmentSize,
                 [&](const u8* data, std::size_t size) {
-                    const std::size_t received = size;
+                    // Account for bytes on arrival. Queue backpressure below
+                    // must not make the UI mistake a paused callback for a
+                    // server-side reconnect.
+                    progress.addNetworkBytes(size);
                     while (size) {
                         if (stopWorkers.load())
                             throw std::runtime_error("Download range interrupted");
@@ -4275,9 +4303,6 @@ static std::string downloadFullGame(
                         data += n;
                         size -= n;
                     }
-                    // Count bytes when the network receives them, not
-                    // when the SD writer flushes its 4 MiB buffer.
-                    progress.addNetworkBytes(received);
                 }, &stopWorkers);
             enqueue();
             if (nextOffset != segmentOffset + segmentSize)
