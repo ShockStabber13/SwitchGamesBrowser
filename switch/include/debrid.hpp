@@ -21,6 +21,8 @@ struct DebridConfig {
     std::string apiKey;
     // NotUltraNX website session. Password is never persisted.
     std::string notUltraNxToken;
+    // Tunable HTTP range workers: use 4 for baseline or 8 for faster mirrors.
+    unsigned int notUltraNxConnections = 8;
 };
 
 struct DebridCandidate {
