@@ -23,6 +23,8 @@ struct DebridConfig {
     std::string notUltraNxToken;
     // Tunable HTTP range workers: use 4 for baseline or 8 for faster mirrors.
     unsigned int notUltraNxConnections = 8;
+    // Applies only to TorBox and AllDebrid Download Manager transfers.
+    unsigned int debridDownloadConnections = 8;
 };
 
 struct DebridCandidate {
