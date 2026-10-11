@@ -4137,16 +4137,18 @@ static std::string downloadFullGame(
     progress.beginTransfer(job.file.size);
     progress.set("Downloading", 0, job.file.name);
 
-    // Four independent HTTP/1.1 byte ranges for NotUltraNX's signed
+    // Up to eight independent HTTP/1.1 byte ranges for NotUltraNX's signed
     // file URL. Other providers retain the original single connection.
     // One SD writer serializes all writes to the preallocated file while
     // accepting out-of-order ranges at their exact offsets.
-    // Use smaller batches to keep four TCP streams active while the SD
-    // writer commits data. A 24 MiB queue absorbs short flash-write stalls
-    // without buffering an unbounded number of bytes.
+    // Bounded queue with small batches keeps TCP streams active while the
+    // SD writer commits data. Run eight independent byte ranges on larger
+    // files, or four for the baseline option / shorter transfers.
     constexpr std::size_t blockSize = 1024 * 1024;
-    constexpr std::size_t maxBuffered = 24 * blockSize;
+    constexpr std::size_t maxBuffered = 32 * blockSize;
     const unsigned int connections =
+        requestedConnections >= 8 &&
+        job.file.size >= 8ULL * blockSize ? 8u :
         requestedConnections >= 4 &&
         job.file.size >= 4ULL * blockSize ? 4u : 1u;
     progress.writerActiveNanoseconds.store(0);
@@ -4664,7 +4666,7 @@ InstallResult runDownloadJob(
                     websiteShop ||
                         (!localShop && !onlineShop &&
                          config.service == DebridService::AllDebrid),
-                    websiteShop ? 4u : 1u,
+                    websiteShop ? config.notUltraNxConnections : 1u,
                     progress, cancelRequested);
             }
         }
