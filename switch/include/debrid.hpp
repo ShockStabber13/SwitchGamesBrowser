@@ -16,12 +16,16 @@ enum class DebridService {
     AllDebrid
 };
 
+// Capped to avoid exhausting Switch RAM/sockets or overloading mirrors.
+inline constexpr unsigned int kMinDownloadConnections = 1u;
+inline constexpr unsigned int kMaxDownloadConnections = 16u;
+
 struct DebridConfig {
     DebridService service = DebridService::None;
     std::string apiKey;
     // NotUltraNX website session. Password is never persisted.
     std::string notUltraNxToken;
-    // Tunable HTTP range workers: use 4 for baseline or 8 for faster mirrors.
+    // Independent user-selected HTTP range worker counts, 1 to 16.
     unsigned int notUltraNxConnections = 8;
     // Applies only to TorBox and AllDebrid Download Manager transfers.
     unsigned int debridDownloadConnections = 8;
